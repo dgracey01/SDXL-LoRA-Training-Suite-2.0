@@ -1,0 +1,45 @@
+# ── Virtual environment ────────────────────────────────────────────────────────
+.venv/
+
+# ── Python cache ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Downloaded models (auto-downloaded on first use) ──────────────────────────
+tags/models/
+randomizer/models/
+
+# ── User config & data ─────────────────────────────────────────────────────────
+tags/uth_config.json
+tags/uth_profiles.json
+randomizer/randomizer_config.json
+calculator/training_log.json
+randomizer/random images/
+
+# ── Secrets — never commit ─────────────────────────────────────────────────────
+launcher/hf_config.json
+
+# ── Dataset & working folders ──────────────────────────────────────────────────
+dataset/
+temp/
+
+# ── Build artifacts ────────────────────────────────────────────────────────────
+*.zip
+
+# ── Stray image files in root ──────────────────────────────────────────────────
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+output.png
+
+# ── Windows metadata ───────────────────────────────────────────────────────────
+desktop.ini
+Thumbs.db
+ehthumbs.db
+
+# ── IDE ────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
