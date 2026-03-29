@@ -16,6 +16,13 @@ tags/uth_profiles.json
 randomizer/randomizer_config.json
 calculator/training_log.json
 randomizer/random images/
+faces/faceswap_config.json
+enhancer/enhancer_config.json
+faces/inswapper_128.onnx
+faces/GFPGANv1.4.pth
+gfpgan/weights/detection_Resnet50_Final.pth
+gfpgan/weights/parsing_parsenet.pth
+gfpgan/weights/*.partial
 
 # ── Secrets — never commit ─────────────────────────────────────────────────────
 launcher/hf_config.json
@@ -23,6 +30,9 @@ launcher/hf_config.json
 # ── Dataset & working folders ──────────────────────────────────────────────────
 dataset/
 temp/
+
+# ── Local workflow scripts ─────────────────────────────────────────────────────
+push.bat
 
 # ── Build artifacts ────────────────────────────────────────────────────────────
 *.zip

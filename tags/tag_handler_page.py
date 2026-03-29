@@ -527,7 +527,8 @@ class PrepareCard(QFrame):
     D = DEFAULT_CARD
 
     def __init__(self, parent, img_path, status="normal",
-                 saved_offset=None, saved_zoom=1.0, tw=None, th=None):
+                 saved_offset=None, saved_zoom=1.0, tw=None, th=None,
+                 on_deleted=None):
         super().__init__(parent)
         bc = {"normal": ACC, "nonsquare": RED, "duplicate": AMB}.get(status, ACC)
         self.setStyleSheet(
@@ -537,6 +538,7 @@ class PrepareCard(QFrame):
         self.setFixedWidth(self.D + 8)   # 4px margin each side
         self.img_path  = img_path
         self.status    = status
+        self.on_deleted = on_deleted
         self.offset_x  = saved_offset[0] if saved_offset else 0.5
         self.offset_y  = saved_offset[1] if saved_offset else 0.5
         self.card_zoom = float(saved_zoom) if saved_zoom else 1.0
@@ -565,8 +567,20 @@ class PrepareCard(QFrame):
         hdr.setStyleSheet("background:transparent;")
         hlay = QHBoxLayout(hdr)
         hlay.setContentsMargins(2,0,2,0); hlay.setSpacing(4)
+
+        del_btn = QPushButton("🗑", hdr)
+        del_btn.setFixedSize(16, 16)
+        del_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{MUT};border:none;"
+            f"font-size:10px;padding:0;}}"
+            f"QPushButton:hover{{color:{RED};}}")
+        del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        del_btn.setToolTip("Delete image from dataset")
+        del_btn.clicked.connect(self._delete_image)
+        hlay.addWidget(del_btn)
+
         fname = os.path.basename(img_path)
-        fname_s = fname if len(fname)<=34 else fname[:31]+"…"
+        fname_s = fname if len(fname)<=30 else fname[:27]+"…"
         nm = QLabel(fname_s, hdr)
         nm.setStyleSheet(f"color:{MUT};font-family:{FONT};font-size:9px;background:transparent;")
         hlay.addWidget(nm)
@@ -641,6 +655,22 @@ class PrepareCard(QFrame):
                 f"QSlider::handle:vertical{{background:{ACC};width:10px;height:10px;margin:0 -3px;border-radius:5px;}}"
                 f"QSlider::sub-page:horizontal{{background:{ACC};border-radius:2px;}}"
                 f"QSlider::add-page:vertical{{background:{ACC};border-radius:2px;}}")
+
+    def _delete_image(self):
+        if QMessageBox.question(
+                self, "Delete Image",
+                f"Permanently delete:\n{os.path.basename(self.img_path)}\n"
+                f"and its .txt file?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            try: os.remove(self.img_path)
+            except: pass
+            tp = _txt_path(self.img_path)
+            if os.path.exists(tp):
+                try: os.remove(tp)
+                except: pass
+            if self.on_deleted:
+                self.on_deleted(self.img_path)
 
     @property
     def _inner_rect(self):
@@ -1554,7 +1584,8 @@ class TagHandlerPage(QWidget):
                 _tw, _th = tw, th
             card = PrepareCard(self._prep_inner, img_path,
                                saved_offset=s_offset, saved_zoom=s_zoom,
-                               tw=_tw, th=_th)
+                               tw=_tw, th=_th,
+                               on_deleted=self._on_prepare_image_deleted)
             if is_manual:
                 card.set_manual_mode(True)
             self._prep_card_widgets.append(card)
@@ -2237,6 +2268,14 @@ class TagHandlerPage(QWidget):
         self._tags_changed.discard(img_path)
         self._rebuild_tag_freq()
         self._render_editor_page()
+
+    def _on_prepare_image_deleted(self, img_path: str):
+        if img_path in self._images:
+            self._images.remove(img_path)
+        self._crop_offsets.pop(img_path, None)
+        self._tags_changed.discard(img_path)
+        self._rebuild_tag_freq()
+        self._render_prepare_page()
 
     def _on_dont_sort_toggle(self, checked: bool):
         pass  # applied at save time

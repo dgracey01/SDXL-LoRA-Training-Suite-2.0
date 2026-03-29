@@ -659,9 +659,13 @@ class Launcher(QMainWindow):
         self._tags_page     = None
         self._calc_page     = None
         self._rand_page     = None
+        self._face_page     = None
+        self._enh_page      = None
         self._tags_index:   int | None = None
         self._calc_index:   int | None = None
         self._rand_index:   int | None = None
+        self._face_index:   int | None = None
+        self._enh_index:    int | None = None
 
         self._build_ui()
         self._start_polling()
@@ -691,13 +695,22 @@ class Launcher(QMainWindow):
         hrow.setContentsMargins(4, 4, 8, 4)
         hrow.setSpacing(0)
 
-        # Nav tabs
+        # Nav tabs — Manage has no close; the other three can be unloaded
         self._manage_tab = self._make_nav_tab("Manage",     self._show_manage)
-        self._tags_tab   = self._make_nav_tab("Tags",       self._show_tags)
-        self._calc_tab   = self._make_nav_tab("Calculator", self._show_calculator)
-        self._rand_tab   = self._make_nav_tab("Randomizer", self._show_randomizer)
+        self._tags_tab   = self._make_nav_tab("Tags",       self._show_tags,       closeable=True)
+        self._calc_tab   = self._make_nav_tab("Calculator", self._show_calculator, closeable=True)
+        self._rand_tab   = self._make_nav_tab("Randomizer", self._show_randomizer, closeable=True)
+        self._face_tab   = self._make_nav_tab("Face Swap",  self._show_faceswap,   closeable=True)
+        self._enh_tab    = self._make_nav_tab("Enhancer",   self._show_enhancer,   closeable=True)
 
-        for btn in (self._manage_tab, self._tags_tab, self._calc_tab, self._rand_tab):
+        self._tags_tab.close_requested.connect(self._close_tags)
+        self._calc_tab.close_requested.connect(self._close_calculator)
+        self._rand_tab.close_requested.connect(self._close_randomizer)
+        self._face_tab.close_requested.connect(self._close_faceswap)
+        self._enh_tab.close_requested.connect(self._close_enhancer)
+
+        for btn in (self._manage_tab, self._tags_tab, self._calc_tab,
+                    self._rand_tab, self._face_tab, self._enh_tab):
             hrow.addWidget(btn)
             hrow.addSpacing(4)
 
@@ -754,8 +767,8 @@ class Launcher(QMainWindow):
 
         self._show_manage()
 
-    def _make_nav_tab(self, label: str, callback) -> TabButton:
-        btn = TabButton(label, show_dot=False, show_close=False, parent=self._header)
+    def _make_nav_tab(self, label: str, callback, closeable: bool = False) -> TabButton:
+        btn = TabButton(label, show_dot=closeable, show_close=closeable, parent=self._header)
         btn.clicked.connect(callback)
         return btn
 
@@ -787,6 +800,8 @@ class Launcher(QMainWindow):
         self._tags_tab.set_active(False)
         self._calc_tab.set_active(False)
         self._rand_tab.set_active(False)
+        self._face_tab.set_active(False)
+        self._enh_tab.set_active(False)
         for entry in self._tab_data.values():
             entry["tab_btn"].set_active(False)
 
@@ -802,6 +817,7 @@ class Launcher(QMainWindow):
             from tags.tag_handler_page import TagHandlerPage
             self._tags_page  = TagHandlerPage()
             self._tags_index = self._stack.addWidget(self._tags_page)
+            self._tags_tab.set_dot_online(True)
         self._deactivate_all()
         self._tags_tab.set_active(True)
         self._active_url = None
@@ -813,6 +829,7 @@ class Launcher(QMainWindow):
             from calculator.calculator_page import CalculatorPage
             self._calc_page  = CalculatorPage()
             self._calc_index = self._stack.addWidget(self._calc_page)
+            self._calc_tab.set_dot_online(True)
         self._deactivate_all()
         self._calc_tab.set_active(True)
         self._active_url = None
@@ -824,10 +841,23 @@ class Launcher(QMainWindow):
             from randomizer.randomizer_page import RandomizerPage
             self._rand_page  = RandomizerPage()
             self._rand_index = self._stack.addWidget(self._rand_page)
+            self._rand_tab.set_dot_online(True)
         self._deactivate_all()
         self._rand_tab.set_active(True)
         self._active_url = None
         self._stack.setCurrentIndex(self._rand_index)
+        self._set_zoom_display(1.0)
+
+    def _show_faceswap(self):
+        if self._face_page is None:
+            from faces.face_swap_page import FaceSwapPage
+            self._face_page  = FaceSwapPage()
+            self._face_index = self._stack.addWidget(self._face_page)
+            self._face_tab.set_dot_online(True)
+        self._deactivate_all()
+        self._face_tab.set_active(True)
+        self._active_url = None
+        self._stack.setCurrentIndex(self._face_index)
         self._set_zoom_display(1.0)
 
     def _open_app_tab(self, url: str):
@@ -879,6 +909,87 @@ class Launcher(QMainWindow):
             self._active_url = None
             self._show_manage()
 
+    def _close_tags(self):
+        if self._tags_page is None:
+            return
+        # Warn if there are unsaved edits
+        if getattr(self._tags_page, '_tags_changed', None):
+            from PySide6.QtWidgets import QMessageBox
+            r = QMessageBox.question(
+                self, "Unsaved Changes",
+                "Tag edits have not been saved.\nClose anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        self._stack.removeWidget(self._tags_page)
+        self._tags_page.deleteLater()
+        self._tags_page  = None
+        self._tags_index = None
+        self._tags_tab.set_active(False)
+        self._tags_tab.set_dot_online(False)
+        self._rebuild_stack_index()
+        self._show_manage()
+
+    def _close_calculator(self):
+        if self._calc_page is None:
+            return
+        self._stack.removeWidget(self._calc_page)
+        self._calc_page.deleteLater()
+        self._calc_page  = None
+        self._calc_index = None
+        self._calc_tab.set_active(False)
+        self._calc_tab.set_dot_online(False)
+        self._rebuild_stack_index()
+        self._show_manage()
+
+    def _close_randomizer(self):
+        if self._rand_page is None:
+            return
+        self._stack.removeWidget(self._rand_page)
+        self._rand_page.deleteLater()
+        self._rand_page  = None
+        self._rand_index = None
+        self._rand_tab.set_active(False)
+        self._rand_tab.set_dot_online(False)
+        self._rebuild_stack_index()
+        self._show_manage()
+
+    def _close_faceswap(self):
+        if self._face_page is None:
+            return
+        self._stack.removeWidget(self._face_page)
+        self._face_page.deleteLater()
+        self._face_page  = None
+        self._face_index = None
+        self._face_tab.set_active(False)
+        self._face_tab.set_dot_online(False)
+        self._rebuild_stack_index()
+        self._show_manage()
+
+    def _show_enhancer(self):
+        if self._enh_page is None:
+            from enhancer.enhancer_page import EnhancerPage
+            self._enh_page  = EnhancerPage()
+            self._enh_index = self._stack.addWidget(self._enh_page)
+            self._enh_tab.set_dot_online(True)
+        self._deactivate_all()
+        self._enh_tab.set_active(True)
+        self._active_url = None
+        self._stack.setCurrentIndex(self._enh_index)
+        self._set_zoom_display(1.0)
+
+    def _close_enhancer(self):
+        if self._enh_page is None:
+            return
+        self._stack.removeWidget(self._enh_page)
+        self._enh_page.deleteLater()
+        self._enh_page  = None
+        self._enh_index = None
+        self._enh_tab.set_active(False)
+        self._enh_tab.set_dot_online(False)
+        self._rebuild_stack_index()
+        self._show_manage()
+
     def _rebuild_stack_index(self):
         self._stack_index.clear()
         for url, entry in self._tab_data.items():
@@ -891,6 +1002,10 @@ class Launcher(QMainWindow):
             self._calc_index = self._stack.indexOf(self._calc_page)
         if self._rand_page:
             self._rand_index = self._stack.indexOf(self._rand_page)
+        if self._face_page:
+            self._face_index = self._stack.indexOf(self._face_page)
+        if self._enh_page:
+            self._enh_index = self._stack.indexOf(self._enh_page)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Zoom

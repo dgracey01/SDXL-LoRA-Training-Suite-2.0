@@ -279,8 +279,7 @@ class CalculatorPage(QWidget):
         grid = QGridLayout(frame)
         grid.setContentsMargins(8, 6, 8, 6)
         grid.setSpacing(4)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(5, 1)
+        grid.setColumnStretch(6, 1)   # push both pairs left, trailing space fills right
 
         lbls: dict[str, QLabel] = {}
         for i, (disp, key) in enumerate(fields):
@@ -296,7 +295,7 @@ class CalculatorPage(QWidget):
             val.setStyleSheet(
                 f"background:transparent; color:{PRI}; font-family:{FONT};"
                 f"font-size:{FONT_MD}px; font-weight:bold;")
-            val.setMinimumWidth(110)
+            val.setMinimumWidth(80)
             lbls[key] = val
             grid.addWidget(val, row, bc + 1)
 

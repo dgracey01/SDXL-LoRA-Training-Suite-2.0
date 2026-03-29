@@ -87,6 +87,8 @@ echo.
     realesrgan ^
     safetensors ^
     accelerate ^
+    insightface ^
+    gfpgan ^
     --quiet --disable-pip-version-check
 
 if errorlevel 1 (

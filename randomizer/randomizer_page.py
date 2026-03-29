@@ -63,6 +63,7 @@ MODELS = {
 DEFAULTS = {
     "last_input_dir":  "",
     "last_output_dir": "",
+    "bg_folder":       BG_FOLDER,
     "mode":            "Realism",
     "card_size":       2000,
 }
@@ -418,6 +419,7 @@ class RandomizerPage(QWidget):
         os.makedirs(BG_FOLDER, exist_ok=True)
 
         self._cfg            = load_json(CFG_FILE, DEFAULTS)
+        self._bg_folder      = self._cfg.get("bg_folder", BG_FOLDER)
         self._src_pil        = None   # loaded input (RGBA)
         self._out_pil        = None   # inference result (RGBA, transparent bg)
         self._composited_pil = None   # _out_pil composited over selected bg (RGB)
@@ -608,10 +610,16 @@ class RandomizerPage(QWidget):
         hrow.setContentsMargins(6, 0, 4, 0)
         hrow.setSpacing(4)
 
-        bg_lbl = QLabel("Backgrounds", hdr)
-        bg_lbl.setStyleSheet(
-            f"color:{ACC};font-family:{FONT};font-size:{FONT_SM}px;font-weight:bold;")
-        hrow.addWidget(bg_lbl, stretch=1)
+        bg_browse_btn = QPushButton("Backgrounds ▾", hdr)
+        bg_browse_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{ACC};border:none;"
+            f"font-family:{FONT};font-size:{FONT_SM}px;font-weight:bold;"
+            f"text-align:left;padding:0;}}"
+            f"QPushButton:hover{{color:{PRI};}}")
+        bg_browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        bg_browse_btn.setToolTip("Click to choose a backgrounds folder")
+        bg_browse_btn.clicked.connect(self._browse_bg_folder)
+        hrow.addWidget(bg_browse_btn, stretch=1)
 
         self._bg_count_lbl = QLabel("0", hdr)
         self._bg_count_lbl.setStyleSheet(
@@ -649,7 +657,7 @@ class RandomizerPage(QWidget):
 
         # ── Empty hint ────────────────────────────────────────────────────
         self._bg_empty_lbl = QLabel(
-            "Drop images into\n'random images'\nfolder & refresh", panel)
+            "Click 'Backgrounds'\nto choose a folder", panel)
         self._bg_empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._bg_empty_lbl.setStyleSheet(
             f"color:{MUT};font-family:{FONT};font-size:{FONT_SM}px;"
@@ -746,8 +754,19 @@ class RandomizerPage(QWidget):
     # Background image panel
     # =========================================================================
 
+    def _browse_bg_folder(self):
+        """Let user pick any folder as the backgrounds source."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Backgrounds Folder", self._bg_folder)
+        if not folder:
+            return
+        self._bg_folder = folder
+        self._cfg["bg_folder"] = folder
+        save_json(CFG_FILE, self._cfg)
+        self._load_bg_images()
+
     def _load_bg_images(self):
-        """Scan 'random images' folder and rebuild thumbnail column."""
+        """Scan the selected backgrounds folder and rebuild thumbnail column."""
         # Clear existing cards (keep stretch at end)
         for card in self._thumb_cards:
             self._bg_layout.removeWidget(card)
@@ -755,8 +774,14 @@ class RandomizerPage(QWidget):
         self._thumb_cards.clear()
         self._selected_bg = None
 
+        folder = Path(self._bg_folder)
+        if not folder.exists():
+            self._bg_empty_lbl.setVisible(True)
+            self._bg_count_lbl.setText("0")
+            return
+
         paths = sorted(
-            p for p in Path(BG_FOLDER).iterdir()
+            p for p in folder.iterdir()
             if p.suffix.lower() in IMAGE_EXTS
         )
 

@@ -1,0 +1,48 @@
+{
+  "last_dataset_dir": "X:/AI-Toolkit/datasets",
+  "last_export_dir": "",
+  "last_model_dir": "X:/model",
+  "last_kohya_prompts_dir": "",
+  "aitoolkit_path": "X:/AI-Toolkit",
+  "base_model_path": "X:/model/sdXL_v10VAEFix.safetensors",
+  "default_caption": "Created by Zero",
+  "version": "1.0",
+  "sample_prompts": [
+    "tifaba, 1girl, skirt, gloves, fingerless gloves, crop top, midriff, miniskirt, suspenders, suspender skirt, pencil skirt, long hair, belt, black skirt, navel, elbow gloves, elbow pads",
+    "tifaba, 1girl, skirt, gloves, fingerless gloves, crop top, midriff, miniskirt, suspenders, suspender skirt, pencil skirt, long hair, belt, black skirt, navel, elbow gloves, elbow pads",
+    "tifaba, 1girl, skirt, gloves, fingerless gloves, crop top, midriff, miniskirt, suspenders, suspender skirt, pencil skirt, long hair, belt, black skirt, navel, elbow gloves, elbow pads "
+  ],
+  "kohya_sample_prompts": [
+    "",
+    "",
+    ""
+  ],
+  "in_network": true,
+  "local_drive": "X",
+  "remote_drive": "I",
+  "bucket_512": false,
+  "bucket_256": false,
+  "cache_latents": true,
+  "lora_type": "character",
+  "dataset_files": "0",
+  "tagged": false,
+  "rank_cap": "auto",
+  "batch_size": "2",
+  "at_factor": "1",
+  "ko_factor": "1",
+  "cv_factor": "1",
+  "tos_presets": {
+    "character": "Recommended",
+    "concept": "Recommended",
+    "style": "Recommended",
+    "outfit": "Recommended",
+    "pose": "Recommended"
+  },
+  "tos_overrides": {
+    "character": "",
+    "concept": "",
+    "style": "",
+    "outfit": "",
+    "pose": ""
+  }
+}
