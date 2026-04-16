@@ -8,6 +8,7 @@ __pycache__/
 
 # ── Downloaded models (auto-downloaded on first use) ──────────────────────────
 tags/models/
+tags/*.pth
 randomizer/models/
 
 # ── User config & data ─────────────────────────────────────────────────────────
