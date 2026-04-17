@@ -1,5 +1,6 @@
 # ── Virtual environment ────────────────────────────────────────────────────────
 .venv/
+.venv_zluda_backup/
 
 # ── Python cache ───────────────────────────────────────────────────────────────
 __pycache__/
@@ -21,6 +22,7 @@ faces/faceswap_config.json
 enhancer/enhancer_config.json
 faces/inswapper_128.onnx
 faces/GFPGANv1.4.pth
+faces/models/
 gfpgan/weights/detection_Resnet50_Final.pth
 gfpgan/weights/parsing_parsenet.pth
 gfpgan/weights/*.partial

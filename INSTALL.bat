@@ -1,16 +1,17 @@
 @echo off
-title Lora Training Suite 2.0 — Installer
+chcp 65001 >nul
+title Lora Training Suite 2.0 - Installer
 color 0A
 
 echo ================================================================================
-echo   Lora Training Suite v2.0 — Installer
+echo   Lora Training Suite v2.0 - Installer
 echo   Designed by: Zero  ^|  Built by: Jarvis
 echo ================================================================================
 echo.
 
 set "SUITE_DIR=%~dp0"
 
-:: ── Check Python ──────────────────────────────────────────────────────────────
+:: -- Check Python --
 echo [CHECKING] Python...
 python --version >nul 2>&1
 if errorlevel 1 (
@@ -37,7 +38,7 @@ echo [OK] Python found:
 python --version
 echo.
 
-:: ── Create virtual environment ─────────────────────────────────────────────
+:: -- Create virtual environment --
 echo ================================================================================
 echo   [1/3] Creating virtual environment
 echo ================================================================================
@@ -56,31 +57,30 @@ if not exist "%SUITE_DIR%.venv\Scripts\python.exe" (
 )
 echo.
 
-:: ── Upgrade pip ───────────────────────────────────────────────────────────────
+:: -- Upgrade pip --
 echo ================================================================================
 echo   [2/3] Upgrading pip
 echo ================================================================================
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --upgrade pip --quiet --disable-pip-version-check
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
 echo [OK] pip up to date.
 echo.
 
-:: ── Install packages ──────────────────────────────────────────────────────────
+:: -- Install packages --
 echo ================================================================================
 echo   [3/3] Installing packages
 echo ================================================================================
 echo.
-echo Installing PySide6 (Qt 6 — bundled Chromium, ~150 MB)...
-echo Note: PySide6 ^>=6.4 includes WebEngine — no separate package needed.
+echo Installing PySide6, Pillow, numpy, transformers, and friends...
 echo This may take several minutes on first install.
 echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install ^
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
     PySide6 ^
     Pillow ^
     numpy ^
     opencv-python ^
     PyYAML ^
     huggingface-hub ^
-    transformers ^
+    "transformers==4.46.3" ^
     einops ^
     kornia ^
     timm ^
@@ -89,7 +89,8 @@ echo.
     accelerate ^
     insightface ^
     gfpgan ^
-    --quiet --disable-pip-version-check
+    tiktoken ^
+    sentencepiece
 
 if errorlevel 1 (
     echo.
@@ -102,23 +103,25 @@ if errorlevel 1 (
 echo [OK] Core packages installed.
 echo.
 
-:: ── GPU acceleration (for WD14 tagger + JoyCaption) ───────────────────────────
+:: -- GPU acceleration --
 echo ================================================================================
 echo   GPU Acceleration  (WD14 tagger + JoyCaption)
 echo ================================================================================
 echo.
 echo   [1] NVIDIA GPU   CUDA 12.1 - recommended if you have an NVIDIA card
-echo   [2] AMD GPU      DirectML
-echo   [3] CPU only     No GPU - slow for auto-tagging but fully functional
-echo   [4] Skip         Install manually later
+echo   [2] AMD GPU      ROCm (AMD RX 5000+ on Windows via native ROCm PyTorch)
+echo   [3] AMD GPU      DirectML (simpler alternative for AMD/Intel)
+echo   [4] CPU only     No GPU - slow for auto-tagging but fully functional
+echo   [5] Skip         Install manually later
 echo.
-set /p GPU_CHOICE="   Enter choice (1/2/3/4): "
+set /p GPU_CHOICE="   Enter choice (1/2/3/4/5): "
 echo.
 
 if "%GPU_CHOICE%"=="1" goto :nvidia
-if "%GPU_CHOICE%"=="2" goto :amd
-if "%GPU_CHOICE%"=="3" goto :cpu
-if "%GPU_CHOICE%"=="4" goto :done
+if "%GPU_CHOICE%"=="2" goto :rocm
+if "%GPU_CHOICE%"=="3" goto :amd
+if "%GPU_CHOICE%"=="4" goto :cpu
+if "%GPU_CHOICE%"=="5" goto :done
 echo Invalid choice - skipping GPU setup.
 goto :done
 
@@ -126,21 +129,32 @@ goto :done
 echo Installing NVIDIA packages (onnxruntime-gpu, torch, torchvision)...
 echo NOTE: Download is approximately 2-3 GB. This will take a while.
 echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install ^
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime-gpu
+if errorlevel 1 ( echo [ERROR] onnxruntime-gpu install failed. & goto :done )
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
+    torch torchvision ^
+    --index-url https://download.pytorch.org/whl/cu121
+if errorlevel 1 ( echo [ERROR] NVIDIA torch install failed. ) else ( echo [OK] NVIDIA packages installed. )
+goto :done
+
+:rocm
+echo Installing AMD ROCm packages (native ROCm PyTorch)...
+echo NOTE: Download is approximately 2-3 GB. This will take a while.
+echo.
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
     onnxruntime-gpu ^
     torch torchvision ^
-    --index-url https://download.pytorch.org/whl/cu121 ^
-    --quiet --disable-pip-version-check
-if errorlevel 1 ( echo [ERROR] NVIDIA install failed. ) else ( echo [OK] NVIDIA packages installed. )
+    --index-url https://download.pytorch.org/whl/rocm6.2
+if errorlevel 1 ( echo [ERROR] ROCm install failed. ) else ( echo [OK] ROCm packages installed. )
+echo.
+echo Launch with run.bat - no wrapper needed.
 goto :done
 
 :amd
-echo Installing AMD packages (onnxruntime-directml, torch-directml)...
+echo Installing AMD packages (onnxruntime-directml)...
 echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install ^
-    onnxruntime-directml ^
-    torch-directml ^
-    --quiet --disable-pip-version-check
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
+    onnxruntime-directml
 if errorlevel 1 ( echo [ERROR] AMD install failed. ) else ( echo [OK] AMD packages installed. )
 goto :done
 
@@ -148,11 +162,12 @@ goto :done
 echo Installing CPU packages (onnxruntime, torch, torchvision)...
 echo NOTE: Download is approximately 2-3 GB. This will take a while.
 echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install ^
-    onnxruntime ^
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime
+if errorlevel 1 ( echo [ERROR] onnxruntime install failed. & goto :done )
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
     torch torchvision ^
-    --quiet --disable-pip-version-check
-if errorlevel 1 ( echo [ERROR] CPU install failed. ) else ( echo [OK] CPU packages installed. )
+    --index-url https://download.pytorch.org/whl/cpu
+if errorlevel 1 ( echo [ERROR] CPU torch install failed. ) else ( echo [OK] CPU packages installed. )
 goto :done
 
 :done
@@ -161,12 +176,6 @@ echo ===========================================================================
 echo   Installation complete!
 echo.
 echo   Run the suite:  run.bat
-echo.
-echo   What's new in v2.0:
-echo     - PySide6 + bundled Chromium (no Chrome/Edge dependency)
-echo     - Tag Handler and Calculator are now embedded tabs (not separate windows)
-echo     - Per-tab zoom via Qt compositor (no CSS hack)
-echo     - Off-the-record browsing (no cookies on disk)
 echo ================================================================================
 echo.
 pause

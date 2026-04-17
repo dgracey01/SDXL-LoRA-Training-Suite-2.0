@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QDialog, QProgressDialog, QApplication,
     QMenu, QSpacerItem, QSpinBox,
 )
-from PySide6.QtGui import QPixmap, QImage, QFont, QCursor, QKeySequence, QShortcut
+from PySide6.QtGui import QPixmap, QImage, QFont, QCursor, QKeySequence, QShortcut, QDrag
+from PySide6.QtCore import QMimeData
 
 from shared.theme import (
     BG, PAN, CAR, ACC, GRN, RED, MUT, PRI, SEC, AMB,
@@ -43,6 +44,8 @@ MIN_CARD       = 180
 MAX_CARD       = 520
 COLS           = 6
 CARDS_PER_PAGE = 18
+PREP_BATCH     = 30   # cards loaded per scroll-triggered batch in Prepare tab
+EDITOR_BATCH   = 15   # cards loaded per scroll-triggered batch in Editor tab
 THUMB_SIZE     = 340
 MAX_PILL_POOL  = 64
 
@@ -69,10 +72,12 @@ NEG_KEYS      = {"Character":"character_neg","Concept":"concept_neg",
                  "Style":"style_neg","Outfit":"outfit_neg","Pose":"pose_neg"}
 IMAGE_EXTS    = {'.jpg','.jpeg','.png','.webp','.bmp','.tiff','.tif','.gif','.avif'}
 WD_MODELS     = ["WD14 ConvNextV2","WD EVA02-Large"]
-OUTPUT_MODES  = ["Tags","Captions","Hybrid"]
+OUTPUT_MODES  = ["Tags","Captions","Captions (Fast)","Hybrid","Hybrid (GPU)","Hybrid (Fast)"]
 CAP_TYPES     = ["Descriptive","Training Prompt","MidJourney","Booru-like Tags","Formal","Casual"]
 CAP_LENGTHS   = ["Short","Medium","Long","Any"]
 JOY_MODEL_ID  = "fancyfeast/llama-joycaption-alpha-two-hf-llava"
+MOONDREAM_MODEL_ID  = "vikhyatk/moondream2"
+MOONDREAM_REVISION  = "2024-08-26"
 def _joy_prompt(cap_type: str, length: str) -> str:
     """Generate the instruction prompt for JoyCaption given type and length."""
     l = {"Any": "", "Short": "short ", "Medium": "medium-length ",
@@ -88,7 +93,7 @@ def _joy_prompt(cap_type: str, length: str) -> str:
         "Social Media Post":     f"Write a {l}social media caption for this image.",
     }
     return _P.get(cap_type, f"Write a {l}caption for this image.")
-DEVICES      = ["Auto-detect","Force CUDA","Force DirectML","Force CPU"]
+DEVICES      = ["Auto-detect","Force CUDA","Force CPU"]
 EXIST_MODES  = ["Skip","Append","Overwrite"]
 PROC_MODES   = ["Enabled","Disabled"]
 CONV_FMTS    = ["PNG","JPEG"]
@@ -96,6 +101,11 @@ CONV_FMTS    = ["PNG","JPEG"]
 WD14_REPOS = {
     "WD14 ConvNextV2": "SmilingWolf/wd-v1-4-convnextv2-tagger-v2",
     "WD EVA02-Large":  "SmilingWolf/wd-eva02-large-tagger-v3",
+}
+# timm-based models: pure PyTorch inference, GPU-accelerated via ROCm/CUDA
+WD14_TIMM_REPOS = {
+    "WD EVA02-Large (GPU)": "SmilingWolf/wd-eva02-large-tagger-v3",
+    "WD SwinV2 v3 (GPU)":   "SmilingWolf/wd-swinv2-tagger-v3",
 }
 WD14_IMG_SIZE   = 448
 ESR_MODELS = {
@@ -147,7 +157,7 @@ HELP = {
         ("Confidence Threshold","Minimum confidence (0.0–1.0) for a tag to be included. Default 0.35."),
         ("Output Mode","Tags: WD14 only. Captions: JoyCaption only. Hybrid: WD14 tags + JoyCaption caption in one file."),
         ("Existing Files","Skip: leave existing .txt untouched. Append: add new tags. Overwrite: replace content."),
-        ("Device","Auto-detect: CUDA for NVIDIA, DirectML for AMD, CPU fallback."),
+        ("Device","Auto-detect: uses CUDA if available (NVIDIA or AMD ROCm), CPU fallback. Force CUDA: always use GPU. Force CPU: always use CPU."),
         ("Batch Size","Images processed simultaneously. Higher = faster but more VRAM. Default 4."),
     ],
     "Tag Editor":[
@@ -568,11 +578,11 @@ class PrepareCard(QFrame):
         hlay = QHBoxLayout(hdr)
         hlay.setContentsMargins(2,0,2,0); hlay.setSpacing(4)
 
-        del_btn = QPushButton("🗑", hdr)
-        del_btn.setFixedSize(16, 16)
+        del_btn = QPushButton("DEL", hdr)
+        del_btn.setFixedSize(26, 14)
         del_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{MUT};border:none;"
-            f"font-size:10px;padding:0;}}"
+            f"font-family:{FONT};font-size:8px;font-weight:bold;padding:0;}}"
             f"QPushButton:hover{{color:{RED};}}")
         del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         del_btn.setToolTip("Delete image from dataset")
@@ -803,39 +813,50 @@ class TagCloud(QFrame):
         hl.addWidget(collapse_btn)
         root.addWidget(hdr)
 
-        # Search + actions row
+        # Actions row
         self._ctrl = QWidget(self); self._ctrl.setStyleSheet("background:transparent;")
-        cl = QHBoxLayout(self._ctrl); cl.setContentsMargins(0,0,0,0); cl.setSpacing(4)
-        srch_ico = QLabel("🔍",self._ctrl)
-        srch_ico.setStyleSheet(f"color:{MUT};font-size:14px;background:transparent;")
-        cl.addWidget(srch_ico)
-        self._search = QLineEdit(self._ctrl)
-        self._search.setPlaceholderText("Search tags...")
-        self._search.setFixedHeight(30)
-        self._search.setStyleSheet(f"background:{CAR};color:{PRI};border:1px solid {MUT};border-radius:4px;padding:2px 6px;")
-        self._search.textChanged.connect(lambda _: self._refresh())
-        cl.addWidget(self._search,1)
-        clr = QPushButton("×",self._ctrl)
-        clr.setFixedSize(28,30)
-        clr.setStyleSheet(f"background:transparent;color:{MUT};border:none;font-size:15px;")
-        clr.clicked.connect(lambda: self._search.clear())
-        cl.addWidget(clr)
-        self._act_btn = QPushButton("Actions ▼",self._ctrl)
-        self._act_btn.setFixedHeight(30)
+        ctrl_v = QVBoxLayout(self._ctrl); ctrl_v.setContentsMargins(0,0,0,0); ctrl_v.setSpacing(3)
+
+        act_row = QWidget(self._ctrl); act_row.setStyleSheet("background:transparent;")
+        al = QHBoxLayout(act_row); al.setContentsMargins(0,0,0,0); al.setSpacing(4)
+        self._act_btn = QPushButton("Actions ▼", act_row)
+        self._act_btn.setFixedHeight(28)
         self._act_btn.setStyleSheet(
             f"background:{ACC};color:{PRI};border:none;border-radius:4px;"
             f"font-weight:bold;padding:4px 10px;")
         self._act_btn.clicked.connect(self._show_actions)
-        cl.addWidget(self._act_btn)
-        self._desel_btn = QPushButton("Deselect All",self._ctrl)
-        self._desel_btn.setFixedHeight(30)
+        al.addWidget(self._act_btn)
+        self._desel_btn = QPushButton("Select ▼", act_row)
+        self._desel_btn.setFixedHeight(28)
         self._desel_btn.setStyleSheet(
             f"background:{CAR};color:{SEC};border:1px solid {MUT};border-radius:4px;padding:4px 8px;")
-        self._desel_btn.clicked.connect(self._deselect_all)
-        cl.addWidget(self._desel_btn)
+        self._desel_btn.clicked.connect(self._show_select_menu)
+        al.addWidget(self._desel_btn)
+        al.addStretch()
+        ctrl_v.addWidget(act_row)
+
+        # Search row
+        srch_row = QWidget(self._ctrl); srch_row.setStyleSheet("background:transparent;")
+        cl = QHBoxLayout(srch_row); cl.setContentsMargins(0,0,0,0); cl.setSpacing(4)
+        srch_ico = QLabel("🔍", srch_row)
+        srch_ico.setStyleSheet(f"color:{MUT};font-size:14px;background:transparent;")
+        cl.addWidget(srch_ico)
+        self._search = QLineEdit(srch_row)
+        self._search.setPlaceholderText("Search tags...")
+        self._search.setFixedHeight(28)
+        self._search.setStyleSheet(f"background:{CAR};color:{PRI};border:1px solid {MUT};border-radius:4px;padding:2px 6px;")
+        self._search.textChanged.connect(lambda _: self._refresh())
+        cl.addWidget(self._search, 1)
+        clr = QPushButton("×", srch_row)
+        clr.setFixedSize(28, 28)
+        clr.setStyleSheet(f"background:transparent;color:{MUT};border:none;font-size:15px;")
+        clr.clicked.connect(lambda: self._search.clear())
+        cl.addWidget(clr)
+        ctrl_v.addWidget(srch_row)
+
         root.addWidget(self._ctrl)
 
-        # Pill scroll area
+        # Pill scroll area — flow layout (horizontal mode)
         self._scroll = QScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFixedHeight(220)
@@ -847,21 +868,59 @@ class TagCloud(QFrame):
         self._scroll.setWidget(self._pill_widget)
         root.addWidget(self._scroll)
 
+        # Pill scroll area — vertical layout (vertical mode, one pill per line)
+        self._scroll_v = QScrollArea(self)
+        self._scroll_v.setWidgetResizable(True)
+        self._scroll_v.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self._pill_v_widget = QWidget()
+        self._pill_v_widget.setStyleSheet(f"background:{PAN};")
+        self._pill_v_layout = QVBoxLayout(self._pill_v_widget)
+        self._pill_v_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._pill_v_layout.setContentsMargins(4, 4, 4, 4)
+        self._pill_v_layout.setSpacing(3)
+        self._scroll_v.setWidget(self._pill_v_widget)
+        self._scroll_v.setVisible(False)
+        root.addWidget(self._scroll_v)
+
+        self._single_col = False
+
     def _toggle(self):
         self.collapsed = not self.collapsed
         self._ctrl.setVisible(not self.collapsed)
-        self._scroll.setVisible(not self.collapsed)
+        # Only show the active scroll area when expanded
+        if not self.collapsed:
+            self._scroll.setVisible(not self._single_col)
+            self._scroll_v.setVisible(self._single_col)
+        else:
+            self._scroll.setVisible(False)
+            self._scroll_v.setVisible(False)
 
     def load(self,tags_freq,total_images):
         self.all_tags = tags_freq
         self._img_badge.setText(f"🖼 {total_images}")
         self._refresh()
 
+    def set_single_column(self, single: bool):
+        """Switch between flow layout (horizontal mode) and single-column layout (vertical mode)."""
+        if getattr(self, '_single_col', False) == single:
+            return
+        self._single_col = single
+        self._scroll.setVisible(not single)
+        self._scroll_v.setVisible(single)
+        self._refresh()
+
     def _refresh(self):
-        # Clear existing pills
-        while self._pill_layout.count():
-            it = self._pill_layout.takeAt(0)
-            if it.widget(): it.widget().deleteLater()
+        # Clear active pill container
+        if self._single_col:
+            while self._pill_v_layout.count():
+                it = self._pill_v_layout.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+            active_widget = self._pill_v_widget
+        else:
+            while self._pill_layout.count():
+                it = self._pill_layout.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+            active_widget = self._pill_widget
 
         search = self._search.text().lower()
         tags = [(t,c) for t,c in sorted(self.all_tags.items(),key=lambda x:-x[1])
@@ -869,24 +928,32 @@ class TagCloud(QFrame):
         if not tags:
             lbl = QLabel("No tags found.")
             lbl.setStyleSheet(f"color:{MUT};font-size:11px;padding:8px;background:transparent;")
-            self._pill_layout.addWidget(lbl)
+            if self._single_col:
+                self._pill_v_layout.addWidget(lbl)
+            else:
+                self._pill_layout.addWidget(lbl)
             return
         self._pill_map = {}
         for tag,count in tags:
             sel = tag in self.selected
-            txt = f" ✓ {tag}  {count} " if sel else f" {tag}  {count} "
+            txt = f" {tag}  {count} "
             fg  = ACC if sel else CAR
             bc2 = ACC if sel else MUT
-            btn = QPushButton(txt,self._pill_widget)
+            btn = QPushButton(txt, active_widget)
             btn.setFixedHeight(28)
             btn.setStyleSheet(
                 f"QPushButton{{background:{fg};color:{PRI};border:1px solid {bc2};"
                 f"border-radius:10px;font-size:11px;font-weight:bold;padding:2px 6px;}}"
                 f"QPushButton:hover{{background:#185FA5;border-color:{ACC};}}")
+            if self._single_col:
+                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda _,t=tag: self._toggle_tag(t))
-            self._pill_layout.addWidget(btn)
+            if self._single_col:
+                self._pill_v_layout.addWidget(btn)
+            else:
+                self._pill_layout.addWidget(btn)
             self._pill_map[tag] = btn
-        QTimer.singleShot(0, lambda: self._pill_widget.adjustSize())
+        QTimer.singleShot(0, lambda: active_widget.adjustSize())
 
     def _toggle_tag(self,tag):
         if tag in self.selected: self.selected.discard(tag)
@@ -901,7 +968,7 @@ class TagCloud(QFrame):
             btn = self._pill_map.get(tag)
             if btn and btn.isVisible():
                 sel = tag in self.selected
-                txt = f" ✓ {tag}  {self.all_tags.get(tag,'')} " if sel else f" {tag}  {self.all_tags.get(tag,'')} "
+                txt = f" {tag}  {self.all_tags.get(tag,'')} "
                 fg  = ACC if sel else CAR
                 bc2 = ACC if sel else MUT
                 btn.setText(txt)
@@ -920,6 +987,26 @@ class TagCloud(QFrame):
             f"background:{CAR};color:{SEC};border:1px solid {MUT};border-radius:4px;padding:4px 8px;")
         self._refresh()
         if self.on_filter: self.on_filter(set())
+
+    def _select_all(self):
+        self.selected = set(self.all_tags.keys())
+        n = len(self.selected)
+        self._sel_badge.setText(f"🏷 {n}" if n else "")
+        self._sel_badge.setVisible(bool(n))
+        self._desel_btn.setStyleSheet(
+            f"background:{CAR};color:{RED};border:1px solid {RED};border-radius:4px;padding:4px 8px;")
+        self._refresh()
+        if self.on_filter: self.on_filter(self.selected)
+
+    def _show_select_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu{{background:{CAR};color:{PRI};border:1px solid {MUT};}}"
+            f"QMenu::item:selected{{background:{ACC};}}")
+        menu.addAction("Deselect All", self._deselect_all)
+        menu.addAction("Select All",   self._select_all)
+        btn = self._desel_btn
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def _show_actions(self):
         if not self.selected:
@@ -960,6 +1047,81 @@ class _ThumbLabel(QLabel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  DRAG-AND-DROP TAG PILLS
+# ══════════════════════════════════════════════════════════════════════════════
+class DraggableTagPill(QPushButton):
+    """Tag pill that initiates a drag on significant mouse movement."""
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = e.pos()
+            self._dragging   = False
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if not getattr(self, '_drag_start', None):
+            return
+        if (e.pos() - self._drag_start).manhattanLength() < 8:
+            return
+        self._dragging = True
+        mime = QMimeData()
+        mime.setText(self.property("tag_name"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(self.grab())
+        drag.setHotSpot(e.pos())
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def mouseReleaseEvent(self, e):
+        if getattr(self, '_dragging', False):
+            self._dragging   = False
+            self._drag_start = None
+            return          # swallow — no click/delete
+        super().mouseReleaseEvent(e)
+
+
+class DroppablePillWidget(QWidget):
+    """Pill container that accepts tag drops and emits the new insertion index."""
+    tag_reordered = Signal(str, int)   # (tag_name, new_index)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasText():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        tag = e.mimeData().text()
+        idx = self._drop_index(e.position().toPoint())
+        e.acceptProposedAction()
+        self.tag_reordered.emit(tag, idx)
+
+    def _drop_index(self, pos):
+        layout = self.layout()
+        if not layout:
+            return 0
+        n = layout.count()
+        for i in range(n):
+            item = layout.itemAt(i)
+            if not item or not item.widget():
+                continue
+            geo = item.widget().geometry()
+            # Drop point is above this pill's row → insert before it
+            if pos.y() < geo.top():
+                return i
+            # Same row: insert before if left of centre
+            if geo.top() <= pos.y() <= geo.bottom():
+                if pos.x() < geo.x() + geo.width() // 2:
+                    return i
+        return n
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  EDITOR CARD
 # ══════════════════════════════════════════════════════════════════════════════
 class EditorCard(QFrame):
@@ -995,11 +1157,12 @@ class EditorCard(QFrame):
         self._tag_scroll.setWidgetResizable(True)
         self._tag_scroll.setFixedHeight(160)
         self._tag_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
-        self._pill_widget = QWidget()
+        self._pill_widget = DroppablePillWidget()
         self._pill_widget.setStyleSheet(f"background:{CAR};")
         self._pill_layout = FlowLayout(self._pill_widget,h_spacing=3,v_spacing=3)
         self._pill_layout.setContentsMargins(4,4,4,4)
         self._pill_widget.setLayout(self._pill_layout)
+        self._pill_widget.tag_reordered.connect(self._on_tag_reordered)
         self._tag_scroll.setWidget(self._pill_widget)
         root.addWidget(self._tag_scroll)
 
@@ -1083,8 +1246,10 @@ class EditorCard(QFrame):
             is_trig = bool(trig_low) and tag.lower()==trig_low
             fg  = ACC if hl else "#3a3a3a"
             bc2 = ACC if (hl or is_trig) else SEC
-            btn = QPushButton(f" {tag.upper()} ",self._pill_widget)
+            btn = DraggableTagPill(f" {tag.upper()} ", self._pill_widget)
+            btn.setProperty("tag_name", tag)
             btn.setFixedHeight(28)
+            btn.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
             btn.setStyleSheet(
                 f"QPushButton{{background:{fg};color:{PRI};border:1px solid {bc2};"
                 f"border-radius:4px;font-size:12px;font-weight:bold;padding:2px 4px;}}"
@@ -1144,6 +1309,19 @@ class EditorCard(QFrame):
             _write_tags(self.img_path,tags); self._captions=[]
         if self.on_tags_changed: self.on_tags_changed(self.img_path)
 
+    def _on_tag_reordered(self, tag: str, drop_idx: int):
+        all_items = _read_tags(self.img_path)
+        tags, caps = _split_tags_captions(all_items)
+        # Find original position (case-insensitive)
+        tag_low = tag.lower()
+        orig_idx = next((i for i,t in enumerate(tags) if t.lower()==tag_low), None)
+        if orig_idx is None or orig_idx == drop_idx:
+            return
+        tags.insert(drop_idx, tags.pop(orig_idx))
+        _write_tags(self.img_path, tags + caps)
+        self.refresh_pills()
+        if self.on_tags_changed: self.on_tags_changed(self.img_path)
+
     def set_highlighted(self,tags):
         self.highlighted=tags; self.refresh_pills()
 
@@ -1160,12 +1338,15 @@ class EditorCard(QFrame):
         self._hover_frame.setStyleSheet("background:transparent;border:none;")
         hfl = QHBoxLayout(self._hover_frame)
         hfl.setContentsMargins(0,0,0,0); hfl.setSpacing(4)
-        for icon,color,cmd in [("🚫",AMB,self._disable_image),
-                                ("🗑",RED,self._delete_image)]:
-            btn = QPushButton(icon,self._hover_frame)
-            btn.setFixedSize(30,30)
+        for text,tip,color,cmd in [("OFF","Disable image (hides from tagger)",AMB,self._disable_image),
+                                    ("DEL","Delete image from dataset",RED,self._delete_image)]:
+            btn = QPushButton(text,self._hover_frame)
+            btn.setFixedSize(34,24)
+            btn.setToolTip(tip)
             btn.setStyleSheet(
-                f"background:{CAR};color:{color};border-radius:4px;font-size:14px;border:none;")
+                f"QPushButton{{background:{CAR};color:{color};border-radius:4px;"
+                f"font-family:{FONT};font-size:9px;font-weight:bold;border:none;}}"
+                f"QPushButton:hover{{background:{color};color:{PRI};}}")
             btn.clicked.connect(cmd)
             hfl.addWidget(btn)
         self._hover_frame.adjustSize()
@@ -1355,7 +1536,8 @@ class TagHandlerPage(QWidget):
         self._undo_stack: list      = []
 
         # editor state
-        self._editor_page  = 0
+        self._editor_loaded:  int  = 0
+        self._editor_visible: list = []
         self._editor_cards: list[EditorCard] = []
         self._tags_changed: set[str] = set()
         self._flush_timer  = QTimer(self)
@@ -1363,9 +1545,9 @@ class TagHandlerPage(QWidget):
         self._flush_timer.timeout.connect(self._flush_tags_changed)
 
         # prepare state
-        self._prepare_page  = 0
         self._prep_card_widgets: list[PrepareCard] = []
         self._crop_offsets: dict = {}   # img_path → (ox, oy, zoom, tw, th)
+        self._prep_loaded: int = 0      # how many cards have been appended so far
 
         # tagger state
         self._tagger_thread_obj = None
@@ -1519,51 +1701,22 @@ class TagHandlerPage(QWidget):
         self._prep_grid.setSpacing(6)
         self._prep_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self._prep_scroll.setWidget(self._prep_inner)
+        self._prep_scroll.verticalScrollBar().valueChanged.connect(
+            self._on_prep_scroll)
         v.addWidget(self._prep_scroll, stretch=1)
 
-        # pagination
-        nav = QFrame(self._prepare_tab)
-        nav.setStyleSheet(f"background:{PAN};border-radius:4px;")
-        nh = QHBoxLayout(nav)
-        nh.setContentsMargins(6, 4, 6, 4)
-        nh.setSpacing(6)
-        self._prep_prev = self._mk_btn(nav, "◀ Prev", min_w=80)
-        self._prep_prev.clicked.connect(lambda: self._go_prepare(-1))
-        self._prep_page_lbl = self._mk_label(nav, "Page 0/0", color=MUT)
-        self._prep_next = self._mk_btn(nav, "Next ▶", min_w=80)
-        self._prep_next.clicked.connect(lambda: self._go_prepare(1))
-        nh.addWidget(self._prep_prev)
-        nh.addStretch()
-        nh.addWidget(self._prep_page_lbl)
-        nh.addStretch()
-        nh.addWidget(self._prep_next)
-        v.addWidget(nav)
 
         # init ratio label
         self._update_res_indicator(self._res_combo.currentText())
 
     def _render_prepare_page(self):
-        if not self._images:
-            return
-        cols      = self._prep_cols_spin.value()
-        page_size = CARDS_PER_PAGE
-        total     = len(self._images)
-        pages     = max(1, math.ceil(total / page_size))
-        self._prepare_page = max(0, min(self._prepare_page, pages - 1))
+        """Clear all cards and load the first batch (infinite-scroll reset)."""
+        # snapshot any currently visible cards before clearing
+        for card in self._prep_card_widgets:
+            ox, oy = card.get_offset()
+            tw_c, th_c = card.get_resolution()
+            self._crop_offsets[card.img_path] = (ox, oy, card.get_zoom(), tw_c, th_c)
 
-        self._prep_page_lbl.setText(f"Page {self._prepare_page+1}/{pages}")
-        self._prep_prev.setEnabled(self._prepare_page > 0)
-        self._prep_next.setEnabled(self._prepare_page < pages - 1)
-
-        start = self._prepare_page * page_size
-        end   = min(start + page_size, total)
-        batch = self._images[start:end]
-
-        res_txt   = self._res_combo.currentText()
-        is_manual = (res_txt == "Manual")
-        tw, th, _ = RES_MAP.get(res_txt, (1024, 1024, "1:1"))
-
-        # clear old widgets
         for card in self._prep_card_widgets:
             card.setParent(None)
             card.deleteLater()
@@ -1574,8 +1727,20 @@ class TagHandlerPage(QWidget):
             if item.widget():
                 item.widget().setParent(None)
 
-        for i, img_path in enumerate(batch):
-            saved = self._crop_offsets.get(img_path)
+        self._prep_loaded = 0
+        if not self._images:
+            return
+        self._append_prepare_cards(0, min(PREP_BATCH, len(self._images)))
+
+    def _append_prepare_cards(self, start: int, end: int):
+        """Append cards for self._images[start:end] to the grid."""
+        cols      = self._prep_cols_spin.value()
+        res_txt   = self._res_combo.currentText()
+        is_manual = (res_txt == "Manual")
+        tw, th, _ = RES_MAP.get(res_txt, (1024, 1024, "1:1"))
+
+        for i, img_path in enumerate(self._images[start:end], start=start):
+            saved    = self._crop_offsets.get(img_path)
             s_offset = (saved[0], saved[1]) if saved else None
             s_zoom   = saved[2] if saved else 1.0
             if is_manual and saved and len(saved) > 3:
@@ -1592,15 +1757,24 @@ class TagHandlerPage(QWidget):
             row, col = divmod(i, cols)
             self._prep_grid.addWidget(card, row, col)
 
-    def _go_prepare(self, delta: int):
-        # save current card states before changing page
-        for card in self._prep_card_widgets:
-            ox, oy = card.get_offset()
-            tw_c, th_c = card.get_resolution()
-            self._crop_offsets[card.img_path] = (ox, oy, card.get_zoom(), tw_c, th_c)
-        self._prepare_page += delta
-        self._render_prepare_page()
-        self._prep_scroll.verticalScrollBar().setValue(0)
+        self._prep_loaded = end
+        total = len(self._images)
+        if end < total:
+            self._prep_status.setText(
+                f"{end} of {total} shown — scroll down to load more")
+        else:
+            self._prep_status.setText(
+                f"{total} images loaded from {os.path.basename(self._dataset_folder)}")
+
+    def _on_prep_scroll(self, value: int):
+        """Load next batch when scrolled to 85% of the current content."""
+        if self._prep_loaded >= len(self._images):
+            return
+        sb = self._prep_scroll.verticalScrollBar()
+        if sb.maximum() > 0 and value >= sb.maximum() * 0.85:
+            nxt = min(self._prep_loaded + PREP_BATCH, len(self._images))
+            self._append_prepare_cards(self._prep_loaded, nxt)
+
 
     # ══════════════════════════════════════════════════════════════════════════
     #  TAGGER TAB
@@ -1722,7 +1896,7 @@ class TagHandlerPage(QWidget):
             eg.addWidget(self._mk_label(eng_frame, txt, color=MUT), 0, i * 2,
                          alignment=Qt.AlignmentFlag.AlignLeft)
 
-        self._output_combo = self._mk_combo(eng_frame, OUTPUT_MODES, width=100)
+        self._output_combo = self._mk_combo(eng_frame, OUTPUT_MODES, width=140)
         self._output_combo.currentTextChanged.connect(self._on_output_change)
         eg.addWidget(self._output_combo, 1, 0, 1, 2)
 
@@ -1730,6 +1904,11 @@ class TagHandlerPage(QWidget):
         eg.addWidget(self._tagger_exist_combo, 1, 2, 1, 2)
 
         self._device_combo = self._mk_combo(eng_frame, DEVICES, width=130)
+        saved_device = self._cfg.get("tagger_device", "Auto-detect")
+        idx = self._device_combo.findText(saved_device)
+        if idx >= 0:
+            self._device_combo.setCurrentIndex(idx)
+        self._device_combo.currentTextChanged.connect(self._on_device_changed)
         eg.addWidget(self._device_combo, 1, 4, 1, 2)
 
         batch_row = QWidget(eng_frame)
@@ -1819,7 +1998,7 @@ class TagHandlerPage(QWidget):
         # ── JoyCaption Settings panel ─────────────────────────────────────────
         self._joy_frame = QFrame(inner)
         self._joy_frame.setStyleSheet(
-            f"QFrame{{background:{CAR};border:1px solid {ACC};border-radius:6px;}}")
+            f"QFrame{{background:{CAR};border:none;border-radius:6px;}}")
         jv = QVBoxLayout(self._joy_frame)
         jv.setContentsMargins(12, 8, 12, 8)
         jv.setSpacing(6)
@@ -1889,14 +2068,56 @@ class TagHandlerPage(QWidget):
         rh.addWidget(self._tag_status)
         iv.addWidget(run_frame)
 
+        # ── Tagger log ────────────────────────────────────────────────────────
+        self._tagger_log = QPlainTextEdit(inner)
+        self._tagger_log.setReadOnly(True)
+        self._tagger_log.setMinimumHeight(120)
+        self._tagger_log.setMaximumHeight(220)
+        self._tagger_log.setPlaceholderText("Tagger output will appear here…")
+        self._tagger_log.setStyleSheet(
+            f"QPlainTextEdit {{"
+            f"  background:#0d0d0d; color:#c8c8c8;"
+            f"  border:1px solid {MUT}; border-radius:4px;"
+            f"  font-family:'Consolas','Courier New',monospace; font-size:11px;"
+            f"  padding:4px 6px;"
+            f"}}"
+            f"QScrollBar:vertical {{ background:{CAR}; width:6px; }}"
+            f"QScrollBar::handle:vertical {{ background:{MUT}; border-radius:3px; }}")
+        iv.addWidget(self._tagger_log)
+
         iv.addStretch()
 
-        # initial panel visibility
+        # initial panel visibility — also seeds correct output mode list for saved device
+        self._refresh_output_modes(self._device_combo.currentText())
+
+    def _on_device_changed(self, val: str):
+        self._cfg["tagger_device"] = val
+        _save_cfg(self._cfg)
+        self._refresh_output_modes(val)
+
+    def _refresh_output_modes(self, device: str):
+        """Swap Output Mode options to match the selected device."""
+        use_gpu = "cuda" in device.lower() or device.lower() == "auto-detect"
+        if use_gpu:
+            modes = ["Tags", "Captions", "Captions (Fast)",
+                     "Hybrid (GPU)", "Hybrid", "Hybrid (Fast)"]
+        else:
+            modes = ["Tags", "Captions", "Captions (Fast)",
+                     "Hybrid", "Hybrid (Fast)"]
+        cur = self._output_combo.currentText()
+        self._output_combo.blockSignals(True)
+        self._output_combo.clear()
+        self._output_combo.addItems(modes)
+        # keep current selection if still valid, else default to first item
+        idx = self._output_combo.findText(cur)
+        self._output_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._output_combo.blockSignals(False)
         self._on_output_change(self._output_combo.currentText())
 
     def _on_output_change(self, val: str):
-        show_wd  = val in ("Tags", "Hybrid")
-        show_joy = val in ("Captions", "Hybrid")
+        show_wd  = val in ("Tags", "Hybrid", "Hybrid (GPU)", "Hybrid (Fast)")
+        show_joy = val in ("Captions", "Hybrid", "Hybrid (GPU)",
+                           "Captions (Fast)", "Hybrid (Fast)")
         self._wd14_frame.setVisible(show_wd)
         self._joy_frame.setVisible(show_joy)
 
@@ -1944,7 +2165,6 @@ class TagHandlerPage(QWidget):
             "output_mode":        self._output_combo.currentText(),
             "threshold":          self._thresh_slider.value() / 100,
             "char_threshold":     self._char_thresh_slider.value() / 100,
-            "device":             self._device_combo.currentText(),
             "batch_size":         self._batch_slider.value(),
             "ratings":            {k: chk.isChecked()
                                    for k, chk in self._rat_checks.items()},
@@ -1970,9 +2190,6 @@ class TagHandlerPage(QWidget):
             self._output_combo.setCurrentIndex(idx)
         self._thresh_slider.setValue(int(p.get("threshold", 0.35) * 100))
         self._char_thresh_slider.setValue(int(p.get("char_threshold", 0.85) * 100))
-        idx = self._device_combo.findText(p.get("device", "Auto-detect"))
-        if idx >= 0:
-            self._device_combo.setCurrentIndex(idx)
         self._batch_slider.setValue(int(p.get("batch_size", 4)))
         ratings = p.get("ratings", {})
         for k, chk in self._rat_checks.items():
@@ -2089,6 +2306,7 @@ class TagHandlerPage(QWidget):
         v = QVBoxLayout(self._editor_tab)
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(6)
+        self._ed_main_vbox = v
 
         # ── top controls ─────────────────────────────────────────────────────
         ctrl = QFrame(self._editor_tab)
@@ -2110,9 +2328,31 @@ class TagHandlerPage(QWidget):
 
         ch.addStretch()
 
-        self._dont_sort_cb = QCheckBox("Don't sort", ctrl)
-        self._dont_sort_cb.setStyleSheet(f"color:{SEC};")
-        ch.addWidget(self._dont_sort_cb)
+        # Layout dropdown ("Horizontal" / "Vertical")
+        self._layout_combo = QComboBox(ctrl)
+        self._layout_combo.addItems(["Horizontal", "Vertical"])
+        self._layout_combo.setCurrentText("Vertical")
+        self._layout_combo.setFixedHeight(26)
+        self._layout_combo.setFixedWidth(110)
+        self._layout_combo.setStyleSheet(
+            f"QComboBox{{background:{CAR};color:{PRI};border:1px solid {MUT};"
+            f"border-radius:4px;padding:2px 6px;font-size:12px;}}"
+            f"QComboBox::drop-down{{border:none;}}"
+            f"QComboBox QAbstractItemView{{background:{CAR};color:{PRI};"
+            f"selection-background-color:{ACC};}}")
+        self._layout_combo.currentTextChanged.connect(self._on_editor_layout_changed)
+        ch.addWidget(self._layout_combo)
+
+        # "Don't Sort" toggle button (replaces checkbox)
+        self._dont_sort_btn = QPushButton("Don't Sort", ctrl)
+        self._dont_sort_btn.setCheckable(True)
+        self._dont_sort_btn.setFixedHeight(26)
+        self._dont_sort_btn.setStyleSheet(
+            f"QPushButton{{background:{CAR};color:{SEC};border:1px solid {MUT};"
+            f"border-radius:4px;font-size:12px;padding:0 10px;}}"
+            f"QPushButton:checked{{background:{ACC};color:{PRI};border-color:{ACC};}}"
+            f"QPushButton:hover:!checked{{border-color:{ACC};}}")
+        ch.addWidget(self._dont_sort_btn)
 
         self._unsaved_lbl = self._mk_label(ctrl, "", color=AMB)
         ch.addWidget(self._unsaved_lbl)
@@ -2127,89 +2367,124 @@ class TagHandlerPage(QWidget):
 
         v.addWidget(ctrl)
 
-        # ── tag cloud ─────────────────────────────────────────────────────────
+        # ── shared widgets (parented later by _apply_editor_layout) ──────────
         self._tag_cloud = TagCloud(
-            self._editor_tab,
+            None,
             on_add=self._batch_add_from_cloud,
             on_remove=self._batch_remove_from_cloud_set,
             on_replace=self._batch_replace_prompt,
             on_filter=self._on_cloud_filter_set,
         )
-        self._tag_cloud.setMinimumHeight(100)
-        self._tag_cloud.setMaximumHeight(200)
-        v.addWidget(self._tag_cloud)
 
-        # ── editor scroll area ───────────────────────────────────────────────
-        self._editor_scroll = QScrollArea(self._editor_tab)
+        self._editor_scroll = QScrollArea()
         self._editor_scroll.setWidgetResizable(True)
         self._editor_scroll.setStyleSheet(f"QScrollArea{{border:none;background:{BG};}}")
-        self._editor_inner  = QWidget()
+        self._editor_inner = QWidget()
         self._editor_inner.setStyleSheet(f"background:{BG};")
-        self._editor_grid   = QGridLayout(self._editor_inner)
+        self._editor_grid  = QGridLayout(self._editor_inner)
         self._editor_grid.setSpacing(6)
         self._editor_scroll.setWidget(self._editor_inner)
-        v.addWidget(self._editor_scroll, stretch=1)
+        self._editor_scroll.verticalScrollBar().valueChanged.connect(
+            self._on_editor_scroll)
 
-        # ── pagination ───────────────────────────────────────────────────────
-        nav = QFrame(self._editor_tab)
-        nav.setStyleSheet(f"background:{PAN};border-radius:4px;")
-        nh = QHBoxLayout(nav)
-        nh.setContentsMargins(6, 4, 6, 4)
-        nh.setSpacing(6)
-        self._edit_prev = self._mk_btn(nav, "◀ Prev", min_w=80)
-        self._edit_prev.clicked.connect(lambda: self._go_editor(-1))
-        self._edit_page_lbl = self._mk_label(nav, "Page 0/0", color=MUT)
-        self._edit_next = self._mk_btn(nav, "Next ▶", min_w=80)
-        self._edit_next.clicked.connect(lambda: self._go_editor(1))
-        nh.addWidget(self._edit_prev)
-        nh.addStretch()
-        nh.addWidget(self._edit_page_lbl)
-        nh.addStretch()
-        nh.addWidget(self._edit_next)
-        v.addWidget(nav)
+        # Build initial layout (Horizontal)
+        self._ed_body = None
+        self._apply_editor_layout("Vertical")
+
+
+    def _apply_editor_layout(self, mode: str):
+        """Switch between Horizontal and Vertical editor layout."""
+        # Remove old body from main vbox and detach shared widgets
+        if self._ed_body is not None:
+            self._ed_main_vbox.removeWidget(self._ed_body)
+            self._tag_cloud.setParent(None)
+            self._editor_scroll.setParent(None)
+            self._ed_body.deleteLater()
+            self._ed_body = None
+
+        if mode == "Horizontal":
+            body = QWidget(self._editor_tab)
+            bv = QVBoxLayout(body)
+            bv.setContentsMargins(0, 0, 0, 0)
+            bv.setSpacing(6)
+            self._tag_cloud.setMinimumHeight(100)
+            self._tag_cloud.setMaximumHeight(200)
+            bv.addWidget(self._tag_cloud)
+            bv.addWidget(self._editor_scroll, stretch=1)
+            self._tag_cloud.set_single_column(False)
+
+        else:  # Vertical
+            body = QSplitter(Qt.Orientation.Horizontal, self._editor_tab)
+
+            left = QWidget(body)
+            lv = QVBoxLayout(left)
+            lv.setContentsMargins(0, 0, 0, 0)
+            lv.setSpacing(0)
+            lv.addWidget(self._editor_scroll)
+            body.addWidget(left)
+
+            self._tag_cloud.setMinimumHeight(0)
+            self._tag_cloud.setMaximumHeight(16777215)
+            self._tag_cloud.setMinimumWidth(100)
+            body.addWidget(self._tag_cloud)
+            body.setSizes([900, 170])
+            body.setCollapsible(1, True)
+            self._tag_cloud.set_single_column(True)
+
+        self._ed_body = body
+        # Insert at index 1: after ctrl bar, before pagination nav
+        self._ed_main_vbox.insertWidget(1, body, stretch=1)
+
+    def _on_editor_layout_changed(self, mode: str):
+        self._apply_editor_layout(mode)
+        self._render_editor_page()
 
     def _render_editor_page(self):
-        if not self._images:
-            self._edit_page_lbl.setText("Page 0/0")
-            self._edit_prev.setEnabled(False)
-            self._edit_next.setEnabled(False)
-            return
-
-        pg_size  = CARDS_PER_PAGE
-        cols     = COLS
-        total    = len(self._images)
-        pages    = max(1, math.ceil(total / pg_size))
-        self._editor_page = max(0, min(self._editor_page, pages - 1))
-
-        self._edit_page_lbl.setText(f"Page {self._editor_page+1}/{pages}")
-        self._edit_prev.setEnabled(self._editor_page > 0)
-        self._edit_next.setEnabled(self._editor_page < pages - 1)
-
-        start = self._editor_page * pg_size
-        end   = min(start + pg_size, total)
-        batch = self._images[start:end]
-
-        view_mode    = self._view_seg.get()
-        trigger_word = self._editor_trigger_entry.text().strip()
-        highlighted  = self._tag_cloud.selected  # set of selected tag strings
-
-        # grow the card pool as needed (created with dummy path "")
-        while len(self._editor_cards) < len(batch):
-            card = EditorCard(self._editor_inner, "",
-                              on_tags_changed=self._on_tags_changed,
-                              on_deleted=self._on_image_deleted)
-            self._editor_cards.append(card)
+        """Reset the editor grid and load the first batch (infinite-scroll reset)."""
+        # hide all pooled cards and clear grid
         for card in self._editor_cards:
             card.hide()
-
         while self._editor_grid.count():
             item = self._editor_grid.takeAt(0)
             if item.widget():
                 item.widget().hide()
 
-        for i, img_path in enumerate(batch):
+        if not self._images:
+            self._editor_visible = []
+            self._editor_loaded  = 0
+            return
+
+        highlighted = self._tag_cloud.selected
+        dont_sort   = self._dont_sort_btn.isChecked()
+        if highlighted and not dont_sort:
+            visible = [p for p in self._images
+                       if highlighted.issubset(
+                           {t.strip().lower() for t in _read_tags(p)})]
+        else:
+            visible = self._images
+
+        self._editor_visible = visible
+        self._editor_loaded  = 0
+        self._append_editor_cards(0, min(EDITOR_BATCH, len(visible)))
+
+    def _append_editor_cards(self, start: int, end: int):
+        """Append editor cards for _editor_visible[start:end] to the grid."""
+        cols         = 5 if self._layout_combo.currentText() == "Vertical" else COLS
+        highlighted  = self._tag_cloud.selected
+        view_mode    = self._view_seg.get()
+        trigger_word = self._editor_trigger_entry.text().strip()
+        visible      = self._editor_visible
+
+        # grow pool as needed
+        while len(self._editor_cards) < end:
+            card = EditorCard(self._editor_inner, "",
+                              on_tags_changed=self._on_tags_changed,
+                              on_deleted=self._on_image_deleted)
+            self._editor_cards.append(card)
+
+        for i in range(start, end):
             card = self._editor_cards[i]
-            card.recycle(img_path,
+            card.recycle(visible[i],
                          highlighted_tags=highlighted,
                          view_mode=view_mode,
                          trigger_word=trigger_word)
@@ -2217,24 +2492,27 @@ class TagHandlerPage(QWidget):
             row, col = divmod(i, cols)
             self._editor_grid.addWidget(card, row, col)
 
-        QTimer.singleShot(100, self._prefetch_page_thumbs)
+        self._editor_loaded = end
+        total = len(visible)
+        if end < total:
+            self._tag_status.setText(
+                f"{end} of {total} shown — scroll down to load more")
+        else:
+            self._tag_status.setText(f"{total} images ready.")
 
-    def _go_editor(self, delta: int):
-        if self._tags_changed:
-            r = QMessageBox.question(
-                self, "Unsaved changes",
-                "Save changes before changing page?",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
-            if r == QMessageBox.Cancel:
-                return
-            if r == QMessageBox.Save:
-                self._apply_edits()
-        self._editor_page += delta
-        self._render_editor_page()
-        self._editor_scroll.verticalScrollBar().setValue(0)
+        QTimer.singleShot(100, self._prefetch_next_thumbs)
+
+    def _on_editor_scroll(self, value: int):
+        """Load next batch when scrolled to 85% of current content."""
+        if self._editor_loaded >= len(self._editor_visible):
+            return
+        sb = self._editor_scroll.verticalScrollBar()
+        if sb.maximum() > 0 and value >= sb.maximum() * 0.85:
+            nxt = min(self._editor_loaded + EDITOR_BATCH, len(self._editor_visible))
+            self._append_editor_cards(self._editor_loaded, nxt)
 
     def _on_cloud_filter_set(self, selected: set):
-        """Called by TagCloud when selection changes — re-render to highlight."""
+        """Called by TagCloud when selection changes — filter and re-render."""
         self._render_editor_page()
 
     def _on_tags_changed(self, img_path: str):
@@ -2246,7 +2524,7 @@ class TagHandlerPage(QWidget):
         if not self._tags_changed:
             return
         self._push_undo()
-        dont_sort = self._dont_sort_cb.isChecked()
+        dont_sort = self._dont_sort_btn.isChecked()
         for card in self._editor_cards:
             if card.isVisible() and card.img_path in self._tags_changed:
                 all_items = _read_tags(card.img_path)
@@ -2282,18 +2560,37 @@ class TagHandlerPage(QWidget):
 
     def _apply_edits(self):
         self._push_undo()
-        dont_sort = self._dont_sort_cb.isChecked()
+        dont_sort = self._dont_sort_btn.isChecked()
+        trig = self._trigger_entry.text().strip().lower()
         for card in self._editor_cards:
             if card.isVisible():
                 all_items = _read_tags(card.img_path)
                 tags, caps = _split_tags_captions(all_items)
+                # Split trigger from rest
+                trigger_tags = [t for t in tags if t.strip().lower() == trig] if trig else []
+                other_tags   = [t for t in tags if t.strip().lower() != trig] if trig else tags
                 if not dont_sort:
-                    tags = sorted(tags)
-                _write_tags(card.img_path, tags + caps)
+                    other_tags = sorted(other_tags)
+                _write_tags(card.img_path, trigger_tags + other_tags + caps)
         _flush_tag_cache()
         self._tags_changed.clear()
         self._update_unsaved_label()
         self._rebuild_tag_freq()
+        self._show_save_toast()
+
+    def _show_save_toast(self):
+        toast = QLabel("✓  Saved!", self._editor_tab)
+        toast.setStyleSheet(
+            f"background:{GRN};color:{PRI};font-family:{FONT};"
+            f"font-size:{FONT_MD}px;font-weight:bold;"
+            f"border-radius:8px;padding:10px 24px;")
+        toast.adjustSize()
+        # centre over the editor tab
+        pw, ph = self._editor_tab.width(), self._editor_tab.height()
+        toast.move((pw - toast.width()) // 2, (ph - toast.height()) // 2)
+        toast.raise_()
+        toast.show()
+        QTimer.singleShot(1500, toast.deleteLater)
 
     def _update_unsaved_label(self):
         n = len(self._tags_changed)
@@ -2303,9 +2600,9 @@ class TagHandlerPage(QWidget):
         for p in self._images[:40]:
             _load_or_cache_thumb(p)
 
-    def _prefetch_page_thumbs(self):
-        next_start = (self._editor_page + 1) * CARDS_PER_PAGE
-        for p in self._images[next_start:next_start + CARDS_PER_PAGE]:
+    def _prefetch_next_thumbs(self):
+        nxt = self._editor_loaded
+        for p in self._editor_visible[nxt:nxt + EDITOR_BATCH]:
             _load_or_cache_thumb(p)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2378,25 +2675,6 @@ class TagHandlerPage(QWidget):
         s4v.addWidget(self._batch_rm_edit)
         v.addWidget(sec4)
 
-        # ── replace tags ──────────────────────────────────────────────────────
-        sec5 = QFrame(self._batch_tab)
-        sec5.setStyleSheet(f"background:{PAN};border-radius:4px;")
-        s5g = QGridLayout(sec5)
-        s5g.setContentsMargins(8, 6, 8, 6)
-        s5g.setSpacing(6)
-        s5g.addWidget(self._mk_label(sec5, "Replace:", bold=True), 0, 0)
-        self._batch_repl_src = self._mk_entry(sec5, width=200, placeholder="old tag")
-        self._batch_repl_dst = self._mk_entry(sec5, width=200, placeholder="new tag")
-        btn_repl = self._mk_btn(sec5, "Replace", min_w=90)
-        btn_repl.clicked.connect(
-            lambda: self._batch_replace_from_cloud(
-                self._batch_repl_src.text(), self._batch_repl_dst.text()))
-        s5g.addWidget(self._batch_repl_src, 0, 1)
-        s5g.addWidget(self._mk_label(sec5, "→"), 0, 2)
-        s5g.addWidget(self._batch_repl_dst, 0, 3)
-        s5g.addWidget(btn_repl, 0, 4)
-        v.addWidget(sec5)
-
         # ── freq report + export ──────────────────────────────────────────────
         sec6 = QFrame(self._batch_tab)
         sec6.setStyleSheet(f"background:{PAN};border-radius:4px;")
@@ -2404,10 +2682,13 @@ class TagHandlerPage(QWidget):
         s6h.setContentsMargins(8, 6, 8, 6)
         s6h.setSpacing(8)
         s6h.addWidget(self._mk_label(sec6, "Tag frequency:", bold=True))
+        btn_list = self._mk_btn(sec6, "Show List", min_w=100)
+        btn_list.clicked.connect(self._show_tag_list)
         btn_csv = self._mk_btn(sec6, "Export CSV", min_w=100)
         btn_csv.clicked.connect(self._export_freq_csv)
         btn_zip = self._mk_btn(sec6, "Save Final ZIP", min_w=120)
         btn_zip.clicked.connect(self._save_zip)
+        s6h.addWidget(btn_list)
         s6h.addWidget(btn_csv)
         s6h.addWidget(btn_zip)
         s6h.addStretch()
@@ -2502,9 +2783,6 @@ class TagHandlerPage(QWidget):
 
         _init_tag_cache(self._images)
         self._rebuild_tag_freq()
-
-        self._editor_page  = 0
-        self._prepare_page = 0
 
         total = len(self._images)
         self._prep_status.setText(
@@ -2632,7 +2910,7 @@ class TagHandlerPage(QWidget):
         use_esr    = scale_mode.startswith("RealESRGAN")
         esr_anime  = scale_mode == "RealESRGAN 4x (Anime)"
 
-        # save state of currently visible cards so page-0 offsets are captured
+        # snapshot all card states before processing
         for card in self._prep_card_widgets:
             ox, oy = card.get_offset()
             tw_c, th_c = card.get_resolution()
@@ -2820,13 +3098,27 @@ class TagHandlerPage(QWidget):
         self._btn_run_tagger.setEnabled(False)
         self._tag_status.setText("Starting…")
         self._set_progress(self._tag_progress, 0.0)
+        self._tagger_log.clear()
+        self._tagger_log.appendPlainText(
+            f"Device: {self._device_combo.currentText()}  |  "
+            f"Mode: {self._output_combo.currentText()}  |  "
+            f"Images: {len(self._images)}")
 
         output_mode    = self._output_combo.currentText()
-        # engine is derived from output mode (v1 style: Tags/Hybrid → WD14 Ensemble,
-        # Captions → JoyCaption)
-        engine         = ("JoyCaption" if output_mode == "Captions"
-                          else "WD14 Ensemble")
-        model1         = list(WD14_REPOS.keys())[0]
+        # engine is derived from output mode
+        if output_mode == "Captions":
+            engine = "JoyCaption"
+        elif output_mode in ("Captions (Fast)", "Hybrid (Fast)"):
+            engine = "WD14 Single"   # single EVA02 pass for Hybrid (Fast)
+        elif output_mode == "Hybrid (GPU)":
+            engine = "WD14 GPU"
+        else:
+            engine = "WD14 Ensemble"
+        # Hybrid (Fast) uses EVA02-Large (index 1) as its single WD14 model
+        if output_mode == "Hybrid (Fast)":
+            model1 = list(WD14_REPOS.keys())[1]   # "WD EVA02-Large"
+        else:
+            model1 = list(WD14_REPOS.keys())[0]
         model2         = list(WD14_REPOS.keys())[1]
         threshold      = self._thresh_slider.value() / 100
         char_thresh    = self._char_thresh_slider.value() / 100
@@ -2858,22 +3150,29 @@ class TagHandlerPage(QWidget):
             ratings        = ratings,
             rm_underscores = rm_underscores,
             joy_path       = JOY_MODEL_ID,
+            moondream_path     = MOONDREAM_MODEL_ID,
             joy_type       = self._joy_type_combo.currentText(),
             joy_length     = self._joy_len_combo.currentText(),
             extra          = extra,
             joy_threads    = joy_threads,
             app_dir        = _HERE,
         )
-        self._tagger_thread_obj.progress.connect(
-            lambda v, s: (self._set_progress(self._tag_progress, v),
-                          self._tag_status.setText(s)))
+        self._tagger_thread_obj.progress.connect(self._on_tagger_progress)
         self._tagger_thread_obj.done.connect(self._on_tagger_done)
         self._tagger_thread_obj.start()
+
+    def _on_tagger_progress(self, value: float, status: str):
+        self._set_progress(self._tag_progress, value)
+        self._tag_status.setText(status)
+        if status and status != self._tagger_log.toPlainText().split("\n")[-1]:
+            self._tagger_log.appendPlainText(status)
 
     def _on_tagger_done(self, ok: bool, msg: str):
         self._btn_run_tagger.setEnabled(True)
         self._tag_status.setText(msg)
         self._set_progress(self._tag_progress, 1.0 if ok else 0.0)
+        marker = "✓ " if ok else "✗ "
+        self._tagger_log.appendPlainText(f"\n{marker}{msg}")
         # Clear dirty set BEFORE reinit — prevents stale cache from overwriting
         # what the tagger just wrote to disk.
         if _tag_dirty is not None:
@@ -2930,6 +3229,7 @@ class TagHandlerPage(QWidget):
                 count += 1
         _flush_tag_cache()
         self._rebuild_tag_freq()
+        self._tag_cloud._deselect_all()
         self._render_editor_page()
         self._batch_log(f"Removed {tags_set} from {count} files.")
 
@@ -2938,9 +3238,11 @@ class TagHandlerPage(QWidget):
         tags_list = list(tags) if not isinstance(tags, list) else tags
         if not tags_list:
             return
-        replacement, ok = QInputDialog.getText(
-            self, "Replace Tags",
-            f"Replace '{', '.join(tags_list)}' with:")
+        n = len(tags_list)
+        label = (f"Replacing {n} tag(s) across all images.\nNew tag:"
+                 if n > 1 else
+                 f"Replacing: '{tags_list[0]}'\nNew tag:")
+        replacement, ok = QInputDialog.getText(self, "Replace Tags", label)
         if ok and replacement.strip():
             for src in tags_list:
                 self._batch_replace_from_cloud(src, replacement.strip())
@@ -2954,9 +3256,12 @@ class TagHandlerPage(QWidget):
         count = 0
         for img in self._images:
             existing = _read_tags(img)
+            # Replace src with dst, then deduplicate preserving first occurrence
             replaced = [dst if t == src else t for t in existing]
-            if replaced != existing:
-                _write_tags(img, replaced)
+            seen = {}
+            deduped = [seen.setdefault(t, t) for t in replaced if t not in seen]
+            if deduped != existing:
+                _write_tags(img, deduped)
                 count += 1
         _flush_tag_cache()
         self._rebuild_tag_freq()
@@ -2999,6 +3304,62 @@ class TagHandlerPage(QWidget):
         _flush_tag_cache()
         self._render_editor_page()
         self._batch_log(f"Shuffled tags in {count} files.")
+
+    def _show_tag_list(self):
+        if not self._tag_freq:
+            QMessageBox.warning(self, "No data", "Load a dataset first.")
+            return
+
+        trigger = self._trigger_entry.text().strip().lower()
+        sorted_tags = sorted(self._tag_freq.items(), key=lambda x: -x[1])
+
+        # Trigger word first, then remaining by frequency
+        ordered = []
+        if trigger and trigger in self._tag_freq:
+            ordered.append(trigger)
+        for tag, _ in sorted_tags:
+            if tag.lower() != trigger:
+                ordered.append(tag)
+
+        tag_list = ", ".join(ordered)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Tag List — sorted by frequency")
+        dlg.resize(700, 400)
+        dlg.setStyleSheet(f"background:{BG};")
+        vl = QVBoxLayout(dlg)
+        vl.setContentsMargins(12, 12, 12, 12)
+        vl.setSpacing(8)
+
+        info = QLabel(
+            f"{len(ordered)} unique tags  ·  trigger word first, then by frequency",
+            dlg)
+        info.setStyleSheet(
+            f"color:{SEC};font-family:{FONT};font-size:{FONT_SM}px;background:transparent;")
+        vl.addWidget(info)
+
+        txt = QPlainTextEdit(dlg)
+        txt.setPlainText(tag_list)
+        txt.setReadOnly(True)
+        txt.setStyleSheet(
+            f"QPlainTextEdit{{background:{CAR};color:{PRI};border:1px solid {MUT};"
+            f"border-radius:4px;font-family:{FONT};font-size:{FONT_SM}px;padding:6px;}}")
+        vl.addWidget(txt, stretch=1)
+
+        btn_copy = QPushButton("Copy to Clipboard", dlg)
+        btn_copy.setFixedHeight(30)
+        btn_copy.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{PRI};border:none;border-radius:4px;"
+            f"font-family:{FONT};font-size:{FONT_SM}px;font-weight:bold;padding:4px 16px;}}"
+            f"QPushButton:hover{{background:#185FA5;}}")
+        btn_copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(tag_list))
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(btn_copy)
+        vl.addLayout(btn_row)
+
+        dlg.exec()
 
     def _export_freq_csv(self):
         if not self._tag_freq:
@@ -3205,7 +3566,8 @@ class _TaggerThread(QThread):
                  char_thresh, device, exist_mode, output_mode,
                  trigger, desired, negative,
                  batch_size=4, ratings=None, rm_underscores=True,
-                 joy_path=None, joy_type="Descriptive", joy_length="any",
+                 joy_path=None, moondream_path=None,
+                 joy_type="Descriptive", joy_length="any",
                  extra="", joy_threads=4, app_dir):
         super().__init__()
         self.images         = images
@@ -3226,6 +3588,7 @@ class _TaggerThread(QThread):
             "questionable": True, "explicit": True}
         self.rm_underscores = rm_underscores
         self.joy_path       = joy_path or JOY_MODEL_ID
+        self.moondream_path     = moondream_path or MOONDREAM_MODEL_ID
         self.joy_type       = joy_type
         self.joy_length     = joy_length
         self.extra          = extra
@@ -3238,6 +3601,29 @@ class _TaggerThread(QThread):
             return False
         txt = _txt_path(img_path)
         return os.path.isfile(txt) and os.path.getsize(txt) > 0
+
+    def _joy_should_skip(self, img_path: str) -> bool:
+        """JoyCaption-specific skip: only skip if the .txt already contains a
+        caption (sentence text).  A file that only has WD14 comma-separated
+        tags is NOT considered captioned — JoyCaption will append to it."""
+        if self.exist_mode != "Skip":
+            return False
+        txt = _txt_path(img_path)
+        if not os.path.isfile(txt) or os.path.getsize(txt) == 0:
+            return False
+        try:
+            with open(txt, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.read().split("\n") if l.strip()]
+            if not lines:
+                return False
+            # If the only content is a single tags line, don't skip —
+            # JoyCaption will append the caption below it.
+            if len(lines) == 1 and _line_is_tags(lines[0]):
+                return False
+            # A second line or a non-tag first line means a caption exists.
+            return True
+        except Exception:
+            return False
 
     def _write(self, img_path: str, tags: list[str], caption: str = ""):
         """Write result respecting exist_mode and output_mode."""
@@ -3256,10 +3642,10 @@ class _TaggerThread(QThread):
                 if disk_lines:
                     if _line_is_tags(disk_lines[0]):
                         existing_tags = [t.strip() for t in disk_lines[0].split(',') if t.strip()]
+                        if len(disk_lines) > 1:
+                            existing_cap = "\n".join(disk_lines[1:])
                     else:
-                        existing_cap = disk_lines[0]
-                    for line in disk_lines[1:]:
-                        existing_cap = line
+                        existing_cap = "\n".join(disk_lines)
             except Exception:
                 pass
 
@@ -3281,12 +3667,12 @@ class _TaggerThread(QThread):
         mode = self.output_mode
         if mode == "Tags":
             content = ", ".join(all_tags)
-        elif mode == "Captions":
+        elif mode in ("Captions", "Captions (Fast)"):
             # preserve existing tags when appending
             content = ", ".join(all_tags) if all_tags else ""
             if final_cap:
                 content = (content + "\n" if content else "") + final_cap
-        elif mode == "Hybrid":
+        elif mode in ("Hybrid", "Hybrid (GPU)", "Hybrid (Fast)"):
             content = ", ".join(all_tags)
             if final_cap:
                 content = (content + "\n" if content else "") + final_cap
@@ -3301,18 +3687,38 @@ class _TaggerThread(QThread):
 
     def run(self):
         try:
+            # Hybrid (GPU) uses timm/PyTorch for WD14 (GPU-accelerated).
+            # Plain Hybrid uses ONNX WD14 (CPU only via ORT).
+            use_gpu = "cuda" in self.device.lower() or self.device.lower() == "auto-detect"
+
             if self.output_mode == "Captions":
                 self._run_joycaption()
-            elif self.output_mode == "Hybrid":
-                # Phase 1: WD14 tags — suppress done signal, not finished yet
-                self._run_wd14(emit_done=False)
-                # Phase 2: JoyCaption captions appended to the tags just written
+            elif self.output_mode == "Captions (Fast)":
+                self._run_moondream()
+            elif self.output_mode == "Hybrid (GPU)":
+                self._run_wd14_timm(emit_done=False)
                 saved_exist = self.exist_mode
                 self.exist_mode = "Append"
-                self._run_joycaption()   # emits done at the end
+                self._run_joycaption()
+                self.exist_mode = saved_exist
+            elif self.output_mode == "Hybrid":
+                self._run_wd14(emit_done=False)
+                saved_exist = self.exist_mode
+                self.exist_mode = "Append"
+                self._run_joycaption()
+                self.exist_mode = saved_exist
+            elif self.output_mode == "Hybrid (Fast)":
+                self._run_wd14(emit_done=False)
+                saved_exist = self.exist_mode
+                self.exist_mode = "Append"
+                self._run_moondream()
                 self.exist_mode = saved_exist
             else:
-                self._run_wd14()
+                # Tags mode — timm on GPU, ONNX on CPU
+                if use_gpu:
+                    self._run_wd14_timm()
+                else:
+                    self._run_wd14()
         except Exception as e:
             import traceback
             self.done.emit(False, f"Fatal: {e}\n{traceback.format_exc()}")
@@ -3355,6 +3761,13 @@ class _TaggerThread(QThread):
 
             try:
                 sess = ort.InferenceSession(str(onnx_files[0]), providers=providers)
+                active = sess.get_providers()[0] if sess.get_providers() else "unknown"
+                if active != providers[0]:
+                    # ORT CUDAExecutionProvider not available — expected with ROCm.
+                    # WD14 runs fine on CPU (fast enough). JoyCaption uses PyTorch GPU.
+                    self.progress.emit(0.0, f"{mname}: CPU (ORT CUDAExecutionProvider unavailable)")
+                else:
+                    self.progress.emit(0.0, f"{mname}: using {active}")
             except Exception as e:
                 self.done.emit(False, f"ONNX load failed for {mname}: {e}")
                 return
@@ -3383,59 +3796,377 @@ class _TaggerThread(QThread):
         total  = len(self.images)
         tagged = 0
         errors = 0
+        bs     = max(1, self.batch_size)
 
-        for i, img_path in enumerate(self.images):
-            self.progress.emit(i / total, f"Tagging {i+1}/{total}…")
-            if self._should_skip(img_path):
-                tagged += 1
-                continue
-            try:
-                img = Image.open(img_path).convert("RGBA")
-                bg  = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                bg.alpha_composite(img)
-                img = bg.convert("RGB").resize(
-                    (WD14_IMG_SIZE, WD14_IMG_SIZE), Image.LANCZOS)
-                arr = _np.array(img, dtype=_np.float32)[:, :, ::-1]   # RGB→BGR
-                arr = _np.expand_dims(arr, 0)
+        def _prep(img_path):
+            """Load and preprocess one image → float32 CHW array, or None on error."""
+            img = Image.open(img_path).convert("RGBA")
+            bg  = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            bg.alpha_composite(img)
+            img = bg.convert("RGB").resize(
+                (WD14_IMG_SIZE, WD14_IMG_SIZE), Image.LANCZOS)
+            arr = _np.array(img, dtype=_np.float32)[:, :, ::-1]   # RGB→BGR
+            return arr
 
-                # ratings check — find dominant rating across all sessions
-                skip_img = False
-                for sess, tag_names, gen_idx, ch_idx, rat_idx in sessions:
-                    inp_name = sess.get_inputs()[0].name
-                    preds    = sess.run(None, {inp_name: arr})[0][0]
-                    dom_rating, dom_prob = "general", 0.0
-                    for idx in rat_idx:
-                        rkey = WD14_RATING_MAP.get(tag_names[idx] if idx < len(tag_names) else "")
-                        if rkey and idx < len(preds) and float(preds[idx]) > dom_prob:
-                            dom_rating, dom_prob = rkey, float(preds[idx])
-                    if not self.ratings.get(dom_rating, True):
-                        skip_img = True
-                        break
-                if skip_img:
+        # Chunk images into batches
+        for batch_start in range(0, total, bs):
+            batch_paths = self.images[batch_start:batch_start + bs]
+
+            # Separate skips from images to process
+            to_process = []   # (original_index, path, arr)
+            for j, img_path in enumerate(batch_paths):
+                abs_i = batch_start + j
+                self.progress.emit(abs_i / total,
+                                   f"Tagging {abs_i+1}/{total}…")
+                if self._should_skip(img_path):
                     tagged += 1
                     continue
+                try:
+                    to_process.append((abs_i, img_path, _prep(img_path)))
+                except Exception as e:
+                    errors += 1
+                    self.progress.emit(abs_i / total,
+                        f"Error loading {os.path.basename(img_path)}: {e}")
 
-                tag_union: set[str] = set()
+            if not to_process:
+                continue
+
+            paths_batch = [x[1] for x in to_process]
+            arrs_batch  = _np.stack([x[2] for x in to_process], axis=0)  # (N,H,W,C)
+
+            try:
+                # Run inference once per session for the whole batch,
+                # cache results keyed by image index within to_process
+                # session_preds[sess_idx][img_idx] = preds array
+                session_preds = []
                 for sess, tag_names, gen_idx, ch_idx, rat_idx in sessions:
-                    inp_name = sess.get_inputs()[0].name
-                    preds    = sess.run(None, {inp_name: arr})[0][0]
-                    for idx in gen_idx:
-                        if idx < len(preds) and preds[idx] > self.threshold:
-                            name = tag_names[idx]
-                            tag_union.add(
-                                name.replace("_", " ") if self.rm_underscores else name)
-                    for idx in ch_idx:
-                        if idx < len(preds) and preds[idx] > self.char_thresh:
-                            name = tag_names[idx]
-                            tag_union.add(
-                                name.replace("_", " ") if self.rm_underscores else name)
+                    inp_name  = sess.get_inputs()[0].name
+                    all_preds = sess.run(None, {inp_name: arrs_batch})[0]  # (N, tags)
+                    session_preds.append(all_preds)
 
-                self._write(img_path, list(tag_union))
-                tagged += 1
+                for k, (abs_i, img_path, _) in enumerate(to_process):
+                    try:
+                        # ratings filter — check across all sessions
+                        skip_img = False
+                        for s_idx, (sess, tag_names, gen_idx, ch_idx, rat_idx) \
+                                in enumerate(sessions):
+                            preds = session_preds[s_idx][k]
+                            dom_rating, dom_prob = "general", 0.0
+                            for idx in rat_idx:
+                                rkey = WD14_RATING_MAP.get(
+                                    tag_names[idx] if idx < len(tag_names) else "")
+                                if rkey and idx < len(preds) and \
+                                        float(preds[idx]) > dom_prob:
+                                    dom_rating, dom_prob = rkey, float(preds[idx])
+                            if not self.ratings.get(dom_rating, True):
+                                skip_img = True
+                                break
+                        if skip_img:
+                            tagged += 1
+                            continue
+
+                        # tag extraction — reuse same cached preds
+                        tag_union: set[str] = set()
+                        for s_idx, (sess, tag_names, gen_idx, ch_idx, rat_idx) \
+                                in enumerate(sessions):
+                            preds = session_preds[s_idx][k]
+                            for idx in gen_idx:
+                                if idx < len(preds) and preds[idx] > self.threshold:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+                            for idx in ch_idx:
+                                if idx < len(preds) and preds[idx] > self.char_thresh:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+
+                        self._write(img_path, list(tag_union))
+                        tagged += 1
+                    except Exception as e2:
+                        errors += 1
+                        self.progress.emit(abs_i / total,
+                            f"Error: {os.path.basename(img_path)}: {e2}")
+
             except Exception as e:
-                errors += 1
-                self.progress.emit(i / total,
-                    f"Error: {os.path.basename(img_path)}: {e}")
+                # Batch inference failed (e.g. OOM) — fall back to per-image
+                for abs_i, img_path, arr in to_process:
+                    try:
+                        single    = _np.expand_dims(arr, 0)
+                        skip_img  = False
+                        for sess, tag_names, gen_idx, ch_idx, rat_idx in sessions:
+                            inp_name = sess.get_inputs()[0].name
+                            preds    = sess.run(None, {inp_name: single})[0][0]
+                            dom_rating, dom_prob = "general", 0.0
+                            for idx in rat_idx:
+                                rkey = WD14_RATING_MAP.get(
+                                    tag_names[idx] if idx < len(tag_names) else "")
+                                if rkey and idx < len(preds) and \
+                                        float(preds[idx]) > dom_prob:
+                                    dom_rating, dom_prob = rkey, float(preds[idx])
+                            if not self.ratings.get(dom_rating, True):
+                                skip_img = True
+                                break
+                        if skip_img:
+                            tagged += 1
+                            continue
+                        tag_union: set[str] = set()
+                        for sess, tag_names, gen_idx, ch_idx, rat_idx in sessions:
+                            inp_name = sess.get_inputs()[0].name
+                            preds    = sess.run(None, {inp_name: single})[0][0]
+                            for idx in gen_idx:
+                                if idx < len(preds) and preds[idx] > self.threshold:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+                            for idx in ch_idx:
+                                if idx < len(preds) and preds[idx] > self.char_thresh:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+                        self._write(img_path, list(tag_union))
+                        tagged += 1
+                    except Exception as e2:
+                        errors += 1
+                        self.progress.emit(abs_i / total,
+                            f"Error: {os.path.basename(img_path)}: {e2}")
+
+        self.progress.emit(1.0, "Done.")
+        if emit_done:
+            self.done.emit(True,
+                f"Tagged {tagged}/{total} images. Errors: {errors}.")
+
+    # ── WD14 timm (GPU) ──────────────────────────────────────────────────────
+    def _run_wd14_timm(self, emit_done=True):
+        """Pure PyTorch WD14 inference via timm — GPU-accelerated (ROCm/CUDA)."""
+        try:
+            import torch
+        except ImportError:
+            self.done.emit(False, "torch not installed. Run INSTALL.bat and choose a GPU option.")
+            return
+        try:
+            import timm
+        except ImportError:
+            self.done.emit(False,
+                "timm not installed. Run: pip install timm")
+            return
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            self.done.emit(False,
+                "huggingface_hub not installed. Run: pip install huggingface_hub")
+            return
+
+        # ── resolve device ────────────────────────────────────────────────────
+        dev_lower = self.device.lower()
+        if "cuda" in dev_lower or dev_lower == "auto-detect":
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+        elif "cpu" in dev_lower:
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        # float16 halves VRAM usage with negligible accuracy loss for tagging.
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+        mname   = "WD EVA02-Large (GPU)"
+        repo_id = WD14_TIMM_REPOS[mname]
+
+        # ── pythonw.exe has no console: stdout/stderr are None.
+        #    tqdm/huggingface_hub write to them during download — guard here.
+        import io as _io
+        _saved_out, _saved_err = sys.stdout, sys.stderr
+        if sys.stdout is None: sys.stdout = _io.StringIO()
+        if sys.stderr is None: sys.stderr = _io.StringIO()
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        try:
+            from huggingface_hub import disable_progress_bars as _dpb
+            _dpb()
+        except Exception:
+            pass
+
+        # ── load model ────────────────────────────────────────────────────────
+        self.progress.emit(0.0, f"Loading {mname}…")
+        try:
+            model = timm.create_model("hf-hub:" + repo_id, pretrained=True)
+            model.eval().to(device=device, dtype=dtype)
+            self.progress.emit(0.0, f"{mname}: using {device} ({dtype})")
+        except Exception as e:
+            sys.stdout, sys.stderr = _saved_out, _saved_err
+            self.done.emit(False, f"timm model load failed for {mname}: {e}")
+            return
+        finally:
+            sys.stdout, sys.stderr = _saved_out, _saved_err
+
+        # ── load tags CSV from HF hub ─────────────────────────────────────────
+        if sys.stdout is None: sys.stdout = _io.StringIO()
+        if sys.stderr is None: sys.stderr = _io.StringIO()
+        try:
+            csv_path = hf_hub_download(repo_id, "selected_tags.csv")
+        except Exception as e:
+            self.done.emit(False, f"Could not download tags CSV for {mname}: {e}")
+            return
+        finally:
+            sys.stdout, sys.stderr = _saved_out, _saved_err
+
+        tag_names:   list[str] = []
+        general_idx: list[int] = []
+        char_idx:    list[int] = []
+        rating_idx:  list[int] = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tag_names.append(row.get("name", ""))
+                cat = int(row.get("category", 0))
+                idx = len(tag_names) - 1
+                if cat == 0:   general_idx.append(idx)
+                elif cat == 4: char_idx.append(idx)
+                elif cat == 9: rating_idx.append(idx)
+
+        # ── build transform from model's own data config ──────────────────────
+        data_cfg  = timm.data.resolve_model_data_config(model)
+        transform = timm.data.create_transform(**data_cfg, is_training=False)
+
+        # ── GPU pre-flight check ─────────────────────────────────────────────
+        # Run a dummy forward pass before touching real images. If the GPU
+        # doesn't support the required op variant, fall back to CPU cleanly.
+        if device.type == "cuda":
+            try:
+                _dummy = torch.zeros(1, 3, WD14_IMG_SIZE, WD14_IMG_SIZE,
+                                     device=device, dtype=dtype)
+                with torch.inference_mode():
+                    model(_dummy)
+                del _dummy
+            except RuntimeError as _e:
+                if "CUBLAS" in str(_e) or "cublas" in str(_e).lower():
+                    self.progress.emit(0.0,
+                        f"{mname}: GPU pre-flight failed — switching to CPU")
+                    device = torch.device("cpu")
+                    dtype  = torch.float32
+                    model  = model.to(device=device, dtype=dtype)
+                    self.progress.emit(0.0, f"{mname}: using cpu (float32)")
+                else:
+                    self.done.emit(False, f"GPU pre-flight failed: {_e}")
+                    return
+
+        def _prep(img_path):
+            img = Image.open(img_path).convert("RGBA")
+            bg  = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            bg.alpha_composite(img)
+            img = bg.convert("RGB").resize(
+                (WD14_IMG_SIZE, WD14_IMG_SIZE), Image.LANCZOS)
+            return transform(img)   # CHW float tensor
+
+        total  = len(self.images)
+        tagged = 0
+        errors = 0
+        bs     = max(1, self.batch_size)
+
+        with torch.inference_mode():
+            for batch_start in range(0, total, bs):
+                batch_paths = self.images[batch_start:batch_start + bs]
+
+                to_process = []
+                for j, img_path in enumerate(batch_paths):
+                    abs_i = batch_start + j
+                    self.progress.emit(abs_i / total, f"Tagging {abs_i+1}/{total}…")
+                    if self._should_skip(img_path):
+                        tagged += 1
+                        continue
+                    try:
+                        to_process.append((abs_i, img_path, _prep(img_path)))
+                    except Exception as e:
+                        errors += 1
+                        self.progress.emit(abs_i / total,
+                            f"Error loading {os.path.basename(img_path)}: {e}")
+
+                if not to_process:
+                    continue
+
+                try:
+                    batch_t = torch.stack([x[2] for x in to_process]).to(device=device, dtype=dtype)
+                    preds_batch = torch.sigmoid(model(batch_t)).cpu().float().numpy()  # (N, tags)
+
+                    for k, (abs_i, img_path, _) in enumerate(to_process):
+                        try:
+                            preds = preds_batch[k]
+
+                            # ratings filter
+                            dom_rating, dom_prob = "general", 0.0
+                            for idx in rating_idx:
+                                rkey = WD14_RATING_MAP.get(
+                                    tag_names[idx] if idx < len(tag_names) else "")
+                                if rkey and idx < len(preds) and float(preds[idx]) > dom_prob:
+                                    dom_rating, dom_prob = rkey, float(preds[idx])
+                            if not self.ratings.get(dom_rating, True):
+                                tagged += 1
+                                continue
+
+                            tag_union: set[str] = set()
+                            for idx in general_idx:
+                                if idx < len(preds) and preds[idx] > self.threshold:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+                            for idx in char_idx:
+                                if idx < len(preds) and preds[idx] > self.char_thresh:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+
+                            self._write(img_path, list(tag_union))
+                            tagged += 1
+                        except Exception as e2:
+                            errors += 1
+                            self.progress.emit(abs_i / total,
+                                f"Error: {os.path.basename(img_path)}: {e2}")
+
+                except Exception as e:
+                    # batch failed — fall back to per-image
+                    for abs_i, img_path, tensor in to_process:
+                        try:
+                            preds = torch.sigmoid(
+                                model(tensor.unsqueeze(0).to(device=device, dtype=dtype))
+                            )[0].cpu().float().numpy()
+
+                            dom_rating, dom_prob = "general", 0.0
+                            for idx in rating_idx:
+                                rkey = WD14_RATING_MAP.get(
+                                    tag_names[idx] if idx < len(tag_names) else "")
+                                if rkey and idx < len(preds) and float(preds[idx]) > dom_prob:
+                                    dom_rating, dom_prob = rkey, float(preds[idx])
+                            if not self.ratings.get(dom_rating, True):
+                                tagged += 1
+                                continue
+
+                            tag_union: set[str] = set()
+                            for idx in general_idx:
+                                if idx < len(preds) and preds[idx] > self.threshold:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+                            for idx in char_idx:
+                                if idx < len(preds) and preds[idx] > self.char_thresh:
+                                    name = tag_names[idx]
+                                    tag_union.add(
+                                        name.replace("_", " ")
+                                        if self.rm_underscores else name)
+                            self._write(img_path, list(tag_union))
+                            tagged += 1
+                        except Exception as e2:
+                            errors += 1
+                            self.progress.emit(abs_i / total,
+                                f"Error: {os.path.basename(img_path)}: {e2}")
 
         self.progress.emit(1.0, "Done.")
         if emit_done:
@@ -3450,14 +4181,17 @@ class _TaggerThread(QThread):
             self.done.emit(False, f"Failed to load JoyCaption model.\n{load_err}")
             return
 
+        self.progress.emit(0.0, f"JoyCaption loaded on {device}")
+
         total     = len(self.images)
         captioned = 0
+        skipped   = 0
         errors    = 0
 
         for i, img_path in enumerate(self.images):
             self.progress.emit(i / total, f"Captioning {i+1}/{total}…")
-            if self._should_skip(img_path):
-                captioned += 1
+            if self._joy_should_skip(img_path):
+                skipped += 1
                 continue
             try:
                 img     = Image.open(img_path).convert("RGB")
@@ -3469,13 +4203,44 @@ class _TaggerThread(QThread):
                 self.progress.emit(i / total,
                     f"Error: {os.path.basename(img_path)}: {e}")
 
-        self.progress.emit(1.0, "Done.")
-        self.done.emit(True,
-            f"Captioned {captioned}/{total} images. Errors: {errors}.")
-
-    def _load_joycaption(self):
         try:
             import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        self.progress.emit(1.0, "Done.")
+        parts = [f"Captioned {captioned}/{total} images"]
+        if skipped:
+            parts.append(f"skipped {skipped} (caption exists)")
+        if errors:
+            parts.append(f"errors: {errors}")
+        self.done.emit(True, ".  ".join(parts) + ".")
+
+    def _load_joycaption(self):
+        # pythonw.exe has no console — stdout/stderr are None.
+        # transformers/huggingface_hub write tqdm progress during download,
+        # which segfaults when stdout is None. Guard before ANY HF import.
+        import io as _io
+        _saved_out, _saved_err = sys.stdout, sys.stderr
+        if sys.stdout is None: sys.stdout = _io.StringIO()
+        if sys.stderr is None: sys.stderr = _io.StringIO()
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        try:
+            from huggingface_hub import disable_progress_bars as _dpb
+            _dpb()
+        except Exception:
+            pass
+
+        try:
+            import torch
+            self._stub_c10d()   # must be AFTER import torch, BEFORE transformers
+            try:                # disable dynamo compilation — not needed for
+                torch._dynamo.config.disable = True   # inference; prevents the
+            except Exception:   # distributed-chain import cascade on ROCm
+                pass
             from transformers import AutoProcessor, LlavaForConditionalGeneration
 
             proc = AutoProcessor.from_pretrained(self.joy_path)
@@ -3484,16 +4249,24 @@ class _TaggerThread(QThread):
             has_cuda = torch.cuda.is_available()
             dtype    = torch.bfloat16 if has_cuda else torch.float32
 
-            # device_map="auto" requires accelerate; use manual placement if missing
+            # Load model: try single-GPU first to avoid CPU offloading.
+            # device_map={"": 0} forces all layers onto GPU 0 — much faster than
+            # "auto" when the model is near VRAM limits, because "auto" will
+            # silently offload overflow layers to CPU causing severe slowdowns.
+            # Fall back to "auto" only if the model genuinely doesn't fit.
             try:
                 import accelerate  # noqa: F401
-                model = LlavaForConditionalGeneration.from_pretrained(
-                    self.joy_path, torch_dtype=dtype, device_map="auto")
+                try:
+                    model = LlavaForConditionalGeneration.from_pretrained(
+                        self.joy_path, torch_dtype=dtype, device_map={"": 0})
+                except (RuntimeError, Exception):
+                    model = LlavaForConditionalGeneration.from_pretrained(
+                        self.joy_path, torch_dtype=dtype, device_map="auto")
             except ImportError:
                 model = LlavaForConditionalGeneration.from_pretrained(
                     self.joy_path, torch_dtype=dtype)
-                device = "cuda" if has_cuda else "cpu"
-                model = model.to(device)
+                target = "cuda" if has_cuda else "cpu"
+                model = model.to(target)
 
             model.eval()
             dev = next(model.parameters()).device
@@ -3503,6 +4276,8 @@ class _TaggerThread(QThread):
             err = f"{e}\n{traceback.format_exc()}"
             self.progress.emit(0.0, f"JoyCaption load error: {e}")
             return None, None, None, err
+        finally:
+            sys.stdout, sys.stderr = _saved_out, _saved_err
 
     def _joy_infer_one(self, img, model, proc, device):
         import torch
@@ -3514,11 +4289,322 @@ class _TaggerThread(QThread):
         chat_text = proc.apply_chat_template(
             convo, tokenize=False, add_generation_prompt=True)
         inputs = proc(text=chat_text, images=[img], return_tensors="pt")
-        inputs = {k: v.to(device) if hasattr(v, "to") else v
-                  for k, v in inputs.items()}
+        model_dtype = next(model.parameters()).dtype
+        inputs = {
+            k: (v.to(device=device, dtype=model_dtype)
+                if hasattr(v, "to") and hasattr(v, "is_floating_point") and v.is_floating_point()
+                else v.to(device) if hasattr(v, "to") else v)
+            for k, v in inputs.items()
+        }
         with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+            output = model.generate(**inputs, max_new_tokens=300, do_sample=False)
         # trim to only the generated tokens (exclude input prompt)
         input_len = inputs["input_ids"].shape[1]
         decoded = proc.decode(output[0][input_len:], skip_special_tokens=True)
+        del inputs, output
         return decoded.strip()
+
+    # ── Moondream2 (Fast caption) ─────────────────────────────────────────────
+    def _run_moondream(self):
+        self.progress.emit(0.0, "Loading Moondream2 model…")
+        model, tokenizer, device, load_err = self._load_moondream()
+        if model is None:
+            self.done.emit(False, f"Failed to load Moondream2 model.\n{load_err}")
+            return
+
+        self.progress.emit(0.0, f"Moondream2 loaded on {device}")
+
+        total     = len(self.images)
+        captioned = 0
+        skipped   = 0
+        errors    = 0
+
+        for i, img_path in enumerate(self.images):
+            self.progress.emit(i / total, f"Captioning {i+1}/{total}…")
+            if self._joy_should_skip(img_path):
+                skipped += 1
+                continue
+            try:
+                img     = Image.open(img_path).convert("RGB")
+                caption = self._moondream_infer_one(img, model, tokenizer, device)
+                self._write(img_path, [], caption=caption)
+                captioned += 1
+            except Exception as e:
+                errors += 1
+                self.progress.emit(i / total,
+                    f"Error: {os.path.basename(img_path)}: {e}")
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        self.progress.emit(1.0, "Done.")
+        parts = [f"Captioned {captioned}/{total} images"]
+        if skipped:
+            parts.append(f"skipped {skipped} (caption exists)")
+        if errors:
+            parts.append(f"errors: {errors}")
+        self.done.emit(True, ".  ".join(parts) + ".")
+
+    @staticmethod
+    def _stub_c10d():
+        """Patch ROCm/Windows torch for inference.
+
+        Call AFTER `import torch`, BEFORE `from transformers import ...`.
+
+        On ROCm Windows, torch._C._distributed_c10d is inaccessible via
+        Python's import path (torch._C is a .pyd, not a package), so any
+        code that does `from torch._C._distributed_c10d import X` fails.
+        This affects both torch._dynamo (load time) and model.chat() (runtime).
+
+        Fix: replace the missing/empty stub with an _AutoStub whose __getattr__
+        creates a placeholder class for every requested symbol.  This lets
+        torch/distributed/distributed_c10d.py import normally so that
+        torch.distributed.is_available() / is_initialized() work correctly.
+        """
+        import sys as _sys, types as _types
+
+        class _StubMeta(type):
+            """Metaclass for stub classes.
+            Handles *class-level* attribute access (e.g. ProcessGroup.BackendType)
+            by auto-creating a child stub class on demand.
+            Special cases:
+              __members__  → {} (Enum iteration)
+              other dunders → AttributeError (let importlib/inspect use defaults)
+            """
+            def __getattr__(cls, name):
+                if name == '__members__':
+                    return {}           # Enum-style: empty member dict
+                if name.startswith('__') and name.endswith('__'):
+                    raise AttributeError(name)
+                child = _StubMeta(f"{cls.__name__}.{name}", (), {})
+                setattr(cls, name, child)
+                return child
+
+        def _stub_cls(name):
+            """Create a self-expanding stub class (class attrs auto-created)."""
+            return _StubMeta(name, (), {})
+
+        # ── meta-path finder: auto-stub any submodule of an _AutoStub ─────
+        # When `import torch.distributed.tensor.parallel` is attempted and
+        # torch.distributed.tensor is already an _AutoStub, this finder
+        # intercepts it, creates a child _AutoStub, and returns a no-op spec.
+        # This prevents whack-a-mole for every sub-package of stubbed modules.
+        class _AutoStubLoader:
+            def create_module(self, spec):
+                return _sys.modules.get(spec.name)
+            def exec_module(self, module):
+                pass
+
+        class _AutoStubFinder:
+            _loader = _AutoStubLoader()
+            def find_spec(self, fullname, path, target=None):
+                if '.' not in fullname or fullname in _sys.modules:
+                    return None
+                parent = fullname.rsplit('.', 1)[0]
+                if not isinstance(_sys.modules.get(parent), _AutoStub):
+                    return None
+                stub = _AutoStub(fullname)
+                _sys.modules[fullname] = stub
+                import importlib.machinery as _imm
+                spec = _imm.ModuleSpec(
+                    fullname, self._loader, origin='<auto-stub>')
+                spec.submodule_search_locations = []
+                return spec
+
+        if not any(type(f).__name__ == '_AutoStubFinder'
+                   for f in _sys.meta_path):
+            _sys.meta_path.append(_AutoStubFinder())
+
+        class _AutoStub(_types.ModuleType):
+            """Returns a new stub class for any attribute not already set.
+            __path__ = [] marks this as a package so Python calls meta_path
+            finders for sub-imports instead of raising 'is not a package'.
+            Dunder attributes raise AttributeError so inspect/importlib see
+            normal module metadata (e.g. __file__ must be a string, not a class)."""
+            def __init__(self, name):
+                super().__init__(name)
+                self.__dict__['__path__'] = []   # register as package
+            def __getattr__(self, name):
+                if name.startswith('__') and name.endswith('__'):
+                    raise AttributeError(name)
+                val = _stub_cls(name)
+                self.__dict__[name] = val   # cache — no repeated __getattr__
+                return val
+
+        def _ensure_stub(key, **attrs):
+            if key not in _sys.modules:
+                m = _types.ModuleType(key)
+                for k, v in attrs.items():
+                    setattr(m, k, v)
+                _sys.modules[key] = m
+
+        import torch as _torch
+
+        # ── torch.compiler.disable → no-op ───────────────────────────────
+        # torchvision/tv_tensors/__init__.py applies @torch.compiler.disable
+        # at import time.  torch.compiler.disable() does `import torch._dynamo`
+        # which cascades into torch.distributed.tensor → _functional_collectives
+        # → C-level operator registration that fails on ROCm Windows.
+        # Replace with a no-op decorator; since we also disable dynamo globally,
+        # there is no compilation to exclude from anyway.
+        try:
+            import torch.compiler as _tc
+            if not getattr(_tc, '_rocm_patched', False):
+                def _noop_disable(fn=None, recursive=True):
+                    return fn if fn is not None else (lambda f: f)
+                _tc.disable = _noop_disable
+                _tc._rocm_patched = True
+        except Exception:
+            pass
+
+        # ── torch._C._distributed_c10d ────────────────────────────────────
+        # Two access patterns need patching:
+        #   (a) `from torch._C._distributed_c10d import X`  → sys.modules lookup
+        #   (b) `torch._C._distributed_c10d`                → attribute on torch._C
+        # sys.modules handles (a). Setting the attribute handles (b).
+        _c10d_key = 'torch._C._distributed_c10d'
+        if not hasattr(_sys.modules.get(_c10d_key), '_DistributedBackendOptions'):
+            _sys.modules[_c10d_key] = _AutoStub(_c10d_key)
+        if not hasattr(_torch._C, '_distributed_c10d'):
+            _torch._C._distributed_c10d = _sys.modules[_c10d_key]
+
+        # ── torch._dynamo → fsdp chain (load-time) ────────────────────────
+        # Pre-stub with _AutoStub so any `from ... import X` works, not just
+        # the original _fsdp_param_group.
+        if 'torch.distributed.fsdp._fully_shard' not in _sys.modules:
+            _sys.modules['torch.distributed.fsdp._fully_shard'] = _AutoStub(
+                'torch.distributed.fsdp._fully_shard')
+
+        # ── torch.distributed.tensor / _functional_collectives ────────────
+        # torch._dynamo.trace_rules imports torch.distributed.tensor to build
+        # its object-rule map.  tensor/__init__ imports _functional_collectives,
+        # whose module-level code registers _c10d_functional::all_reduce — an
+        # operator that doesn't exist in the ROCm dispatch table → RuntimeError.
+        # Pre-stubbing both prevents their module code from ever executing.
+        for _key in (
+            'torch.distributed._functional_collectives',
+            'torch.distributed._functional_collectives_impl',
+            'torch.distributed.tensor',
+            'torch.distributed.device_mesh',
+        ):
+            if _key not in _sys.modules:
+                _sys.modules[_key] = _AutoStub(_key)
+
+        # ── fake_pg (load-time) ───────────────────────────────────────────
+        # Pre-stub so the real file (subclasses dist.Store, absent on ROCm)
+        # is never executed.
+        _ensure_stub('torch.testing._internal.distributed.fake_pg',
+                     FakeProcessGroup=_stub_cls('FakeProcessGroup'),
+                     FakeStore=_stub_cls('FakeStore'))
+        _ensure_stub('torch.distributed.fake_pg',
+                     FakeProcessGroup=_stub_cls('FakeProcessGroup'),
+                     FakeStore=_stub_cls('FakeStore'))
+
+        # ── torch.distributed — auto-stub missing C10d symbols ───────────
+        # On ROCm Windows, torch.distributed.is_available() returns False so
+        # __init__.py never imports Store/FileStore/HashStore/_remote_device
+        # etc. from the C extension.  Instead of listing every missing name,
+        # install a module-level __getattr__ (PEP 562) that auto-stubs any
+        # missing attribute via the _AutoStub for _distributed_c10d.
+        def _install_getattr(mod_name):
+            """Install auto-stub __getattr__ on an already-loaded real module."""
+            try:
+                mod = _sys.modules.get(mod_name)
+                if mod is None:
+                    import importlib as _il
+                    mod = _il.import_module(mod_name)
+                if hasattr(mod, '__getattr__'):
+                    return
+                _c10d = _sys.modules[_c10d_key]
+                def _getattr(name, _c10d=_c10d, _mod=mod):
+                    if name.startswith('__') and name.endswith('__'):
+                        raise AttributeError(name)
+                    val = getattr(_c10d, name)
+                    setattr(_mod, name, val)
+                    return val
+                mod.__getattr__ = _getattr
+            except Exception:
+                pass
+
+        _install_getattr('torch.distributed')
+        _install_getattr('torch.distributed.device_mesh')
+
+    def _load_moondream(self):
+        import io as _io
+        _saved_out, _saved_err = sys.stdout, sys.stderr
+        if sys.stdout is None: sys.stdout = _io.StringIO()
+        if sys.stderr is None: sys.stderr = _io.StringIO()
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        try:
+            from huggingface_hub import disable_progress_bars as _dpb
+            _dpb()
+        except Exception:
+            pass
+
+        try:
+            import torch
+            self._stub_c10d()   # guard against ROCm distributed import chain
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.moondream_path,
+                revision=MOONDREAM_REVISION,
+                trust_remote_code=True,
+            )
+
+            has_cuda = torch.cuda.is_available()
+            dtype    = torch.float16 if has_cuda else torch.float32
+
+            try:
+                import accelerate  # noqa: F401
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        self.moondream_path,
+                        revision=MOONDREAM_REVISION,
+                        trust_remote_code=True,
+                        torch_dtype=dtype,
+                        device_map={"": 0},
+                    )
+                except (RuntimeError, Exception):
+                    model = AutoModelForCausalLM.from_pretrained(
+                        self.moondream_path,
+                        revision=MOONDREAM_REVISION,
+                        trust_remote_code=True,
+                        torch_dtype=dtype,
+                        device_map="auto",
+                    )
+            except ImportError:
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.moondream_path,
+                    revision=MOONDREAM_REVISION,
+                    trust_remote_code=True,
+                    torch_dtype=dtype,
+                )
+                if has_cuda:
+                    model = model.cuda()
+
+            model.eval()
+            dev = next(model.parameters()).device
+            return model, tokenizer, dev, ""
+        except Exception as e:
+            import traceback
+            err = f"{e}\n{traceback.format_exc()}"
+            self.progress.emit(0.0, f"Moondream2 load error: {e}")
+            return None, None, None, err
+        finally:
+            sys.stdout, sys.stderr = _saved_out, _saved_err
+
+    def _moondream_infer_one(self, img, model, tokenizer, device):
+        """Inference for Moondream2.
+        Newer revisions (2025+): model.caption(img, length='long')
+        Older revisions (2024-08-26): model.encode_image + answer_question
+        """
+        # Use encode_image + answer_question — works across all revisions
+        enc = model.encode_image(img)
+        return model.answer_question(
+            enc, "Describe this image in detail.", tokenizer).strip()

@@ -346,9 +346,9 @@ class FaceModelCard(QFrame):
 
 # ── Face swap worker ──────────────────────────────────────────────────────────
 class FaceSwapWorker(QObject):
-    finished = Signal(object)
-    error    = Signal(str)
-    status   = Signal(str)
+    finished   = Signal(object)
+    error      = Signal(str)
+    status     = Signal(str)
 
     def __init__(self, target_img: Image.Image,
                  source_inputs: list,   # list of (pil_img_or_None, model_path_or_"")
@@ -380,6 +380,7 @@ class FaceSwapWorker(QObject):
         self._gender_src    = gender_source
         self._gender_tgt    = gender_target
         self._device        = device
+        self.source_face    = None   # set during run(), read by main thread after done
 
     def run(self):
         try:
@@ -443,6 +444,7 @@ class FaceSwapWorker(QObject):
                 source_face.embedding = blended_emb
             else:
                 source_face = raw_faces[0]
+            self.source_face = source_face
 
             # ── Target faces ──────────────────────────────────────────────────
             tgt_cv    = to_cv(self._target)
@@ -513,29 +515,39 @@ class FaceExportWorker(QObject):
     error    = Signal(str)
     status   = Signal(str)
 
-    def __init__(self, img: Image.Image, save_path: str):
+    def __init__(self, img: Image.Image, save_path: str,
+                 det_thresh: float = 0.5, device: str = "Auto"):
         super().__init__()
-        self._img       = img
-        self._save_path = save_path
+        self._img        = img
+        self._save_path  = save_path
+        self._det_thresh = det_thresh
+        self._device     = device
 
     def run(self):
         try:
             import cv2
             from insightface.app import FaceAnalysis
             self.status.emit("Detecting face…")
-            app = FaceAnalysis(name="buffalo_l",
-                               providers=["CUDAExecutionProvider",
-                                          "CPUExecutionProvider"])
+            prov = _providers(self._device)
+            app  = FaceAnalysis(name="buffalo_l", providers=prov)
             app.prepare(ctx_id=0, det_size=(640, 640))
             img_cv = cv2.cvtColor(np.array(self._img.convert("RGB")),
                                   cv2.COLOR_RGB2BGR)
-            faces = app.get(img_cv)
+            faces = [f for f in app.get(img_cv)
+                     if f.det_score >= self._det_thresh]
             if not faces:
                 self.error.emit(
-                    "No face detected.\nUse a clear front-facing portrait.")
+                    "No face detected.\n"
+                    f"Detection threshold: {self._det_thresh:.2f} — "
+                    "try lowering it in the Detection tab.")
                 return
             self.status.emit("Saving face model…")
             save_reactor_face(faces[0], self._save_path)
+            from pathlib import Path as _Path
+            if not _Path(self._save_path).is_file():
+                self.error.emit(
+                    f"Save appeared to succeed but file not found:\n{self._save_path}")
+                return
             self.finished.emit(self._save_path)
         except Exception as e:
             import traceback
@@ -777,9 +789,10 @@ class FaceSwapPage(QWidget):
         self._cfg         = load_json(CFG_FILE, DEFAULTS)
         self._faces_dir   = Path(self._cfg.get("faces_folder", str(FACES_DIR)))
 
-        self._src_pil:       Image.Image | None = None
-        self._src_path:      str  = ""
-        self._out_pil:       Image.Image | None = None
+        self._src_pil:          Image.Image | None = None
+        self._src_path:         str  = ""
+        self._out_pil:          Image.Image | None = None
+        self._last_source_face: object | None = None   # face used in last swap
         self._viewing:       str  = "input"
         self._face_cards:    list = []
         self._sel_faces:     list = []   # list of (path, is_model) tuples
@@ -992,6 +1005,15 @@ class FaceSwapPage(QWidget):
         rb.clicked.connect(self._load_face_images)
         hl.addWidget(rb)
         vl.addWidget(hdr)
+
+        self._desel_all_btn = QPushButton("Deselect All", panel)
+        self._desel_all_btn.setFixedHeight(22)
+        self._desel_all_btn.setStyleSheet(
+            f"QPushButton {{ background:transparent; color:{MUT}; border:none;"
+            f"font-family:{FONT}; font-size:{FONT_SM}px; }}"
+            f"QPushButton:hover {{ color:{RED}; }}")
+        self._desel_all_btn.clicked.connect(self._deselect_all_faces)
+        vl.addWidget(self._desel_all_btn)
 
         sa = QScrollArea(panel)
         sa.setWidgetResizable(True)
@@ -1298,8 +1320,9 @@ class FaceSwapPage(QWidget):
         self._device_combo = _combo(
             DEVICE_OPTS, self._cfg.get("device", "Auto"))
         self._device_combo.setToolTip(
-            "Auto: try CUDA → DirectML → CPU.\n"
-            "CUDA: NVIDIA GPU.  DirectML: AMD GPU.  CPU: fallback.")
+            "Auto: try CUDA -> DirectML -> CPU.\n"
+            "CUDA: NVIDIA GPU.  DirectML: AMD/Intel GPU.\n"
+            "CPU: fallback.")
         self._device_combo.currentTextChanged.connect(
             lambda t: self._save_cfg("device", t))
         g.addWidget(self._device_combo, r, 1); r += 1
@@ -1393,6 +1416,12 @@ class FaceSwapPage(QWidget):
             card.selected_changed.connect(self._on_face_selected)
             self._face_vl.insertWidget(self._face_vl.count() - 1, card)
             self._face_cards.append(card)
+
+    def _deselect_all_faces(self):
+        for card in self._face_cards:
+            card.set_selected(False)
+        self._sel_faces = []
+        self._update_apply_btn()
 
     def _on_blend_toggled(self, state):
         # When blend is turned off, keep only the first selected face
@@ -1501,9 +1530,10 @@ class FaceSwapPage(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Load Error", str(e))
             return
-        self._src_pil   = img
-        self._src_path  = path
-        self._out_pil   = None
+        self._src_pil          = img
+        self._src_path         = path
+        self._out_pil          = None
+        self._last_source_face = None
         self._viewing   = "input"
         name = os.path.basename(path)
         self._path_lbl.setText(name[:50] + ("…" if len(name) > 50 else ""))
@@ -1542,6 +1572,7 @@ class FaceSwapPage(QWidget):
         if enhance:
             try:
                 import sys, io
+                self._patch_torchvision_functional_tensor()
                 from gfpgan import GFPGANer
                 self._status_lbl.setText("Loading GFPGAN… (may download ~185 MB on first run)")
                 QApplication.processEvents()
@@ -1620,6 +1651,9 @@ class FaceSwapPage(QWidget):
         if self._prog_dlg:
             self._prog_dlg.close()
             self._prog_dlg = None
+        # Capture the exact source face used (blended or single) for export
+        if self._worker is not None and self._worker.source_face is not None:
+            self._last_source_face = self._worker.source_face
         self._out_pil  = result
         self._viewing  = "output"
         self._viewer.set_image(result)
@@ -1677,6 +1711,7 @@ class FaceSwapPage(QWidget):
         if enhance:
             try:
                 import sys, io
+                self._patch_torchvision_functional_tensor()
                 from gfpgan import GFPGANer
                 self._status_lbl.setText("Loading GFPGAN… (may download ~185 MB on first run)")
                 QApplication.processEvents()
@@ -1797,6 +1832,19 @@ class FaceSwapPage(QWidget):
         if not path:
             return
 
+        # If a swap was just done, use the exact source face (blended or single)
+        # that was used — no re-detection needed.
+        if self._last_source_face is not None:
+            self._status_lbl.setText("Saving face model…")
+            try:
+                save_reactor_face(self._last_source_face, path)
+                self._on_export_done(path)
+            except Exception as e:
+                import traceback
+                self._on_export_error(f"{e}\n{traceback.format_exc()}")
+            return
+
+        # No prior swap — detect face from the loaded image
         self._export_btn.setEnabled(False)
         self._status_lbl.setText("Exporting face model…")
         self._prog_dlg = QProgressDialog(
@@ -1806,7 +1854,11 @@ class FaceSwapPage(QWidget):
         self._prog_dlg.show()
 
         self._exp_thread = QThread()
-        self._exp_worker = FaceExportWorker(self._src_pil, path)
+        self._exp_worker = FaceExportWorker(
+            self._src_pil, path,
+            det_thresh=self._det_thresh.value(),
+            device=self._device_combo.currentText(),
+        )
         self._exp_worker.moveToThread(self._exp_thread)
         self._exp_thread.started.connect(self._exp_worker.run)
         self._exp_worker.finished.connect(self._on_export_done)
@@ -1953,6 +2005,21 @@ class FaceSwapPage(QWidget):
         return False
 
     # ── Model management — GFPGAN ─────────────────────────────────────────────
+
+    @staticmethod
+    def _patch_torchvision_functional_tensor():
+        """Shim for torchvision >= 0.16 which removed functional_tensor.
+        basicsr (GFPGAN dependency) still imports from it."""
+        import sys, types
+        if 'torchvision.transforms.functional_tensor' not in sys.modules:
+            import torchvision.transforms.functional as _tvf
+            _ft = types.ModuleType('torchvision.transforms.functional_tensor')
+            for _attr in ('rgb_to_grayscale', 'adjust_brightness', 'adjust_contrast',
+                          'adjust_hue', 'adjust_saturation', 'normalize',
+                          'to_tensor', 'resize', 'pad', 'crop'):
+                if hasattr(_tvf, _attr):
+                    setattr(_ft, _attr, getattr(_tvf, _attr))
+            sys.modules['torchvision.transforms.functional_tensor'] = _ft
 
     def _ensure_gfpgan(self) -> bool:
         if GFPGAN_MODEL.exists():
