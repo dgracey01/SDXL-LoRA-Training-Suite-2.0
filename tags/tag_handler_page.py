@@ -3149,8 +3149,8 @@ class TagHandlerPage(QWidget):
             batch_size     = batch_size,
             ratings        = ratings,
             rm_underscores = rm_underscores,
-            joy_path       = JOY_MODEL_ID,
-            moondream_path     = MOONDREAM_MODEL_ID,
+            joy_path       = os.path.join(_HERE, "models", "joycaption"),
+            moondream_path = os.path.join(_HERE, "models", "moondream") if os.path.isdir(os.path.join(_HERE, "models", "moondream")) else MOONDREAM_MODEL_ID,
             joy_type       = self._joy_type_combo.currentText(),
             joy_length     = self._joy_len_combo.currentText(),
             extra          = extra,
@@ -3587,8 +3587,8 @@ class _TaggerThread(QThread):
             "general": True, "sensitive": True,
             "questionable": True, "explicit": True}
         self.rm_underscores = rm_underscores
-        self.joy_path       = joy_path or JOY_MODEL_ID
-        self.moondream_path     = moondream_path or MOONDREAM_MODEL_ID
+        self.joy_path       = joy_path if (joy_path and os.path.isdir(joy_path)) else JOY_MODEL_ID
+        self.moondream_path = moondream_path if (moondream_path and os.path.isdir(moondream_path)) else MOONDREAM_MODEL_ID
         self.joy_type       = joy_type
         self.joy_length     = joy_length
         self.extra          = extra

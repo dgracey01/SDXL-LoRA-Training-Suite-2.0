@@ -8,9 +8,9 @@
   "default_caption": "Created by Zero",
   "version": "1.0",
   "sample_prompts": [
-    "tifaba, 1girl, skirt, gloves, fingerless gloves, crop top, midriff, miniskirt, suspenders, suspender skirt, pencil skirt, long hair, belt, black skirt, navel, elbow gloves, elbow pads",
-    "tifaba, 1girl, skirt, gloves, fingerless gloves, crop top, midriff, miniskirt, suspenders, suspender skirt, pencil skirt, long hair, belt, black skirt, navel, elbow gloves, elbow pads",
-    "tifaba, 1girl, skirt, gloves, fingerless gloves, crop top, midriff, miniskirt, suspenders, suspender skirt, pencil skirt, long hair, belt, black skirt, navel, elbow gloves, elbow pads "
+    "dollxl, black hair, lips, short hair, breasts, nipples, brown hair, large breasts, pubic hair, brown eyes",
+    "dollxl, black hair, lips, short hair, breasts, nipples, brown hair, large breasts, pubic hair, brown eyes",
+    "dollxl, black hair, lips, short hair, breasts, nipples, brown hair, large breasts, pubic hair, black eyes"
   ],
   "kohya_sample_prompts": [
     "",
@@ -39,10 +39,10 @@
     "pose": "Recommended"
   },
   "tos_overrides": {
-    "character": "",
-    "concept": "",
-    "style": "",
-    "outfit": "",
-    "pose": ""
+    "character": "160",
+    "concept": "58",
+    "style": "250",
+    "outfit": "123",
+    "pose": "140"
   }
 }

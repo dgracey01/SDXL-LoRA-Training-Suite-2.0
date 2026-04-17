@@ -2,11 +2,11 @@
   {
     "name": "SD.next",
     "url": "http://localhost:7000",
-    "cmd": "E:\\automatic\\webui.bat --use-zluda --update --medvram --backend diffusers --port 7000"
+    "cmd": "E:\\automatic\\webui.bat --use-rocm --update --backend diffusers --port 7000"
   },
   {
     "name": "Kohya",
-    "url": "http://localhost:7862",
+    "url": "http://127.0.0.1:7860",
     "cmd": "E:\\kohya_ss\\gui-uv.bat"
   },
   {
@@ -16,5 +16,13 @@
   {
     "name": "SD.Next Remote",
     "url": "http://192.168.1.64:7860/"
+  },
+  {
+    "name": "Kteos",
+    "url": "http://192.168.1.64:3000/"
+  },
+  {
+    "name": "CivitAI",
+    "url": "https://www.civitai.red/user/Zero_000"
   }
 ]
