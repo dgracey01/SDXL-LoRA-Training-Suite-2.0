@@ -78,6 +78,64 @@ CAP_LENGTHS   = ["Short","Medium","Long","Any"]
 JOY_MODEL_ID  = "fancyfeast/llama-joycaption-alpha-two-hf-llava"
 MOONDREAM_MODEL_ID  = "vikhyatk/moondream2"
 MOONDREAM_REVISION  = "2024-08-26"
+def _check_joycaption_model(path: str):
+    """Verify every safetensors shard is present and non-truncated.
+
+    Returns (True, "") on success, or (False, human-readable error) on any
+    problem.  Uses only the file header + last tensor read per shard so it
+    is fast (no full data scan) but still catches:
+      - missing files
+      - zero / impossibly-small files
+      - header/data mismatch (re-written header over a shorter payload)
+      - truncated downloads (last tensor offset beyond EOF)
+    """
+    import os as _os, json as _json
+    required = ["config.json", "tokenizer.json",
+                "tokenizer_config.json", "model.safetensors.index.json"]
+    for _f in required:
+        if not _os.path.isfile(_os.path.join(path, _f)):
+            return False, f"Model file missing: {_f}"
+
+    _idx = _os.path.join(path, "model.safetensors.index.json")
+    try:
+        with open(_idx) as _fh:
+            _wmap = _json.load(_fh)["weight_map"]
+    except Exception as _e:
+        return False, f"Cannot read model index: {_e}"
+
+    # Build expected key-count per shard
+    _shard_keys: dict = {}
+    for _k, _s in _wmap.items():
+        _shard_keys.setdefault(_s, []).append(_k)
+
+    try:
+        from safetensors import safe_open as _sf_open
+    except ImportError:
+        return False, "safetensors package not installed"
+
+    for _shard, _exp_keys in sorted(_shard_keys.items()):
+        _sp = _os.path.join(path, _shard)
+        if not _os.path.isfile(_sp):
+            return False, f"Missing shard: {_shard}"
+        _sz = _os.path.getsize(_sp)
+        if _sz < 4096:
+            return False, f"Shard suspiciously small ({_sz} bytes): {_shard}"
+        try:
+            with _sf_open(_sp, framework="pt", device="cpu") as _sf:
+                _actual = list(_sf.keys())
+                if len(_actual) != len(_exp_keys):
+                    return False, (
+                        f"Shard {_shard}: index expects {len(_exp_keys)} tensors "
+                        f"but file header has {len(_actual)}")
+                # Read the last tensor — catches truncated payloads where the
+                # header is intact but the data region is cut short.
+                _sf.get_tensor(_actual[-1])
+        except Exception as _e:
+            return False, f"Shard {_shard} is corrupt or truncated: {_e}"
+
+    return True, ""
+
+
 def _joy_prompt(cap_type: str, length: str) -> str:
     """Generate the instruction prompt for JoyCaption given type and length."""
     l = {"Any": "", "Short": "short ", "Medium": "medium-length ",
@@ -3725,11 +3783,53 @@ class _TaggerThread(QThread):
 
     # ── WD14 ─────────────────────────────────────────────────────────────────
     def _run_wd14(self, emit_done=True):
+        # Add PyTorch's CUDA DLLs to the Windows DLL search path so that
+        # onnxruntime-gpu can find cudart/cublas/cuDNN without a system install.
+        # NOTE: must store the handle — if dropped, CPython immediately calls
+        # RemoveDllDirectory and the path vanishes before onnxruntime imports.
+        _dll_handles = []
+        try:
+            import torch as _torch
+            _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+            if os.path.isdir(_torch_lib) and hasattr(os, "add_dll_directory"):
+                _dll_handles.append(os.add_dll_directory(_torch_lib))
+        except Exception:
+            pass
         try:
             import onnxruntime as ort
-        except ImportError:
-            self.done.emit(False,
-                "onnxruntime not installed. Run INSTALL.bat and choose a GPU option.")
+        except Exception as _ort_err:
+            import traceback as _tb, ctypes
+            _err_detail = f"onnxruntime not installed. Run INSTALL.bat and choose a GPU option.\nDetail: {_ort_err}\n\n{_tb.format_exc()}"
+            # Try loading onnxruntime DLLs individually via ctypes to get the real Windows error
+            try:
+                import onnxruntime as _ort_mod_path
+            except Exception:
+                _ort_mod_path = None
+            _ctypes_log = []
+            try:
+                import importlib.util as _ilu
+                _spec = _ilu.find_spec("onnxruntime")
+                _ort_pkg = os.path.dirname(_spec.origin) if _spec else None
+                if _ort_pkg:
+                    _capi_dir = os.path.join(_ort_pkg, "capi")
+                    for _fn in sorted(os.listdir(_capi_dir)):
+                        if _fn.endswith(".dll") or _fn.endswith(".pyd"):
+                            try:
+                                ctypes.WinDLL(os.path.join(_capi_dir, _fn))
+                                _ctypes_log.append(f"  OK:   {_fn}")
+                            except OSError as _ce:
+                                _ctypes_log.append(f"  FAIL: {_fn} => {_ce}")
+            except Exception as _ce2:
+                _ctypes_log.append(f"  ctypes probe error: {_ce2}")
+            if _ctypes_log:
+                _err_detail += "\n\nDLL probe:\n" + "\n".join(_ctypes_log)
+            try:
+                _log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ort_error.log")
+                with open(_log_path, "w", encoding="utf-8") as _lf:
+                    _lf.write(_err_detail)
+            except Exception:
+                pass
+            self.done.emit(False, _err_detail)
             return
 
         models_to_use = ([self.model1, self.model2]
@@ -4175,8 +4275,24 @@ class _TaggerThread(QThread):
 
     # ── JoyCaption ───────────────────────────────────────────────────────────
     def _run_joycaption(self):
+        import traceback as _tb
+        _joy_log = os.path.join(os.path.dirname(os.path.dirname(__file__)), "joy_crash.log")
+        def _jlog(msg):
+            try:
+                with open(_joy_log, "a", encoding="utf-8") as _f:
+                    _f.write(msg + "\n")
+            except Exception:
+                pass
+        _jlog("=== JoyCaption run started ===")
         self.progress.emit(0.0, "Loading JoyCaption model…")
-        model, proc, device, load_err = self._load_joycaption()
+        _jlog("Calling _load_joycaption()")
+        try:
+            model, proc, device, load_err = self._load_joycaption()
+        except Exception as _je:
+            _jlog(f"_load_joycaption raised: {_je}\n{_tb.format_exc()}")
+            self.done.emit(False, f"Failed to load JoyCaption model.\n{_je}")
+            return
+        _jlog(f"_load_joycaption returned: model={model is not None}, device={device}, err={load_err!r}")
         if model is None:
             self.done.emit(False, f"Failed to load JoyCaption model.\n{load_err}")
             return
@@ -4219,6 +4335,14 @@ class _TaggerThread(QThread):
         self.done.emit(True, ".  ".join(parts) + ".")
 
     def _load_joycaption(self):
+        # Integrity check first — catches corrupt/truncated downloads before
+        # we spend time importing torch and loading the model.
+        _ok, _err = _check_joycaption_model(self.joy_path)
+        if not _ok:
+            return None, None, None, (
+                f"JoyCaption model integrity check failed:\n{_err}\n\n"
+                f"Re-download the model to fix this.")
+
         # pythonw.exe has no console — stdout/stderr are None.
         # transformers/huggingface_hub write tqdm progress during download,
         # which segfaults when stdout is None. Guard before ANY HF import.
@@ -4234,46 +4358,77 @@ class _TaggerThread(QThread):
         except Exception:
             pass
 
-        try:
-            import torch
-            self._stub_c10d()   # must be AFTER import torch, BEFORE transformers
-            try:                # disable dynamo compilation — not needed for
-                torch._dynamo.config.disable = True   # inference; prevents the
-            except Exception:   # distributed-chain import cascade on ROCm
-                pass
-            from transformers import AutoProcessor, LlavaForConditionalGeneration
-
-            proc = AutoProcessor.from_pretrained(self.joy_path)
-
-            # Prefer bfloat16 on CUDA; fall back to float32 for CPU / older GPUs
-            has_cuda = torch.cuda.is_available()
-            dtype    = torch.bfloat16 if has_cuda else torch.float32
-
-            # Load model: try single-GPU first to avoid CPU offloading.
-            # device_map={"": 0} forces all layers onto GPU 0 — much faster than
-            # "auto" when the model is near VRAM limits, because "auto" will
-            # silently offload overflow layers to CPU causing severe slowdowns.
-            # Fall back to "auto" only if the model genuinely doesn't fit.
+        _joy_log = os.path.join(os.path.dirname(os.path.dirname(__file__)), "joy_crash.log")
+        def _jlog(msg):
             try:
-                import accelerate  # noqa: F401
-                try:
-                    model = LlavaForConditionalGeneration.from_pretrained(
-                        self.joy_path, torch_dtype=dtype, device_map={"": 0})
-                except (RuntimeError, Exception):
-                    model = LlavaForConditionalGeneration.from_pretrained(
-                        self.joy_path, torch_dtype=dtype, device_map="auto")
-            except ImportError:
+                with open(_joy_log, "a", encoding="utf-8") as _f:
+                    _f.write(msg + "\n")
+            except Exception:
+                pass
+        try:
+            _jlog("importing torch")
+            import torch
+            _jlog(f"torch {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
+            # Only stub C10D on ROCm — NVIDIA has proper implementation
+            _is_rocm = getattr(torch.version, 'hip', None) is not None
+            _jlog(f"is_rocm={_is_rocm}")
+            if _is_rocm:
+                self._stub_c10d()
+                _jlog("_stub_c10d done (ROCm)")
+            try:                # disable dynamo compilation — not needed for
+                torch._dynamo.config.disable = True   # inference
+            except Exception:
+                pass
+            _jlog("importing transformers")
+            from transformers import AutoProcessor, LlavaForConditionalGeneration
+            _jlog("transformers imported")
+
+            _jlog(f"loading processor from {self.joy_path}")
+            proc = AutoProcessor.from_pretrained(self.joy_path)
+            _jlog("processor loaded")
+
+            has_cuda = torch.cuda.is_available()
+            _jlog(f"has_cuda={has_cuda}")
+
+            dtype = torch.bfloat16 if has_cuda else torch.float32
+            _jlog(f"dtype={dtype}")
+
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
+            # Load via mmap (low RAM usage), then move to CUDA through pinned memory.
+            # Pinning is a CPU op (no GPU timeout), DMA from pinned→CUDA is fast.
+            # This avoids Windows TDR caused by GPU waiting on HDD page faults.
+            if has_cuda:
+                # 1. from_pretrained builds the correct model structure via mmap
+                #    (no weight data accessed, no page faults).
+                # 2. to_empty("cuda:0") replaces every mmap-backed CPU tensor with
+                #    an uninitialised CUDA tensor of the same shape, freeing all
+                # Load directly to CUDA via device_map — accelerate handles
+                # weight streaming so the 17.8 GB model never fully occupies RAM.
+                # This also correctly initialises all buffers (inv_freq, etc.)
+                # without needing manual remapping or reinitialisation.
+                _jlog("loading model → cuda:0 via device_map (accelerate)")
                 model = LlavaForConditionalGeneration.from_pretrained(
-                    self.joy_path, torch_dtype=dtype)
-                target = "cuda" if has_cuda else "cpu"
-                model = model.to(target)
+                    self.joy_path,
+                    torch_dtype=dtype,
+                    device_map="cuda:0",
+                    low_cpu_mem_usage=True,
+                )
+                _jlog(f"model loaded, free VRAM: {torch.cuda.mem_get_info()[0]/1e9:.1f}GB")
+            else:
+                _jlog("loading model to CPU (mmap)")
+                model = LlavaForConditionalGeneration.from_pretrained(
+                    self.joy_path, torch_dtype=dtype, low_cpu_mem_usage=True)
+                _jlog("model loaded (CPU)")
 
             model.eval()
             dev = next(model.parameters()).device
+            _jlog(f"model.eval() done, device={dev}")
             return model, proc, dev, ""
-        except Exception as e:
+        except BaseException as e:
             import traceback
             err = f"{e}\n{traceback.format_exc()}"
+            _jlog(f"EXCEPTION in _load_joycaption: {err}")
             self.progress.emit(0.0, f"JoyCaption load error: {e}")
             return None, None, None, err
         finally:
@@ -4282,9 +4437,14 @@ class _TaggerThread(QThread):
     def _joy_infer_one(self, img, model, proc, device):
         import torch
         prompt = _joy_prompt(self.joy_type, self.joy_length)
+        extra  = getattr(self, 'extra', '').strip()
+        if extra:
+            prompt = f"{prompt} {extra}"
+        img_tok_id  = model.config.image_token_index
+        image_token = proc.tokenizer.convert_ids_to_tokens(img_tok_id)
         convo = [
             {"role": "system", "content": "You are a helpful image captioner."},
-            {"role": "user",   "content": f"<image>\n{prompt}"},
+            {"role": "user",   "content": f"{image_token}\n{prompt}"},
         ]
         chat_text = proc.apply_chat_template(
             convo, tokenize=False, add_generation_prompt=True)
@@ -4297,8 +4457,13 @@ class _TaggerThread(QThread):
             for k, v in inputs.items()
         }
         with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=300, do_sample=False)
-        # trim to only the generated tokens (exclude input prompt)
+            output = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.6,
+                top_p=0.9,
+            )
         input_len = inputs["input_ids"].shape[1]
         decoded = proc.decode(output[0][input_len:], skip_special_tokens=True)
         del inputs, output

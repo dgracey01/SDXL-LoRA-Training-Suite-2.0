@@ -1,7 +1,5 @@
 @echo off
-chcp 65001 >nul
 title Lora Training Suite 2.0 - Installer
-color 0A
 
 echo ================================================================================
 echo   Lora Training Suite v2.0 - Installer
@@ -11,31 +9,57 @@ echo.
 
 set "SUITE_DIR=%~dp0"
 
-:: -- Check Python --
+:: -- Check Python (try python, then py launcher) --
 echo [CHECKING] Python...
 python --version >nul 2>&1
+if not errorlevel 1 (
+    set "PYTHON=python"
+    goto :python_ok
+)
+py --version >nul 2>&1
+if not errorlevel 1 (
+    set "PYTHON=py"
+    goto :python_ok
+)
+
+echo [NOT FOUND] Python is not installed or not on PATH.
+echo.
+echo Attempting automatic install via winget...
+winget install Python.Python.3.11 --silent --accept-package-agreements --accept-source-agreements
 if errorlevel 1 (
-    echo [NOT FOUND] Python is not installed or not on PATH.
     echo.
-    echo Attempting automatic install via winget...
-    winget install Python.Python.3.11 --silent --accept-package-agreements --accept-source-agreements
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] Automatic install failed.
-        echo         Install Python manually: https://www.python.org/downloads/
-        echo         IMPORTANT: Check "Add Python to PATH" during install.
-        echo.
-        pause
-        exit /b 1
-    )
-    echo.
-    echo [OK] Python installed. Please CLOSE and RE-RUN this installer.
+    echo [ERROR] Automatic install failed.
+    echo         Install Python manually: https://www.python.org/downloads/
+    echo         IMPORTANT: Check "Add Python to PATH" during install.
     echo.
     pause
-    exit /b 0
+    exit /b 1
 )
+echo.
+echo [OK] Python installed. Please CLOSE and RE-RUN this installer.
+echo.
+pause
+exit /b 0
+
+:python_ok
 echo [OK] Python found:
-python --version
+%PYTHON% --version
+echo.
+
+:: ============================================================
+:: Ask GPU choice FIRST before creating venv or installing
+:: ============================================================
+echo ================================================================================
+echo   GPU Acceleration  (WD14 tagger + JoyCaption)
+echo ================================================================================
+echo.
+echo   [1] NVIDIA GPU   CUDA 12.1 - recommended if you have an NVIDIA card
+echo   [2] AMD GPU      ROCm (AMD RX 5000+ on Windows via native ROCm PyTorch)
+echo   [3] AMD GPU      DirectML (simpler alternative for AMD/Intel)
+echo   [4] CPU only     No GPU - slow for auto-tagging but fully functional
+echo   [5] Skip         Install manually later
+echo.
+set /p GPU_CHOICE="   Enter choice (1/2/3/4/5): "
 echo.
 
 :: -- Create virtual environment --
@@ -45,7 +69,7 @@ echo ===========================================================================
 
 if not exist "%SUITE_DIR%.venv\Scripts\python.exe" (
     echo Creating .venv...
-    python -m venv "%SUITE_DIR%.venv"
+    %PYTHON% -m venv "%SUITE_DIR%.venv"
     if errorlevel 1 (
         echo [ERROR] Failed to create virtual environment.
         pause
@@ -65,12 +89,63 @@ echo ===========================================================================
 echo [OK] pip up to date.
 echo.
 
-:: -- Install packages --
+:: -- Install PyTorch FIRST with correct backend --
 echo ================================================================================
 echo   [3/3] Installing packages
 echo ================================================================================
 echo.
-echo Installing PySide6, Pillow, numpy, transformers, and friends...
+
+if "%GPU_CHOICE%"=="1" goto :nvidia
+if "%GPU_CHOICE%"=="2" goto :rocm
+if "%GPU_CHOICE%"=="3" goto :directml
+if "%GPU_CHOICE%"=="4" goto :cpu
+goto :skip_gpu
+
+:nvidia
+echo Installing PyTorch CUDA 12.1...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cu121
+if errorlevel 1 ( echo [ERROR] NVIDIA torch install failed. ) else ( echo [OK] PyTorch CUDA 12.1 installed. )
+echo Installing onnxruntime (CPU - WD14 tagger)...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime
+if errorlevel 1 ( echo [ERROR] onnxruntime failed. ) else ( echo [OK] onnxruntime installed. JoyCaption uses GPU via PyTorch. )
+echo.
+goto :core
+
+:rocm
+echo Installing PyTorch ROCm 6.2...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+if errorlevel 1 ( echo [ERROR] ROCm torch install failed. ) else ( echo [OK] PyTorch ROCm installed. )
+echo Installing onnxruntime (CPU - WD14 tagger)...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime
+if errorlevel 1 ( echo [ERROR] onnxruntime failed. ) else ( echo [OK] onnxruntime installed. )
+echo.
+goto :core
+
+:directml
+echo Installing onnxruntime-directml...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime-directml
+if errorlevel 1 ( echo [ERROR] DirectML install failed. ) else ( echo [OK] onnxruntime-directml installed. )
+echo.
+goto :core
+
+:cpu
+echo Installing PyTorch CPU...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cpu
+if errorlevel 1 ( echo [ERROR] CPU torch install failed. ) else ( echo [OK] PyTorch CPU installed. )
+echo Installing onnxruntime...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime
+if errorlevel 1 ( echo [ERROR] onnxruntime failed. ) else ( echo [OK] onnxruntime installed. )
+echo.
+goto :core
+
+:skip_gpu
+echo Skipping GPU setup.
+echo Installing onnxruntime CPU fallback...
+"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime
+echo.
+
+:core
+echo Installing core packages...
 echo This may take several minutes on first install.
 echo.
 "%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
@@ -80,7 +155,8 @@ echo.
     opencv-python ^
     PyYAML ^
     huggingface-hub ^
-    "transformers==4.46.3" ^
+    "transformers>=4.47" ^
+    "tokenizers>=0.20" ^
     einops ^
     kornia ^
     timm ^
@@ -103,75 +179,7 @@ if errorlevel 1 (
 echo [OK] Core packages installed.
 echo.
 
-:: -- GPU acceleration --
-echo ================================================================================
-echo   GPU Acceleration  (WD14 tagger + JoyCaption)
-echo ================================================================================
-echo.
-echo   [1] NVIDIA GPU   CUDA 12.1 - recommended if you have an NVIDIA card
-echo   [2] AMD GPU      ROCm (AMD RX 5000+ on Windows via native ROCm PyTorch)
-echo   [3] AMD GPU      DirectML (simpler alternative for AMD/Intel)
-echo   [4] CPU only     No GPU - slow for auto-tagging but fully functional
-echo   [5] Skip         Install manually later
-echo.
-set /p GPU_CHOICE="   Enter choice (1/2/3/4/5): "
-echo.
-
-if "%GPU_CHOICE%"=="1" goto :nvidia
-if "%GPU_CHOICE%"=="2" goto :rocm
-if "%GPU_CHOICE%"=="3" goto :amd
-if "%GPU_CHOICE%"=="4" goto :cpu
-if "%GPU_CHOICE%"=="5" goto :done
-echo Invalid choice - skipping GPU setup.
-goto :done
-
-:nvidia
-echo Installing NVIDIA packages (onnxruntime-gpu, torch, torchvision)...
-echo NOTE: Download is approximately 2-3 GB. This will take a while.
-echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime-gpu
-if errorlevel 1 ( echo [ERROR] onnxruntime-gpu install failed. & goto :done )
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
-    torch torchvision ^
-    --index-url https://download.pytorch.org/whl/cu121
-if errorlevel 1 ( echo [ERROR] NVIDIA torch install failed. ) else ( echo [OK] NVIDIA packages installed. )
-goto :done
-
-:rocm
-echo Installing AMD ROCm packages (native ROCm PyTorch)...
-echo NOTE: Download is approximately 2-3 GB. This will take a while.
-echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
-    onnxruntime-gpu ^
-    torch torchvision ^
-    --index-url https://download.pytorch.org/whl/rocm6.2
-if errorlevel 1 ( echo [ERROR] ROCm install failed. ) else ( echo [OK] ROCm packages installed. )
-echo.
-echo Launch with run.bat - no wrapper needed.
-goto :done
-
-:amd
-echo Installing AMD packages (onnxruntime-directml)...
-echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
-    onnxruntime-directml
-if errorlevel 1 ( echo [ERROR] AMD install failed. ) else ( echo [OK] AMD packages installed. )
-goto :done
-
-:cpu
-echo Installing CPU packages (onnxruntime, torch, torchvision)...
-echo NOTE: Download is approximately 2-3 GB. This will take a while.
-echo.
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet onnxruntime
-if errorlevel 1 ( echo [ERROR] onnxruntime install failed. & goto :done )
-"%SUITE_DIR%.venv\Scripts\python.exe" -m pip install --quiet ^
-    torch torchvision ^
-    --index-url https://download.pytorch.org/whl/cpu
-if errorlevel 1 ( echo [ERROR] CPU torch install failed. ) else ( echo [OK] CPU packages installed. )
-goto :done
-
 :done
-echo.
 echo ================================================================================
 echo   Installation complete!
 echo.
