@@ -11,11 +11,14 @@ Designed by **Zero** | Built by **Jarvis**
 ### Tag Handler
 - Browse and edit image datasets with a card-based gallery
 - Auto-tag with **WD14 Ensemble** (ConvNextV2 + EVA02-Large)
-- Generate natural language captions with **JoyCaption Alpha Two**
-- Hybrid mode: WD14 tags + JoyCaption captions in one file
+- Generate natural language captions with **JoyCaption Beta One** (formal, informal, training prompt, booru, art critic, and more)
+- Fast captioning with **Moondream2** (lower VRAM, quicker turnaround)
+- Hybrid mode: WD14 tags + caption in one file
+- Extra Instructions field: steer caption output per run (e.g. "Focus on outfit and accessories.")
 - Upscale images with **Real-ESRGAN** (photo and anime modes)
 - Batch tag operations: add, remove, replace, shuffle, sort
 - Tag frequency chart and profile system
+- Model integrity check on startup — detects corrupt or incomplete downloads before loading
 
 ### Randomizer
 - Background removal with **BRIA RMBG-2.0** (realism) and **ToonOut** (anime)
@@ -59,6 +62,7 @@ Designed by **Zero** | Built by **Jarvis**
 - Windows 10/11
 - Python 3.10+ (3.11 recommended)
 - NVIDIA GPU recommended for tagging and captioning (8 GB+ VRAM for JoyCaption)
+- JoyCaption Beta One loads directly to VRAM via accelerate — does not require 18 GB of system RAM
 
 ---
 
@@ -70,7 +74,21 @@ Designed by **Zero** | Built by **Jarvis**
 4. Once complete, launch with **`run.bat`**
 
 > Models are downloaded automatically on first use (WD14, Real-ESRGAN, RMBG-2.0, ToonOut).
-> JoyCaption (~15 GB) is downloaded on first caption run.
+> JoyCaption Beta One (~18 GB) must be downloaded manually before first caption run — see below.
+
+### Downloading JoyCaption Beta One
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="fancyfeast/llama-joycaption-beta-one-hf-llava",
+    local_dir=r"<install_path>\tags\models\joycaption",
+    local_dir_use_symlinks=False,
+)
+```
+
+Run this once from the `.venv` Python after installation. The suite checks model integrity on every caption run and will report corrupt or incomplete downloads with a clear error.
 
 ---
 
@@ -80,11 +98,14 @@ Designed by **Zero** | Built by **Jarvis**
 |-------|------|---------|-----|
 | WD14 ConvNextV2 | ~600 MB | Apache 2.0 | Image tagging |
 | WD EVA02-Large | ~600 MB | Apache 2.0 | Image tagging |
-| JoyCaption Alpha Two | ~15 GB | Llama 3 | Captioning |
-| BRIA RMBG-2.0 | ~885 MB | BRIA AI ToS | Background removal (realism) |
+| JoyCaption Beta One | ~18 GB | Apache 2.0 + Llama 3.1 | Captioning |
+| Moondream2 | ~1.9 GB | Apache 2.0 | Fast captioning |
+| BRIA RMBG-2.0 | ~885 MB | CC BY-NC 4.0 ⚠ Non-commercial | Background removal (realism) |
 | ToonOut | ~885 MB | MIT | Background removal (anime) |
 | Real-ESRGAN x4+ | ~64 MB | BSD-3 | Upscaling (photo) |
 | Real-ESRGAN x4+ Anime | ~18 MB | BSD-3 | Upscaling (anime) |
+
+> **BRIA RMBG-2.0** is non-commercial only. Commercial use requires a separate license from [bria.ai](https://bria.ai).
 
 ---
 

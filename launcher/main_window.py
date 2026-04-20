@@ -6,15 +6,16 @@ Architecture:
   QMainWindow
     └── central QWidget  (QVBoxLayout, spacing=0)
           ├── Header QFrame (44px fixed height)
-          │     ├── [Manage] [Tags] [Calculator]  nav tabs
-          │     ├── dynamic app tab buttons (added on Open)
-          │     └── zoom controls + signature label
+          │     ├── [Manage] nav tab
+          │     ├── builtin tab buttons (hidden until app is opened)
+          │     ├── dynamic WebUI tab buttons (added on Open)
+          │     └── ⚙ Settings  zoom controls  signature label
           ├── Separator QFrame (1px)
           └── QStackedWidget  (fills remaining space)
                 ├── 0  ManagePage   (always present)
                 ├── …  BrowserView  (one per open web app)
                 ├── N  TagHandlerPage  (lazy, first click)
-                └── N+1 CalculatorPage (lazy, first click)
+                └── N+1 … other built-in app pages (lazy)
 """
 from __future__ import annotations
 
@@ -23,11 +24,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore    import Qt, QUrl, QTimer, QSize, Signal, QObject
-from PySide6.QtGui     import QFont, QCursor, QIcon
+from PySide6.QtGui     import QFont, QCursor, QIcon, QPixmap, QColor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QFrame, QStackedWidget,
     QScrollArea, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QSizePolicy, QInputDialog, QMessageBox,
+    QDialog, QDialogButtonBox, QMenu, QFileDialog, QFormLayout,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore    import (
@@ -77,16 +79,13 @@ class BrowserPage(QWebEnginePage):
         super().__init__(profile, parent)
 
     def createWindow(self, window_type):
-        # Redirect JS popups / target="_blank" into a new launcher tab
         self.new_tab_requested.emit("")
         return None
 
 
 # ── Browser view (one per open app tab) ──────────────────────────────────────
 class BrowserView(QWebEngineView):
-    """
-    Stays alive in the QStackedWidget even when hidden — page keeps its session.
-    """
+    """Stays alive in the QStackedWidget even when hidden — page keeps its session."""
 
     def __init__(self, profile: QWebEngineProfile, url: str, parent=None):
         super().__init__(parent)
@@ -109,7 +108,7 @@ class BrowserView(QWebEngineView):
 # ── Tab button widget ─────────────────────────────────────────────────────────
 class TabButton(QWidget):
     """
-    Header tab button. Optionally shows a status dot and a close ×.
+    Header tab button.  Optionally shows a status dot and a close ×.
     Active state is set via QSS dynamic property.
     """
 
@@ -187,173 +186,293 @@ class TabButton(QWidget):
                 self._STYLE_DOT_ON if online else self._STYLE_DOT_OFF)
 
 
-# ── App card (Manage page) ────────────────────────────────────────────────────
-class AppCard(QFrame):
+# ── App icon box (Manage page — Applications section) ────────────────────────
+class AppIconBox(QFrame):
+    """Clickable icon box for a built-in application — same size as WebUIBox."""
+
+    clicked_app = Signal(str)   # emits app name
+
+    # Same outer dimensions as WebUIBox
+    _W    = 220
+    _H    = 264
+    _BAR_H = 44   # bottom name bar
+    # Square icon area fills the rest: (_H - _BAR_H - 4 borders) × (_W - 4) = 216 × 216
+
+    _STYLE = f"""
+        QFrame {{
+            background-color: {CAR};
+            border: 2px solid {MUT};
+            border-radius: 8px;
+        }}
     """
-    One card per app in the Manage page.
-    Shows name, URL, status dot, Open / Start / Edit / Delete controls.
-    Inline edit panel expands below on demand.
+    _STYLE_HOVER = f"""
+        QFrame {{
+            background-color: #152236;
+            border: 2px solid {ACC};
+            border-radius: 8px;
+        }}
     """
 
-    open_requested   = Signal(str)          # url
-    edit_saved       = Signal(object, dict) # (self, data)
-    delete_requested = Signal(object)       # self
+    def __init__(self, name: str, icon_path: str, parent=None):
+        super().__init__(parent)
+        self.app_name = name
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(self._STYLE)
 
-    _CARD_BASE  = f"QFrame {{ background-color: {CAR}; border: 2px solid {MUT}; border-radius: 8px; }}"
-    _CARD_LIVE  = f"QFrame {{ background-color: {CAR}; border: 2px solid {ACC}; border-radius: 8px; }}"
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        # ── Icon area (square) ─────────────────────────────────────────────
+        icon_area_w = self._W - 4
+        icon_area_h = self._H - self._BAR_H - 4  # = 216
+
+        icon_lbl = QLabel(self)
+        icon_lbl.setFixedSize(icon_area_w, icon_area_h)
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_lbl.setStyleSheet(
+            f"background:{BG}; border:none; border-radius:6px 6px 0 0;")
+
+        px = QPixmap(icon_path)
+        if not px.isNull():
+            px = px.scaled(icon_area_w - 16, icon_area_h - 16,
+                           Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+            icon_lbl.setPixmap(px)
+        else:
+            icon_lbl.setText("?")
+            icon_lbl.setStyleSheet(
+                f"color:{MUT}; font-size:40px; background:{BG};"
+                f" border:none; border-radius:6px 6px 0 0;")
+        vbox.addWidget(icon_lbl)
+
+        # ── Name bar ───────────────────────────────────────────────────────
+        bar = QWidget(self)
+        bar.setFixedHeight(self._BAR_H)
+        bar.setStyleSheet(f"background:{PAN}; border:none; border-radius:0 0 6px 6px;")
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(8, 0, 8, 0)
+
+        name_lbl = QLabel(name, bar)
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_lbl.setStyleSheet(
+            f"color:{PRI}; font-family:{FONT}; font-size:13px;"
+            f" font-weight:bold; background:transparent; border:none;")
+        bar_layout.addWidget(name_lbl)
+        vbox.addWidget(bar)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked_app.emit(self.app_name)
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        self.setStyleSheet(self._STYLE_HOVER)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setStyleSheet(self._STYLE)
+        super().leaveEvent(event)
+
+
+# ── WebUI entry box (Manage page — WebUI/Loader section) ─────────────────────
+class WebUIBox(QFrame):
+    """Card for a WebUI/Loader entry — supports drag-and-drop image, right-click menu."""
+
+    open_requested   = Signal(str)    # url
+    edit_requested   = Signal(object) # self — full edit (name/url/cmd changed)
+    name_changed     = Signal(object) # self — rename only, no rebuild needed
+    delete_requested = Signal(object) # self
+    image_changed    = Signal(object) # self — image dropped/edited/cleared
+
+    _W, _H  = 220, 264
+    _BAR_H  = 44
+    _IMG_H  = _W - 4   # = 216 — square image section
+
+    _STYLE = f"""
+        QFrame {{
+            background-color: {CAR};
+            border: 2px solid {MUT};
+            border-radius: 8px;
+        }}
+    """
+    _STYLE_ONLINE = f"""
+        QFrame {{
+            background-color: {CAR};
+            border: 2px solid {ACC};
+            border-radius: 8px;
+        }}
+    """
 
     def __init__(self, app: dict, parent=None):
         super().__init__(parent)
-        self.app        = app
-        self._online    = None
-        self._edit_open = False
+        self.app     = app
+        self._online = None
+        self.setFixedSize(self._W, self._H)
+        self.setAcceptDrops(True)
+        self.setStyleSheet(self._STYLE)
 
-        self.setStyleSheet(self._CARD_BASE)
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 10, 12, 10)
-        outer.setSpacing(0)
+        # ── Image area (square) ────────────────────────────────────────────
+        self._img_lbl = QLabel(self)
+        self._img_lbl.setFixedSize(self._W - 4, self._IMG_H)   # 216 × 216
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setStyleSheet(
+            f"background:{BG}; border:none; border-radius:6px 6px 0 0;")
+        self._refresh_image()
+        vbox.addWidget(self._img_lbl)
 
-        # ── Main row ──────────────────────────────────────────────────────
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        # ── Bottom bar ─────────────────────────────────────────────────────
+        bar = QWidget(self)
+        bar.setFixedHeight(self._BAR_H)
+        bar.setStyleSheet(f"background:{PAN}; border:none; border-radius:0 0 6px 6px;")
+        bar_row = QHBoxLayout(bar)
+        bar_row.setContentsMargins(8, 0, 6, 0)
+        bar_row.setSpacing(4)
 
-        self._dot = QLabel("●", self)
-        self._dot.setStyleSheet(f"color: {MUT}; font-size: 14px;")
-        row.addWidget(self._dot)
-
-        info_col = QVBoxLayout()
-        info_col.setSpacing(2)
-        self._name_lbl = QLabel(app["name"], self)
+        self._name_lbl = QLabel(app["name"], bar)
         self._name_lbl.setStyleSheet(
-            f"color:{PRI}; font-family:{FONT}; font-size:{FONT_LG}px; font-weight:bold;")
-        self._url_lbl = QLabel(app["url"], self)
-        self._url_lbl.setStyleSheet(
-            f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;")
-        info_col.addWidget(self._name_lbl)
-        info_col.addWidget(self._url_lbl)
-        row.addLayout(info_col, stretch=1)
+            f"color:{PRI}; font-family:{FONT}; font-size:12px;"
+            f" font-weight:bold; background:transparent; border:none;")
+        bar_row.addWidget(self._name_lbl, stretch=1)
 
-        self._open_btn = QPushButton("Open", self)
+        self._open_btn = QPushButton("Open", bar)
+        self._open_btn.setFixedHeight(28)
+        self._open_btn.setMinimumWidth(64)
         self._open_btn.setEnabled(False)
-        self._open_btn.setFixedSize(QSize(80, 32))
-        self._open_btn.clicked.connect(lambda: self.open_requested.emit(app["url"]))
-        self._style_btn(self._open_btn, ACC)
-        row.addWidget(self._open_btn)
-
-        self._start_btn = None
-        if app.get("cmd"):
-            self._start_btn = QPushButton("Start", self)
-            self._start_btn.setFixedSize(QSize(70, 32))
-            self._start_btn.clicked.connect(self._start_app)
-            self._style_btn(self._start_btn, GRN)
-            row.addWidget(self._start_btn)
-
-        edit_btn = QPushButton("✎", self)
-        self._style_icon_btn(edit_btn)
-        edit_btn.clicked.connect(self._toggle_edit)
-        row.addWidget(edit_btn)
-
-        del_btn = QPushButton("×", self)
-        self._style_icon_btn(del_btn, danger=True)
-        del_btn.clicked.connect(lambda: self.delete_requested.emit(self))
-        row.addWidget(del_btn)
-
-        outer.addLayout(row)
-
-        # ── Inline edit panel ─────────────────────────────────────────────
-        self._edit_panel = QWidget(self)
-        self._edit_panel.setVisible(False)
-        ep = QVBoxLayout(self._edit_panel)
-        ep.setContentsMargins(0, 8, 0, 0)
-        ep.setSpacing(4)
-
-        self._ed_name = QLineEdit(app["name"], self._edit_panel)
-        self._ed_name.setPlaceholderText("Name")
-        ep.addWidget(self._ed_name)
-
-        self._ed_url = QLineEdit(app["url"], self._edit_panel)
-        self._ed_url.setPlaceholderText("http://...")
-        ep.addWidget(self._ed_url)
-
-        self._ed_cmd = QLineEdit(app.get("cmd", ""), self._edit_panel)
-        self._ed_cmd.setPlaceholderText(
-            "Launch command (optional): C:\\path\\to\\start.bat --args")
-        ep.addWidget(self._ed_cmd)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        save_btn = QPushButton("Save", self._edit_panel)
-        save_btn.setFixedSize(QSize(80, 28))
-        self._style_btn(save_btn, ACC, small=True)
-        save_btn.clicked.connect(self._save_edit)
-        btn_row.addWidget(save_btn)
-
-        cancel_btn = QPushButton("Cancel", self._edit_panel)
-        cancel_btn.setFixedSize(QSize(80, 28))
-        self._style_btn(cancel_btn, MUT, small=True)
-        cancel_btn.clicked.connect(self._toggle_edit)
-        btn_row.addWidget(cancel_btn)
-
-        ep.addLayout(btn_row)
-        outer.addWidget(self._edit_panel)
-
-    # ── Helpers ────────────────────────────────────────────────────────────
-    @staticmethod
-    def _style_btn(btn: QPushButton, color: str, small: bool = False) -> None:
-        h = 28 if small else 32
-        btn.setStyleSheet(f"""
+        self._open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open_btn.setStyleSheet(f"""
             QPushButton {{
-                background-color: {color};
-                color: {PRI};
-                border: none;
-                border-radius: 4px;
-                font-family: {FONT};
-                font-size: {FONT_MD}px;
-                font-weight: bold;
-                min-height: {h}px;
+                background:{ACC}; color:{PRI}; border:none;
+                border-radius:3px; font-size:11px; font-weight:bold;
             }}
-            QPushButton:hover   {{ background-color: rgba(255,255,255,20); }}
-            QPushButton:disabled {{ background-color: {MUT}; color: {SEC}; }}
+            QPushButton:disabled {{ background:{MUT}; color:{SEC}; }}
+            QPushButton:hover {{ background:#185FA5; }}
         """)
+        self._open_btn.clicked.connect(
+            lambda: self.open_requested.emit(self.app["url"]))
+        bar_row.addWidget(self._open_btn)
 
-    @staticmethod
-    def _style_icon_btn(btn: QPushButton, danger: bool = False) -> None:
-        hover_bg = RED if danger else MUT
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent;
-                color: {SEC};
-                border: none;
-                font-size: 16px;
-                min-width: 28px; max-width: 28px;
-                min-height: 28px; max-height: 28px;
+        vbox.addWidget(bar)
+
+        # ── Status dot (top-right overlay) ─────────────────────────────────
+        self._dot = QLabel("●", self)
+        self._dot.setFixedSize(16, 16)
+        self._dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dot.setStyleSheet(
+            f"color:{MUT}; font-size:10px;"
+            f" background:rgba(0,0,0,160); border-radius:8px; border:none;")
+        self._dot.move(self._W - 20, 6)
+        self._dot.raise_()
+
+    # ── Image ──────────────────────────────────────────────────────────────
+    def _refresh_image(self):
+        img_path = self.app.get("image", "")
+        if img_path and os.path.isfile(img_path):
+            px = QPixmap(img_path)
+            if not px.isNull():
+                # scale to fill, then center-crop
+                scaled = px.scaled(self._W - 4, self._IMG_H,
+                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+                x = max(0, (scaled.width()  - (self._W - 4)) // 2)
+                y = max(0, (scaled.height() - self._IMG_H)   // 2)
+                cropped = scaled.copy(x, y, self._W - 4, self._IMG_H)
+                self._img_lbl.setPixmap(cropped)
+                self._img_lbl.setStyleSheet(
+                    "border:none; border-radius:6px 6px 0 0;")
+                return
+        # Placeholder
+        self._img_lbl.clear()
+        self._img_lbl.setText("Drop image here")
+        self._img_lbl.setStyleSheet(
+            f"color:{MUT}; font-size:11px; background:{BG};"
+            f" border:none; border-radius:6px 6px 0 0;")
+
+    # ── Drag-and-drop ──────────────────────────────────────────────────────
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for u in event.mimeData().urls():
+                if u.toLocalFile().lower().endswith(
+                        ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for u in event.mimeData().urls():
+            path = u.toLocalFile()
+            if path.lower().endswith(
+                    ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                self.app["image"] = path
+                self._refresh_image()
+                self.image_changed.emit(self)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    # ── Context menu ───────────────────────────────────────────────────────
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background:{CAR}; color:{PRI};
+                border:1px solid {MUT};
+                font-family:{FONT}; font-size:12px;
+                padding:4px 0;
             }}
-            QPushButton:hover {{ background-color: {hover_bg}; color: {PRI}; }}
+            QMenu::item {{ padding:5px 20px; }}
+            QMenu::item:selected {{ background:{ACC}; }}
+            QMenu::separator {{ background:{MUT}; height:1px; margin:4px 8px; }}
         """)
-        btn.setFixedSize(QSize(28, 32))
+        act_edit   = menu.addAction("✎  Edit")
+        act_rename = menu.addAction("✏  Rename")
+        if self.app.get("cmd"):
+            menu.addSeparator()
+            act_start = menu.addAction("▶  Start")
+        else:
+            act_start = None
+        menu.addSeparator()
+        act_edit_img = menu.addAction("🖼  Edit Image")
+        act_del_img  = menu.addAction("🗑  Delete Image")
+        menu.addSeparator()
+        act_delete   = menu.addAction("✕  Delete Entry")
 
-    # ── Slots ──────────────────────────────────────────────────────────────
-    def _toggle_edit(self):
-        self._edit_open = not self._edit_open
-        self._edit_panel.setVisible(self._edit_open)
-        if self._edit_open:
-            self._ed_name.setText(self.app["name"])
-            self._ed_url.setText(self.app["url"])
-            self._ed_cmd.setText(self.app.get("cmd", ""))
+        chosen = menu.exec(event.globalPos())
+        if chosen == act_edit:
+            self._open_edit_dialog()
+        elif chosen == act_rename:
+            self._rename()
+        elif chosen == act_start and act_start is not None:
+            self._start()
+        elif chosen == act_edit_img:
+            self._browse_image()
+        elif chosen == act_del_img:
+            self._delete_image()
+        elif chosen == act_delete:
+            self.delete_requested.emit(self)
 
-    def _save_edit(self):
-        data = {
-            "name": self._ed_name.text().strip(),
-            "url":  self._ed_url.text().strip(),
-            "cmd":  self._ed_cmd.text().strip(),
-        }
-        if data["name"] and data["url"]:
-            self.edit_saved.emit(self, data)
-            self._toggle_edit()
+    def _open_edit_dialog(self):
+        dlg = WebUIEntryDialog(self.app, parent=self)
+        if dlg.exec():
+            data = dlg.get_data()
+            self.app.update(data)
+            self._name_lbl.setText(self.app["name"])
+            self.edit_requested.emit(self)
 
-    def _start_app(self):
+    def _rename(self):
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", "New name:", text=self.app["name"])
+        if ok and new_name.strip():
+            self.app["name"] = new_name.strip()
+            self._name_lbl.setText(new_name.strip())
+            self.name_changed.emit(self)
+
+    def _start(self):
         import subprocess
         cmd = self.app.get("cmd", "")
         if not cmd:
@@ -361,245 +480,509 @@ class AppCard(QFrame):
         exe = cmd.split()[0].strip('"')
         cwd = os.path.dirname(exe) if os.path.isfile(exe) else None
         subprocess.Popen(cmd, shell=True, cwd=cwd)
-        if self._start_btn:
-            self._start_btn.setEnabled(False)
-            self._start_btn.setText("Starting…")
 
-    # ── Public API ─────────────────────────────────────────────────────────
+    def _browse_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+        if path:
+            self.app["image"] = path
+            self._refresh_image()
+            self.image_changed.emit(self)
+
+    def _delete_image(self):
+        self.app.pop("image", None)
+        self._refresh_image()
+        self.image_changed.emit(self)
+
+    # ── Status ─────────────────────────────────────────────────────────────
     def set_status(self, online: bool) -> None:
         if online == self._online:
             return
         self._online = online
+        color = GRN if online else RED
         self._dot.setStyleSheet(
-            f"color: {GRN if online else RED}; font-size: 14px;")
-        self.setStyleSheet(self._CARD_LIVE if online else self._CARD_BASE)
+            f"color:{color}; font-size:10px;"
+            f" background:rgba(0,0,0,160); border-radius:8px; border:none;")
+        self.setStyleSheet(self._STYLE_ONLINE if online else self._STYLE)
         self._open_btn.setEnabled(online)
-        if self._start_btn:
-            self._start_btn.setEnabled(not online)
-            self._start_btn.setText("Start")
 
 
-# ── Manage page ───────────────────────────────────────────────────────────────
-class ManagePage(QWidget):
-    """Scrollable list of AppCards + add-app bar at the bottom."""
+# ── "+" add box for WebUI section ─────────────────────────────────────────────
+class AddWebUIBox(QFrame):
+    """Clicking this box opens the Create WebUI dialog."""
 
-    open_app = Signal(str)   # url
+    add_requested = Signal()
 
-    def __init__(self, apps: list[dict], parent=None):
+    _W, _H = 220, 264
+
+    _STYLE = f"""
+        QFrame {{
+            background-color: {CAR};
+            border: 2px dashed {MUT};
+            border-radius: 8px;
+        }}
+    """
+    _STYLE_HOVER = f"""
+        QFrame {{
+            background-color: #152236;
+            border: 2px dashed {ACC};
+            border-radius: 8px;
+        }}
+    """
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.apps   = apps
-        self._cards: list[AppCard] = []
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(self._STYLE)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # ── Scroll area ────────────────────────────────────────────────────
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(f"QScrollArea {{ border: none; background: {PAN}; }}")
+        plus = QLabel("+", self)
+        plus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        plus.setStyleSheet(
+            f"color:{MUT}; font-size:64px; font-weight:bold;"
+            f" background:transparent; border:none;")
+        layout.addWidget(plus)
 
-        self._content = QWidget()
-        self._content.setStyleSheet(f"background: {PAN};")
-        self._card_layout = QVBoxLayout(self._content)
-        self._card_layout.setContentsMargins(12, 12, 12, 8)
-        self._card_layout.setSpacing(8)
-        self._card_layout.addStretch()
+        lbl = QLabel("Add WebUI", self)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(
+            f"color:{MUT}; font-family:{FONT}; font-size:12px;"
+            f" background:transparent; border:none;")
+        layout.addWidget(lbl)
 
-        scroll.setWidget(self._content)
-        root.addWidget(scroll, stretch=1)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.add_requested.emit()
+        super().mousePressEvent(event)
 
-        # ── Add-app bar ────────────────────────────────────────────────────
-        add_bar = QFrame(self)
-        add_bar.setStyleSheet(
-            f"QFrame {{ background-color:{CAR}; border-radius:8px;"
-            f"border:1px solid {MUT}; margin: 6px 12px; }}")
-        add_row = QHBoxLayout(add_bar)
-        add_row.setContentsMargins(8, 8, 8, 8)
-        add_row.setSpacing(4)
+    def enterEvent(self, event):
+        self.setStyleSheet(self._STYLE_HOVER)
+        super().enterEvent(event)
 
-        self._add_name = QLineEdit(self)
-        self._add_name.setPlaceholderText("Name")
-        self._add_name.setFixedWidth(120)
-        add_row.addWidget(self._add_name)
+    def leaveEvent(self, event):
+        self.setStyleSheet(self._STYLE)
+        super().leaveEvent(event)
 
-        self._add_url = QLineEdit(self)
-        self._add_url.setPlaceholderText("http://localhost:")
-        self._add_url.setText("http://localhost:")
-        add_row.addWidget(self._add_url, stretch=1)
 
-        add_btn = QPushButton("+", self)
-        add_btn.setFixedSize(QSize(34, 32))
-        add_btn.setStyleSheet(f"""
+# ── WebUI create / edit dialog ────────────────────────────────────────────────
+class WebUIEntryDialog(QDialog):
+    """Used for both creating new and editing existing WebUI entries."""
+
+    _FIELD_STYLE = f"""
+        QLineEdit {{
+            background:{BG}; color:{PRI};
+            border:1px solid {MUT}; border-radius:4px;
+            font-family:{FONT}; font-size:{FONT_MD}px;
+            padding:4px 8px; min-height:28px;
+        }}
+        QLineEdit:focus {{ border-color:{ACC}; }}
+    """
+
+    def __init__(self, app: dict | None = None, parent=None):
+        super().__init__(parent)
+        is_edit = app is not None
+        self.setWindowTitle("Edit WebUI Entry" if is_edit else "Create WebUI Entry")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(f"QDialog {{ background:{BG}; }} QLabel {{ color:{PRI}; font-family:{FONT}; }}")
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._name = QLineEdit()
+        self._name.setStyleSheet(self._FIELD_STYLE)
+        self._name.setPlaceholderText("e.g.  SD.Next")
+        if is_edit:
+            self._name.setText(app.get("name", ""))
+        form.addRow("Name:", self._name)
+
+        self._url = QLineEdit()
+        self._url.setStyleSheet(self._FIELD_STYLE)
+        self._url.setPlaceholderText("http://localhost:7860")
+        if is_edit:
+            self._url.setText(app.get("url", ""))
+        else:
+            self._url.setText("http://localhost:")
+        form.addRow("URL / IP:", self._url)
+
+        self._cmd = QLineEdit()
+        self._cmd.setStyleSheet(self._FIELD_STYLE)
+        self._cmd.setPlaceholderText("C:\\path\\to\\start.bat  (optional)")
+        if is_edit:
+            self._cmd.setText(app.get("cmd", ""))
+        form.addRow("Launch cmd:", self._cmd)
+
+        layout.addLayout(form)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Save" if is_edit else "Create")
+        btns.accepted.connect(self._validate)
+        btns.rejected.connect(self.reject)
+        btns.setStyleSheet(f"""
             QPushButton {{
-                background-color: {ACC};
-                color: {PRI};
-                border: none;
-                border-radius: 4px;
-                font-family: {FONT};
-                font-size: 18px;
-                font-weight: bold;
+                background:{ACC}; color:{PRI}; border:none;
+                border-radius:4px; font-family:{FONT};
+                font-size:{FONT_MD}px; font-weight:bold;
+                min-width:70px; min-height:28px; padding:0 12px;
             }}
-            QPushButton:hover {{ background-color: #185FA5; }}
+            QPushButton:hover {{ background:#185FA5; }}
         """)
-        add_btn.clicked.connect(self._add_app)
-        add_row.addWidget(add_btn)
+        layout.addWidget(btns)
 
-        root.addWidget(add_bar)
+    def _validate(self):
+        if not self._name.text().strip():
+            QMessageBox.warning(self, "Required", "Name is required.")
+            return
+        if not self._url.text().strip():
+            QMessageBox.warning(self, "Required", "URL / IP address is required.")
+            return
+        self.accept()
 
-        # ── HuggingFace token bar (single slim row) ────────────────────────
-        hf_card = QFrame(self)
-        hf_card.setFixedHeight(38)
-        hf_card.setStyleSheet(
-            f"QFrame {{ background-color:{CAR}; border-radius:6px;"
-            f"border:1px solid {MUT}; margin: 0px 12px 8px 12px; }}")
-        hf_row = QHBoxLayout(hf_card)
-        hf_row.setContentsMargins(10, 0, 8, 0)
-        hf_row.setSpacing(6)
+    def get_data(self) -> dict:
+        data: dict = {
+            "name": self._name.text().strip(),
+            "url":  self._url.text().strip(),
+        }
+        cmd = self._cmd.text().strip()
+        if cmd:
+            data["cmd"] = cmd
+        return data
 
-        hf_title = QLabel("HF Token:", hf_card)
+
+# ── Settings dialog ───────────────────────────────────────────────────────────
+class SettingsDialog(QDialog):
+    """Application settings — currently houses the HuggingFace token."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(440)
+        self.setStyleSheet(f"""
+            QDialog   {{ background:{BG}; }}
+            QLabel    {{ color:{PRI}; font-family:{FONT}; font-size:{FONT_MD}px; }}
+            QGroupBox {{ color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;
+                         font-weight:bold; border:1px solid {MUT};
+                         border-radius:6px; margin-top:8px; padding:8px; }}
+            QGroupBox::title {{ subcontrol-origin:margin; left:8px; padding:0 4px; }}
+        """)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+
+        # ── HuggingFace token ──────────────────────────────────────────────
+        hf_frame = QFrame(self)
+        hf_frame.setStyleSheet(
+            f"QFrame {{ background:{CAR}; border:1px solid {MUT}; border-radius:6px; }}")
+        hf_vbox = QVBoxLayout(hf_frame)
+        hf_vbox.setContentsMargins(12, 10, 12, 10)
+        hf_vbox.setSpacing(8)
+
+        hf_title = QLabel("HuggingFace Token", hf_frame)
         hf_title.setStyleSheet(
             f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;"
-            f" font-weight:bold; border:none; background:transparent;")
-        hf_row.addWidget(hf_title)
+            f" font-weight:bold; background:transparent; border:none;")
+        hf_vbox.addWidget(hf_title)
 
-        self._hf_edit = QLineEdit(hf_card)
-        self._hf_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._hf_edit.setPlaceholderText("hf_••••••••••••••••••••••••••••••••••••")
-        self._hf_edit.setFixedHeight(26)
-        self._hf_edit.setStyleSheet(
-            f"QLineEdit {{ background:{BG}; color:{PRI}; border:1px solid {MUT};"
-            f" border-radius:4px; font-family:{FONT}; font-size:{FONT_SM}px;"
-            f" padding:2px 6px; }}"
-            f"QLineEdit:focus {{ border-color:{ACC}; }}")
-        hf_row.addWidget(self._hf_edit, stretch=1)
+        token_row = QHBoxLayout()
+        token_row.setSpacing(4)
 
-        show_btn = QPushButton("👁", hf_card)
-        show_btn.setFixedSize(QSize(24, 24))
+        self._token_edit = QLineEdit(hf_frame)
+        self._token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._token_edit.setPlaceholderText("hf_••••••••••••••••••••••••••••••••••••")
+        self._token_edit.setFixedHeight(30)
+        self._token_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background:{BG}; color:{PRI};
+                border:1px solid {MUT}; border-radius:4px;
+                font-family:{FONT}; font-size:{FONT_SM}px; padding:2px 8px;
+            }}
+            QLineEdit:focus {{ border-color:{ACC}; }}
+        """)
+        token_row.addWidget(self._token_edit, stretch=1)
+
+        show_btn = QPushButton("👁", hf_frame)
+        show_btn.setFixedSize(QSize(28, 30))
         show_btn.setCheckable(True)
-        show_btn.setStyleSheet(
-            f"QPushButton {{ background:{MUT}; color:{PRI}; border:none;"
-            f" border-radius:3px; font-size:11px; }}"
-            f"QPushButton:checked {{ background:{ACC}; }}")
+        show_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{MUT}; color:{PRI}; border:none;
+                border-radius:4px; font-size:13px;
+            }}
+            QPushButton:checked {{ background:{ACC}; }}
+        """)
         show_btn.toggled.connect(
-            lambda v: self._hf_edit.setEchoMode(
+            lambda v: self._token_edit.setEchoMode(
                 QLineEdit.EchoMode.Normal if v else QLineEdit.EchoMode.Password))
-        hf_row.addWidget(show_btn)
+        token_row.addWidget(show_btn)
 
-        save_hf_btn = QPushButton("Save", hf_card)
-        save_hf_btn.setFixedSize(QSize(52, 24))
-        save_hf_btn.setStyleSheet(
-            f"QPushButton {{ background:{ACC}; color:{PRI}; border:none;"
-            f" border-radius:3px; font-family:{FONT}; font-size:{FONT_SM}px;"
-            f" font-weight:bold; }}"
-            f"QPushButton:hover {{ background:#185FA5; }}")
-        save_hf_btn.clicked.connect(self._save_hf_token)
-        hf_row.addWidget(save_hf_btn)
+        hf_vbox.addLayout(token_row)
 
-        clear_hf_btn = QPushButton("Clear", hf_card)
-        clear_hf_btn.setFixedSize(QSize(44, 24))
-        clear_hf_btn.setStyleSheet(
-            f"QPushButton {{ background:transparent; color:{MUT}; border:1px solid {MUT};"
-            f" border-radius:3px; font-family:{FONT}; font-size:{FONT_SM}px; }}"
-            f"QPushButton:hover {{ border-color:{RED}; color:{RED}; }}")
-        clear_hf_btn.clicked.connect(self._clear_hf_token)
-        hf_row.addWidget(clear_hf_btn)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
 
-        self._hf_status = QLabel("○", hf_card)
-        self._hf_status.setFixedWidth(14)
+        save_btn = QPushButton("Save Token", hf_frame)
+        save_btn.setFixedHeight(28)
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{ACC}; color:{PRI}; border:none; border-radius:4px;
+                font-family:{FONT}; font-size:{FONT_SM}px; font-weight:bold; padding:0 14px;
+            }}
+            QPushButton:hover {{ background:#185FA5; }}
+        """)
+        save_btn.clicked.connect(self._save_token)
+        btn_row.addWidget(save_btn)
+
+        clear_btn = QPushButton("Clear", hf_frame)
+        clear_btn.setFixedHeight(28)
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:transparent; color:{MUT};
+                border:1px solid {MUT}; border-radius:4px;
+                font-family:{FONT}; font-size:{FONT_SM}px; padding:0 14px;
+            }}
+            QPushButton:hover {{ border-color:{RED}; color:{RED}; }}
+        """)
+        clear_btn.clicked.connect(self._clear_token)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+
+        self._hf_status = QLabel("", hf_frame)
         self._hf_status.setStyleSheet(
-            f"color:{MUT}; font-size:11px; border:none; background:transparent;")
-        self._hf_status.setToolTip("No token set")
-        hf_row.addWidget(self._hf_status)
+            f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; border:none;")
+        btn_row.addWidget(self._hf_status)
 
-        root.addWidget(hf_card)
+        hf_vbox.addLayout(btn_row)
+        outer.addWidget(hf_frame)
 
-        # Populate token field if already saved
+        # ── Close button ───────────────────────────────────────────────────
+        outer.addStretch()
+        close_btn = QPushButton("Close", self)
+        close_btn.setFixedHeight(30)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{MUT}; color:{PRI}; border:none; border-radius:4px;
+                font-family:{FONT}; font-size:{FONT_MD}px; font-weight:bold;
+            }}
+            QPushButton:hover {{ background:{ACC}; }}
+        """)
+        close_btn.clicked.connect(self.accept)
+        outer.addWidget(close_btn)
+
+        # Pre-fill saved token
         saved = load_hf_token()
         if saved:
-            self._hf_edit.setText(saved)
-            self._hf_status.setText("●")
+            self._token_edit.setText(saved)
+            self._hf_status.setText("● Token set")
             self._hf_status.setStyleSheet(
-                f"color:{GRN}; font-size:11px; border:none; background:transparent;")
-            self._hf_status.setToolTip("Token set")
+                f"color:{GRN}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
 
-        self.refresh_cards()
-
-    def refresh_cards(self) -> None:
-        for card in self._cards:
-            self._card_layout.removeWidget(card)
-            card.deleteLater()
-        self._cards.clear()
-
-        for app in self.apps:
-            card = AppCard(app)
-            card.open_requested.connect(self.open_app)
-            card.edit_saved.connect(self._on_edit_saved)
-            card.delete_requested.connect(self._on_delete)
-            self._card_layout.insertWidget(self._card_layout.count() - 1, card)
-            self._cards.append(card)
-
-    def poll_update(self, statuses: dict) -> None:
-        for card in self._cards:
-            url = card.app["url"]
-            if url in statuses:
-                card.set_status(statuses[url])
-
-    def get_cards(self) -> list[AppCard]:
-        return list(self._cards)
-
-    def _add_app(self):
-        name = self._add_name.text().strip()
-        url  = self._add_url.text().strip()
-        if not name or not url:
-            return
-        self.apps.append({"name": name, "url": url})
-        save_apps(self.apps)
-        self._add_name.clear()
-        self._add_url.setText("http://localhost:")
-        self.refresh_cards()
-
-    def _on_edit_saved(self, card: AppCard, data: dict):
-        card.app["name"] = data["name"]
-        card.app["url"]  = data["url"]
-        if data["cmd"]:
-            card.app["cmd"] = data["cmd"]
-        else:
-            card.app.pop("cmd", None)
-        save_apps(self.apps)
-        self.refresh_cards()
-
-    def _on_delete(self, card: AppCard):
-        self.apps = [a for a in self.apps if a is not card.app]
-        save_apps(self.apps)
-        self.refresh_cards()
-
-    def _save_hf_token(self):
-        token = self._hf_edit.text().strip()
+    def _save_token(self):
+        token = self._token_edit.text().strip()
         if not token:
             return
         save_hf_token(token)
         ok = apply_hf_token(token)
         if ok:
-            self._hf_status.setText("●  Token set")
+            self._hf_status.setText("✅ Token saved")
             self._hf_status.setStyleSheet(
                 f"color:{GRN}; font-family:{FONT}; font-size:{FONT_SM}px;"
-                f" border:none; background:transparent;")
+                f" background:transparent; border:none;")
         else:
-            self._hf_status.setText("⚠  Login failed")
+            self._hf_status.setText("⚠ Login failed")
             self._hf_status.setStyleSheet(
-                f"color:{AMB}; font-family:{FONT}; font-size:{FONT_SM}px;"
-                f" border:none; background:transparent;")
+                f"color:{RED}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
 
-    def _clear_hf_token(self):
-        self._hf_edit.clear()
+    def _clear_token(self):
+        self._token_edit.clear()
         save_hf_token("")
-        import os; os.environ.pop("HF_TOKEN", None)
-        self._hf_status.setText("○  Not set")
+        os.environ.pop("HF_TOKEN", None)
+        self._hf_status.setText("○ Not set")
         self._hf_status.setStyleSheet(
             f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
-            f" border:none; background:transparent;")
+            f" background:transparent; border:none;")
+
+
+# ── Manage page (visual redesign) ─────────────────────────────────────────────
+class ManagePage(QWidget):
+    """
+    Two-section visual Manage page:
+      1. Applications  — 500×500 icon boxes for built-in apps
+      2. WebUI/Loader  — card boxes with drag-and-drop image + right-click menu
+    """
+
+    open_app     = Signal(str)  # url  — open WebUI browser tab
+    open_builtin = Signal(str)  # name — open built-in app
+    apps_changed = Signal(list) # new list — notify Launcher/poller
+
+    _BUILTIN_APPS = [
+        ("Tags",       "tags.png"),
+        ("Calculator", "calculator.png"),
+        ("Enhancer",   "Enhancer.png"),
+        ("Face Swap",  "Face Swap.png"),
+        ("Randomizer", "Randomizer.png"),
+    ]
+
+    _SECTION_LABEL = (
+        f"color:{SEC}; font-family:{FONT}; font-size:10px;"
+        f" font-weight:bold; letter-spacing:2px;"
+        f" background:transparent;"
+    )
+
+    def __init__(self, apps: list[dict], parent=None):
+        super().__init__(parent)
+        self.apps         = apps
+        self._webui_boxes: list[WebUIBox] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Outer scroll (vertical) ────────────────────────────────────────
+        outer_scroll = QScrollArea(self)
+        outer_scroll.setWidgetResizable(True)
+        outer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer_scroll.setStyleSheet(
+            f"QScrollArea {{ border:none; background:{PAN}; }}")
+
+        content = QWidget()
+        content.setStyleSheet(f"background:{PAN};")
+        vbox = QVBoxLayout(content)
+        vbox.setContentsMargins(16, 16, 16, 20)
+        vbox.setSpacing(12)
+
+        # ── Applications section ───────────────────────────────────────────
+        apps_label = QLabel("APPLICATIONS", content)
+        apps_label.setStyleSheet(self._SECTION_LABEL)
+        vbox.addWidget(apps_label)
+
+        app_scroll = QScrollArea(content)
+        app_scroll.setFixedHeight(AppIconBox._H + 24)
+        app_scroll.setWidgetResizable(True)
+        app_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        app_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        app_scroll.setStyleSheet(f"QScrollArea {{ border:none; background:{PAN}; }}")
+
+        app_row_widget = QWidget()
+        app_row_widget.setStyleSheet(f"background:{PAN};")
+        app_row = QHBoxLayout(app_row_widget)
+        app_row.setContentsMargins(0, 4, 0, 4)
+        app_row.setSpacing(16)
+
+        for name, icon_file in self._BUILTIN_APPS:
+            box = AppIconBox(name, os.path.join(_ASSETS, icon_file), app_row_widget)
+            box.clicked_app.connect(self.open_builtin)
+            app_row.addWidget(box)
+
+        app_row.addStretch()
+        app_scroll.setWidget(app_row_widget)
+        vbox.addWidget(app_scroll)
+
+        # ── WebUI / Loader section ─────────────────────────────────────────
+        web_label = QLabel("WEBUI / LOADER", content)
+        web_label.setStyleSheet(self._SECTION_LABEL)
+        vbox.addWidget(web_label)
+
+        web_scroll = QScrollArea(content)
+        web_scroll.setFixedHeight(WebUIBox._H + 24)
+        web_scroll.setWidgetResizable(True)
+        web_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        web_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        web_scroll.setStyleSheet(f"QScrollArea {{ border:none; background:{PAN}; }}")
+
+        self._webui_row_widget = QWidget()
+        self._webui_row_widget.setStyleSheet(f"background:{PAN};")
+        self._webui_layout = QHBoxLayout(self._webui_row_widget)
+        self._webui_layout.setContentsMargins(0, 4, 0, 4)
+        self._webui_layout.setSpacing(12)
+
+        web_scroll.setWidget(self._webui_row_widget)
+        vbox.addWidget(web_scroll)
+
+        vbox.addStretch()
+        outer_scroll.setWidget(content)
+        root.addWidget(outer_scroll)
+
+        self._refresh_webui()
+
+    # ── WebUI card management ──────────────────────────────────────────────
+
+    def _refresh_webui(self) -> None:
+        while self._webui_layout.count():
+            item = self._webui_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._webui_boxes.clear()
+
+        for app in self.apps:
+            box = WebUIBox(app, self._webui_row_widget)
+            box.open_requested.connect(self.open_app)
+            box.edit_requested.connect(self._on_webui_edit)
+            box.name_changed.connect(self._on_name_changed)
+            box.delete_requested.connect(self._on_webui_delete)
+            box.image_changed.connect(self._on_image_changed)
+            self._webui_layout.addWidget(box)
+            self._webui_boxes.append(box)
+
+        add_box = AddWebUIBox(self._webui_row_widget)
+        add_box.add_requested.connect(self._create_webui)
+        self._webui_layout.addWidget(add_box)
+        self._webui_layout.addStretch()
+
+    def poll_update(self, statuses: dict) -> None:
+        for box in self._webui_boxes:
+            url = box.app.get("url", "")
+            if url in statuses:
+                box.set_status(statuses[url])
+
+    def get_cards(self) -> list[WebUIBox]:
+        return list(self._webui_boxes)
+
+    def _create_webui(self) -> None:
+        dlg = WebUIEntryDialog(parent=self)
+        if dlg.exec():
+            self.apps.append(dlg.get_data())
+            save_apps(self.apps)
+            self.apps_changed.emit(self.apps)
+            self._refresh_webui()
+
+    def _on_webui_edit(self, box: WebUIBox) -> None:
+        # box.app already updated in-place by the dialog inside WebUIBox
+        save_apps(self.apps)
+        self.apps_changed.emit(self.apps)
+        self._refresh_webui()
+
+    def _on_name_changed(self, box: WebUIBox) -> None:
+        # In-place name update — just save, no rebuild needed
+        save_apps(self.apps)
+        self.apps_changed.emit(self.apps)
+
+    def _on_webui_delete(self, box: WebUIBox) -> None:
+        try:
+            self.apps.remove(box.app)
+        except ValueError:
+            pass
+        save_apps(self.apps)
+        self.apps_changed.emit(self.apps)
+        self._refresh_webui()
+
+    def _on_image_changed(self, box: WebUIBox) -> None:
+        # Image updated in-place — just save
+        save_apps(self.apps)
 
 
 # ── Poll worker (signals safe across threads) ─────────────────────────────────
@@ -690,18 +1073,28 @@ class Launcher(QMainWindow):
         self._header = QFrame(self)
         self._header.setObjectName("header")
         self._header.setFixedHeight(44)
-        self._header.setStyleSheet(f"QFrame#header {{ background-color: {CAR}; border: none; }}")
+        self._header.setStyleSheet(
+            f"QFrame#header {{ background-color:{CAR}; border:none; }}")
         hrow = QHBoxLayout(self._header)
         hrow.setContentsMargins(4, 4, 8, 4)
         hrow.setSpacing(0)
 
-        # Nav tabs — Manage has no close; the other three can be unloaded
-        self._manage_tab = self._make_nav_tab("Manage",     self._show_manage)
-        self._tags_tab   = self._make_nav_tab("Tags",       self._show_tags,       closeable=True)
-        self._calc_tab   = self._make_nav_tab("Calculator", self._show_calculator, closeable=True)
-        self._rand_tab   = self._make_nav_tab("Randomizer", self._show_randomizer, closeable=True)
-        self._face_tab   = self._make_nav_tab("Face Swap",  self._show_faceswap,   closeable=True)
-        self._enh_tab    = self._make_nav_tab("Enhancer",   self._show_enhancer,   closeable=True)
+        # Manage tab (always visible, no close)
+        self._manage_tab = self._make_nav_tab("Manage", self._show_manage)
+        hrow.addWidget(self._manage_tab)
+        hrow.addSpacing(4)
+
+        # Built-in app tabs — hidden by default, revealed when app is opened
+        self._tags_tab = self._make_nav_tab(
+            "Tags", self._show_tags, closeable=True)
+        self._calc_tab = self._make_nav_tab(
+            "Calculator", self._show_calculator, closeable=True)
+        self._rand_tab = self._make_nav_tab(
+            "Randomizer", self._show_randomizer, closeable=True)
+        self._face_tab = self._make_nav_tab(
+            "Face Swap", self._show_faceswap, closeable=True)
+        self._enh_tab  = self._make_nav_tab(
+            "Enhancer", self._show_enhancer, closeable=True)
 
         self._tags_tab.close_requested.connect(self._close_tags)
         self._calc_tab.close_requested.connect(self._close_calculator)
@@ -709,12 +1102,13 @@ class Launcher(QMainWindow):
         self._face_tab.close_requested.connect(self._close_faceswap)
         self._enh_tab.close_requested.connect(self._close_enhancer)
 
-        for btn in (self._manage_tab, self._tags_tab, self._calc_tab,
-                    self._rand_tab, self._face_tab, self._enh_tab):
+        for btn in (self._tags_tab, self._calc_tab, self._rand_tab,
+                    self._face_tab, self._enh_tab):
             hrow.addWidget(btn)
             hrow.addSpacing(4)
+            btn.setVisible(False)   # hidden until app is opened
 
-        # Dynamic app tabs
+        # Dynamic WebUI app tabs
         self._app_tabs_area = QHBoxLayout()
         self._app_tabs_area.setContentsMargins(0, 0, 0, 0)
         self._app_tabs_area.setSpacing(4)
@@ -723,15 +1117,15 @@ class Launcher(QMainWindow):
         hrow.addStretch(1)
 
         # Zoom controls
+        btn_minus = self._make_zoom_btn("−", self._zoom_out)
         self._zoom_lbl = QLabel("100%", self._header)
         self._zoom_lbl.setStyleSheet(
             f"color:{SEC}; font-family:{FONT}; font-size:11px;"
-            f"min-width:46px; max-width:46px; qproperty-alignment:AlignCenter;")
+            f" min-width:46px; max-width:46px;"
+            f" qproperty-alignment:AlignCenter;")
         self._zoom_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self._zoom_lbl.mousePressEvent = lambda e: self._zoom_manual()
-
-        btn_minus = self._make_zoom_btn("−", self._zoom_out)
-        btn_plus  = self._make_zoom_btn("+", self._zoom_in)
+        btn_plus = self._make_zoom_btn("+", self._zoom_in)
 
         zoom_frame = QWidget(self._header)
         zoom_row   = QHBoxLayout(zoom_frame)
@@ -741,12 +1135,27 @@ class Launcher(QMainWindow):
         zoom_row.addWidget(self._zoom_lbl)
         zoom_row.addWidget(btn_plus)
         hrow.addWidget(zoom_frame)
+        hrow.addSpacing(6)
+
+        # ⚙ Settings button
+        settings_btn = QPushButton("⚙", self._header)
+        settings_btn.setFixedSize(QSize(28, 28))
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.setToolTip("Settings")
+        settings_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{MUT}; color:{PRI}; border:none;
+                border-radius:4px; font-size:15px;
+            }}
+            QPushButton:hover {{ background:{ACC}; }}
+        """)
+        settings_btn.clicked.connect(self._open_settings)
+        hrow.addWidget(settings_btn)
         hrow.addSpacing(8)
 
         # Signature
         sig = QLabel(SIGNATURE, self._header)
-        sig.setStyleSheet(
-            f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;")
+        sig.setStyleSheet(f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;")
         hrow.addWidget(sig)
 
         root_layout.addWidget(self._header)
@@ -754,7 +1163,7 @@ class Launcher(QMainWindow):
         # ── 1px separator ─────────────────────────────────────────────────
         sep = QFrame(self)
         sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background-color: {MUT};")
+        sep.setStyleSheet(f"background-color:{MUT};")
         root_layout.addWidget(sep)
 
         # ── Content stack ──────────────────────────────────────────────────
@@ -763,12 +1172,16 @@ class Launcher(QMainWindow):
 
         self._manage_page = ManagePage(self.apps)
         self._manage_page.open_app.connect(self._open_app_tab)
+        self._manage_page.open_builtin.connect(self._open_builtin)
+        self._manage_page.apps_changed.connect(self._on_apps_changed)
         self._stack.addWidget(self._manage_page)   # index 0
 
         self._show_manage()
 
-    def _make_nav_tab(self, label: str, callback, closeable: bool = False) -> TabButton:
-        btn = TabButton(label, show_dot=closeable, show_close=closeable, parent=self._header)
+    def _make_nav_tab(self, label: str, callback,
+                      closeable: bool = False) -> TabButton:
+        btn = TabButton(label, show_dot=closeable, show_close=closeable,
+                        parent=self._header)
         btn.clicked.connect(callback)
         return btn
 
@@ -777,16 +1190,12 @@ class Launcher(QMainWindow):
         btn = QPushButton(label)
         btn.setStyleSheet(f"""
             QPushButton {{
-                background-color: {CAR};
-                color: {PRI};
-                border: none;
-                font-family: {FONT};
-                font-size: 16px;
-                font-weight: bold;
-                min-width: 26px; max-width: 26px;
-                min-height: 28px; max-height: 28px;
+                background-color:{CAR}; color:{PRI}; border:none;
+                font-family:{FONT}; font-size:16px; font-weight:bold;
+                min-width:26px; max-width:26px;
+                min-height:28px; max-height:28px;
             }}
-            QPushButton:hover {{ background-color: {MUT}; }}
+            QPushButton:hover {{ background-color:{MUT}; }}
         """)
         btn.clicked.connect(callback)
         return btn
@@ -812,7 +1221,20 @@ class Launcher(QMainWindow):
         self._stack.setCurrentIndex(self.MANAGE_INDEX)
         self._set_zoom_display(1.0)
 
+    def _open_builtin(self, name: str) -> None:
+        dispatch = {
+            "Tags":       self._show_tags,
+            "Calculator": self._show_calculator,
+            "Enhancer":   self._show_enhancer,
+            "Face Swap":  self._show_faceswap,
+            "Randomizer": self._show_randomizer,
+        }
+        fn = dispatch.get(name)
+        if fn:
+            fn()
+
     def _show_tags(self):
+        self._tags_tab.setVisible(True)
         if self._tags_page is None:
             from tags.tag_handler_page import TagHandlerPage
             self._tags_page  = TagHandlerPage()
@@ -825,6 +1247,7 @@ class Launcher(QMainWindow):
         self._set_zoom_display(1.0)
 
     def _show_calculator(self):
+        self._calc_tab.setVisible(True)
         if self._calc_page is None:
             from calculator.calculator_page import CalculatorPage
             self._calc_page  = CalculatorPage()
@@ -837,6 +1260,7 @@ class Launcher(QMainWindow):
         self._set_zoom_display(1.0)
 
     def _show_randomizer(self):
+        self._rand_tab.setVisible(True)
         if self._rand_page is None:
             from randomizer.randomizer_page import RandomizerPage
             self._rand_page  = RandomizerPage()
@@ -849,6 +1273,7 @@ class Launcher(QMainWindow):
         self._set_zoom_display(1.0)
 
     def _show_faceswap(self):
+        self._face_tab.setVisible(True)
         if self._face_page is None:
             from faces.face_swap_page import FaceSwapPage
             self._face_page  = FaceSwapPage()
@@ -860,6 +1285,19 @@ class Launcher(QMainWindow):
         self._stack.setCurrentIndex(self._face_index)
         self._set_zoom_display(1.0)
 
+    def _show_enhancer(self):
+        self._enh_tab.setVisible(True)
+        if self._enh_page is None:
+            from enhancer.enhancer_page import EnhancerPage
+            self._enh_page  = EnhancerPage()
+            self._enh_index = self._stack.addWidget(self._enh_page)
+            self._enh_tab.set_dot_online(True)
+        self._deactivate_all()
+        self._enh_tab.set_active(True)
+        self._active_url = None
+        self._stack.setCurrentIndex(self._enh_index)
+        self._set_zoom_display(1.0)
+
     def _open_app_tab(self, url: str):
         if url in self._tab_data:
             self._switch_to_tab(url)
@@ -869,7 +1307,8 @@ class Launcher(QMainWindow):
         idx  = self._stack.addWidget(view)
         self._stack_index[url] = idx
 
-        app     = next((a for a in self.apps if a["url"] == url), {"name": url, "url": url})
+        app     = next((a for a in self.apps if a["url"] == url),
+                       {"name": url, "url": url})
         tab_btn = TabButton(app["name"], show_dot=True, show_close=True,
                             parent=self._header)
         tab_btn.clicked.connect(lambda u=url: self._switch_to_tab(u))
@@ -892,8 +1331,8 @@ class Launcher(QMainWindow):
     def _close_tab(self, url: str):
         if url not in self._tab_data:
             return
-        entry             = self._tab_data.pop(url)
-        view: BrowserView = entry["view"]
+        entry              = self._tab_data.pop(url)
+        view: BrowserView  = entry["view"]
         tab_btn: TabButton = entry["tab_btn"]
 
         self._app_tabs_area.removeWidget(tab_btn)
@@ -912,7 +1351,6 @@ class Launcher(QMainWindow):
     def _close_tags(self):
         if self._tags_page is None:
             return
-        # Warn if there are unsaved edits
         if getattr(self._tags_page, '_tags_changed', None):
             from PySide6.QtWidgets import QMessageBox
             r = QMessageBox.question(
@@ -927,6 +1365,7 @@ class Launcher(QMainWindow):
         self._tags_index = None
         self._tags_tab.set_active(False)
         self._tags_tab.set_dot_online(False)
+        self._tags_tab.setVisible(False)
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -939,6 +1378,7 @@ class Launcher(QMainWindow):
         self._calc_index = None
         self._calc_tab.set_active(False)
         self._calc_tab.set_dot_online(False)
+        self._calc_tab.setVisible(False)
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -951,6 +1391,7 @@ class Launcher(QMainWindow):
         self._rand_index = None
         self._rand_tab.set_active(False)
         self._rand_tab.set_dot_online(False)
+        self._rand_tab.setVisible(False)
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -963,20 +1404,9 @@ class Launcher(QMainWindow):
         self._face_index = None
         self._face_tab.set_active(False)
         self._face_tab.set_dot_online(False)
+        self._face_tab.setVisible(False)
         self._rebuild_stack_index()
         self._show_manage()
-
-    def _show_enhancer(self):
-        if self._enh_page is None:
-            from enhancer.enhancer_page import EnhancerPage
-            self._enh_page  = EnhancerPage()
-            self._enh_index = self._stack.addWidget(self._enh_page)
-            self._enh_tab.set_dot_online(True)
-        self._deactivate_all()
-        self._enh_tab.set_active(True)
-        self._active_url = None
-        self._stack.setCurrentIndex(self._enh_index)
-        self._set_zoom_display(1.0)
 
     def _close_enhancer(self):
         if self._enh_page is None:
@@ -987,6 +1417,7 @@ class Launcher(QMainWindow):
         self._enh_index = None
         self._enh_tab.set_active(False)
         self._enh_tab.set_dot_online(False)
+        self._enh_tab.setVisible(False)
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -1006,6 +1437,14 @@ class Launcher(QMainWindow):
             self._face_index = self._stack.indexOf(self._face_page)
         if self._enh_page:
             self._enh_index = self._stack.indexOf(self._enh_page)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Settings
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        dlg.exec()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Zoom
@@ -1055,6 +1494,9 @@ class Launcher(QMainWindow):
             if url in self._tab_data:
                 self._tab_data[url]["tab_btn"].set_dot_online(online)
         self._poller.update_apps(self.apps)
+
+    def _on_apps_changed(self, apps: list) -> None:
+        self._poller.update_apps(apps)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Shutdown

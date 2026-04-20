@@ -82,7 +82,7 @@ WD = {"character": 0.009, "concept": 0.008, "style": 0.004, "outfit": 0.008, "po
 CD = {"character": 0.15,  "concept": 0.12,  "style": 0.10,  "outfit": 0.14,  "pose": 0.10}
 
 MAX_LOG         = 20
-IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.txt'}
+IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif', '.txt'}
 RANK_CAP_OPTIONS = ["auto", "min", "outfit", "default", "large", "xlarge", "max"]
 
 PRELOADED_AT = [
@@ -533,9 +533,16 @@ def calc_cv(lt: str, imgs: int, factor: float, rc: str,
 
 def count_dataset_files(folder: str) -> int:
     try:
-        return sum(1 for f in os.listdir(folder)
-                   if os.path.splitext(f)[1].lower() in IMAGE_EXTS)
-    except Exception:
+        count = sum(
+            1
+            for root, _, files in os.walk(folder)
+            for f in files
+            if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+        )
+        print(f"[calc] count_dataset_files({folder!r}) → {count}")
+        return count
+    except Exception as e:
+        print(f"[calc] count_dataset_files ERROR: {e}")
         return 0
 
 

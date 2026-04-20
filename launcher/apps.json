@@ -2,7 +2,8 @@
   {
     "name": "SD.next",
     "url": "http://localhost:7000",
-    "cmd": "E:\\automatic\\webui.bat --use-rocm --update --backend diffusers --port 7000"
+    "cmd": "E:\\automatic\\webui.bat --use-rocm --update --backend diffusers --port 7000",
+    "image": "F:/VC Projects/Lora Training Suite 2.0/assets/SDnext.png"
   },
   {
     "name": "Kohya",
@@ -11,14 +12,17 @@
   },
   {
     "name": "AI-Toolkit",
-    "url": "http://192.168.1.64:8675/"
+    "url": "http://192.168.1.64:8675/",
+    "image": "F:/VC Projects/Lora Training Suite 2.0/assets/AItoolkit.png"
   },
   {
     "name": "SD.Next Remote",
-    "url": "http://192.168.1.64:7860/"
+    "url": "http://192.168.1.64:7860/",
+    "image": "F:/VC Projects/Lora Training Suite 2.0/assets/SDnext.png"
   },
   {
-    "name": "Kteos",
-    "url": "http://192.168.1.64:3000/"
+    "name": "Ktiseos Nyx",
+    "url": "http://192.168.1.64:3000/",
+    "image": "F:/VC Projects/Lora Training Suite 2.0/assets/Ktiseos.png"
   }
 ]
