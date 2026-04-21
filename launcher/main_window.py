@@ -45,8 +45,26 @@ from shared.config import (
     load_hf_token, save_hf_token, apply_hf_token,
 )
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_ASSETS = os.path.join(os.path.dirname(_HERE), "assets")
+_HERE             = os.path.dirname(os.path.abspath(__file__))
+_ASSETS           = os.path.join(os.path.dirname(_HERE), "assets")
+_CUSTOM_APPS_FILE = os.path.join(_HERE, "custom_apps.json")
+
+
+def _load_custom_apps() -> list[dict]:
+    import json
+    try:
+        if os.path.exists(_CUSTOM_APPS_FILE):
+            with open(_CUSTOM_APPS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save_custom_apps(apps: list[dict]) -> None:
+    import json
+    with open(_CUSTOM_APPS_FILE, "w", encoding="utf-8") as f:
+        json.dump(apps, f, indent=2, ensure_ascii=False)
 
 
 # ── Off-the-record WebEngine profile ─────────────────────────────────────────
@@ -418,17 +436,7 @@ class WebUIBox(QFrame):
     # ── Context menu ───────────────────────────────────────────────────────
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{
-                background:{CAR}; color:{PRI};
-                border:1px solid {MUT};
-                font-family:{FONT}; font-size:12px;
-                padding:4px 0;
-            }}
-            QMenu::item {{ padding:5px 20px; }}
-            QMenu::item:selected {{ background:{ACC}; }}
-            QMenu::separator {{ background:{MUT}; height:1px; margin:4px 8px; }}
-        """)
+        menu.setStyleSheet(_MENU_QSS)
         act_edit   = menu.addAction("✎  Edit")
         act_rename = menu.addAction("✏  Rename")
         if self.app.get("cmd"):
@@ -659,6 +667,388 @@ class WebUIEntryDialog(QDialog):
         return data
 
 
+# ── Shared QSS for context menus (used by CustomAppBox & WebUIBox) ────────────
+_MENU_QSS = f"""
+    QMenu {{
+        background:{CAR}; color:{PRI};
+        border:1px solid {MUT};
+        font-family:{FONT}; font-size:12px;
+        padding:4px 0;
+    }}
+    QMenu::item {{ padding:5px 20px; }}
+    QMenu::item:selected {{ background:{ACC}; }}
+    QMenu::separator {{ background:{MUT}; height:1px; margin:4px 8px; }}
+"""
+
+
+# ── Custom external-app box ───────────────────────────────────────────────────
+class CustomAppBox(QFrame):
+    """
+    User-added external application box in the Applications section.
+    Left-click launches the app; right-click opens management menu.
+    Supports drag-and-drop image (same as WebUIBox).
+    """
+
+    edit_requested   = Signal(object)  # self — cmd/name changed
+    name_changed     = Signal(object)  # self — rename only, save without rebuild
+    delete_requested = Signal(object)  # self
+    image_changed    = Signal(object)  # self — image dropped/edited/cleared
+
+    _W     = 220
+    _H     = 264
+    _BAR_H = 44
+    _IMG_H = _W - 4   # = 216, square
+
+    _STYLE = f"""
+        QFrame {{
+            background-color: {CAR};
+            border: 2px solid {MUT};
+            border-radius: 8px;
+        }}
+    """
+    _STYLE_HOVER = f"""
+        QFrame {{
+            background-color: #152236;
+            border: 2px solid {ACC};
+            border-radius: 8px;
+        }}
+    """
+
+    def __init__(self, app: dict, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self.setFixedSize(self._W, self._H)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(self._STYLE)
+
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        # ── Image area (square) ────────────────────────────────────────────
+        self._img_lbl = QLabel(self)
+        self._img_lbl.setFixedSize(self._W - 4, self._IMG_H)
+        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_lbl.setStyleSheet(
+            f"background:{BG}; border:none; border-radius:6px 6px 0 0;")
+        self._refresh_image()
+        vbox.addWidget(self._img_lbl)
+
+        # ── Bottom bar ─────────────────────────────────────────────────────
+        bar = QWidget(self)
+        bar.setFixedHeight(self._BAR_H)
+        bar.setStyleSheet(f"background:{PAN}; border:none; border-radius:0 0 6px 6px;")
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(8, 0, 8, 0)
+
+        self._name_lbl = QLabel(app["name"], bar)
+        self._name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._name_lbl.setStyleSheet(
+            f"color:{PRI}; font-family:{FONT}; font-size:13px;"
+            f" font-weight:bold; background:transparent; border:none;")
+        bar_layout.addWidget(self._name_lbl)
+        vbox.addWidget(bar)
+
+    # ── Image ──────────────────────────────────────────────────────────────
+    def _refresh_image(self):
+        img_path = self.app.get("image", "")
+        if img_path and os.path.isfile(img_path):
+            px = QPixmap(img_path)
+            if not px.isNull():
+                scaled = px.scaled(self._W - 4, self._IMG_H,
+                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+                x = max(0, (scaled.width()  - (self._W - 4)) // 2)
+                y = max(0, (scaled.height() - self._IMG_H)   // 2)
+                cropped = scaled.copy(x, y, self._W - 4, self._IMG_H)
+                self._img_lbl.setPixmap(cropped)
+                self._img_lbl.setStyleSheet(
+                    "border:none; border-radius:6px 6px 0 0;")
+                return
+        self._img_lbl.clear()
+        self._img_lbl.setText("Drop image here")
+        self._img_lbl.setStyleSheet(
+            f"color:{MUT}; font-size:11px; background:{BG};"
+            f" border:none; border-radius:6px 6px 0 0;")
+
+    # ── Drag-and-drop ──────────────────────────────────────────────────────
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for u in event.mimeData().urls():
+                if u.toLocalFile().lower().endswith(
+                        ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for u in event.mimeData().urls():
+            path = u.toLocalFile()
+            if path.lower().endswith(
+                    ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                self.app["image"] = path
+                self._refresh_image()
+                self.image_changed.emit(self)
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    # ── Mouse / hover ──────────────────────────────────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._launch()
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        self.setStyleSheet(self._STYLE_HOVER)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setStyleSheet(self._STYLE)
+        super().leaveEvent(event)
+
+    # ── Context menu ───────────────────────────────────────────────────────
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.setStyleSheet(_MENU_QSS)
+        act_launch   = menu.addAction("▶  Launch")
+        menu.addSeparator()
+        act_edit     = menu.addAction("✎  Edit")
+        act_rename   = menu.addAction("✏  Rename")
+        menu.addSeparator()
+        act_edit_img = menu.addAction("🖼  Edit Image")
+        act_del_img  = menu.addAction("🗑  Delete Image")
+        menu.addSeparator()
+        act_delete   = menu.addAction("✕  Delete Entry")
+
+        chosen = menu.exec(event.globalPos())
+        if chosen == act_launch:
+            self._launch()
+        elif chosen == act_edit:
+            self._open_edit_dialog()
+        elif chosen == act_rename:
+            self._rename()
+        elif chosen == act_edit_img:
+            self._browse_image()
+        elif chosen == act_del_img:
+            self._delete_image()
+        elif chosen == act_delete:
+            self.delete_requested.emit(self)
+
+    # ── Actions ────────────────────────────────────────────────────────────
+    def _launch(self):
+        cmd = self.app.get("cmd", "")
+        if not cmd:
+            QMessageBox.warning(
+                self, "No Command",
+                f"No launch command set for \"{self.app['name']}\".\n"
+                "Right-click → Edit to set one.")
+            return
+        import subprocess
+        exe = cmd.split()[0].strip('"')
+        cwd = os.path.dirname(exe) if os.path.isfile(exe) else None
+        subprocess.Popen(cmd, shell=True, cwd=cwd)
+
+    def _open_edit_dialog(self):
+        dlg = CustomAppEntryDialog(self.app, parent=self)
+        if dlg.exec():
+            self.app.update(dlg.get_data())
+            self._name_lbl.setText(self.app["name"])
+            self.edit_requested.emit(self)
+
+    def _rename(self):
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", "New name:", text=self.app["name"])
+        if ok and new_name.strip():
+            self.app["name"] = new_name.strip()
+            self._name_lbl.setText(new_name.strip())
+            self.name_changed.emit(self)
+
+    def _browse_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+        if path:
+            self.app["image"] = path
+            self._refresh_image()
+            self.image_changed.emit(self)
+
+    def _delete_image(self):
+        self.app.pop("image", None)
+        self._refresh_image()
+        self.image_changed.emit(self)
+
+
+# ── "+" add custom app box ────────────────────────────────────────────────────
+class AddCustomAppBox(QFrame):
+    """The '+' box for adding new custom application entries."""
+
+    add_requested = Signal()
+
+    _W, _H = 220, 264
+
+    _STYLE = f"""
+        QFrame {{
+            background-color: {CAR};
+            border: 2px dashed {MUT};
+            border-radius: 8px;
+        }}
+    """
+    _STYLE_HOVER = f"""
+        QFrame {{
+            background-color: #152236;
+            border: 2px dashed {ACC};
+            border-radius: 8px;
+        }}
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(self._STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        plus = QLabel("+", self)
+        plus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        plus.setStyleSheet(
+            f"color:{MUT}; font-size:64px; font-weight:bold;"
+            f" background:transparent; border:none;")
+        layout.addWidget(plus)
+
+        lbl = QLabel("Add Application", self)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(
+            f"color:{MUT}; font-family:{FONT}; font-size:12px;"
+            f" background:transparent; border:none;")
+        layout.addWidget(lbl)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.add_requested.emit()
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        self.setStyleSheet(self._STYLE_HOVER)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setStyleSheet(self._STYLE)
+        super().leaveEvent(event)
+
+
+# ── Custom app create / edit dialog ──────────────────────────────────────────
+class CustomAppEntryDialog(QDialog):
+    """Create/edit dialog for a custom external application."""
+
+    _FIELD_STYLE = f"""
+        QLineEdit {{
+            background:{BG}; color:{PRI};
+            border:1px solid {MUT}; border-radius:4px;
+            font-family:{FONT}; font-size:{FONT_MD}px;
+            padding:4px 8px; min-height:28px;
+        }}
+        QLineEdit:focus {{ border-color:{ACC}; }}
+    """
+
+    def __init__(self, app: dict | None = None, parent=None):
+        super().__init__(parent)
+        is_edit = app is not None
+        self.setWindowTitle("Edit Application" if is_edit else "Add Application")
+        self.setMinimumWidth(420)
+        self.setStyleSheet(
+            f"QDialog {{ background:{BG}; }}"
+            f" QLabel {{ color:{PRI}; font-family:{FONT}; }}")
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._name = QLineEdit()
+        self._name.setStyleSheet(self._FIELD_STYLE)
+        self._name.setPlaceholderText("e.g.  Photoshop")
+        if is_edit:
+            self._name.setText(app.get("name", ""))
+        form.addRow("Name:", self._name)
+        layout.addLayout(form)
+
+        # Command row — field + Browse button
+        cmd_lbl = QLabel("Command / Path:", self)
+        cmd_lbl.setStyleSheet(
+            f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;")
+        layout.addWidget(cmd_lbl)
+
+        cmd_row = QHBoxLayout()
+        cmd_row.setSpacing(4)
+
+        self._cmd = QLineEdit()
+        self._cmd.setStyleSheet(self._FIELD_STYLE)
+        self._cmd.setPlaceholderText("C:\\path\\to\\app.exe  or  script.bat")
+        if is_edit:
+            self._cmd.setText(app.get("cmd", ""))
+        cmd_row.addWidget(self._cmd, stretch=1)
+
+        browse_btn = QPushButton("Browse…", self)
+        browse_btn.setFixedHeight(36)
+        browse_btn.setMinimumWidth(72)
+        browse_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{MUT}; color:{PRI}; border:none;
+                border-radius:4px; font-family:{FONT};
+                font-size:{FONT_SM}px; padding:0 8px;
+            }}
+            QPushButton:hover {{ background:{ACC}; }}
+        """)
+        browse_btn.clicked.connect(self._browse)
+        cmd_row.addWidget(browse_btn)
+        layout.addLayout(cmd_row)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Save" if is_edit else "Add")
+        btns.accepted.connect(self._validate)
+        btns.rejected.connect(self.reject)
+        btns.setStyleSheet(f"""
+            QPushButton {{
+                background:{ACC}; color:{PRI}; border:none;
+                border-radius:4px; font-family:{FONT};
+                font-size:{FONT_MD}px; font-weight:bold;
+                min-width:70px; min-height:28px; padding:0 12px;
+            }}
+            QPushButton:hover {{ background:#185FA5; }}
+        """)
+        layout.addWidget(btns)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Executable", "",
+            "Executables (*.exe *.bat *.cmd *.sh *.py);;All files (*)")
+        if path:
+            self._cmd.setText(path)
+
+    def _validate(self):
+        if not self._name.text().strip():
+            QMessageBox.warning(self, "Required", "Name is required.")
+            return
+        self.accept()
+
+    def get_data(self) -> dict:
+        data: dict = {"name": self._name.text().strip()}
+        cmd = self._cmd.text().strip()
+        if cmd:
+            data["cmd"] = cmd
+        return data
+
+
 # ── Settings dialog ───────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
     """Application settings — currently houses the HuggingFace token."""
@@ -820,13 +1210,13 @@ class SettingsDialog(QDialog):
 class ManagePage(QWidget):
     """
     Two-section visual Manage page:
-      1. Applications  — 500×500 icon boxes for built-in apps
+      1. Applications  — built-in app boxes + user-added custom app boxes + "+" box
       2. WebUI/Loader  — card boxes with drag-and-drop image + right-click menu
     """
 
     open_app     = Signal(str)  # url  — open WebUI browser tab
     open_builtin = Signal(str)  # name — open built-in app
-    apps_changed = Signal(list) # new list — notify Launcher/poller
+    apps_changed = Signal(list) # webui list changed — notify Launcher/poller
 
     _BUILTIN_APPS = [
         ("Tags",       "tags.png"),
@@ -844,8 +1234,10 @@ class ManagePage(QWidget):
 
     def __init__(self, apps: list[dict], parent=None):
         super().__init__(parent)
-        self.apps         = apps
-        self._webui_boxes: list[WebUIBox] = []
+        self.apps               = apps
+        self._custom_apps       = _load_custom_apps()
+        self._webui_boxes:       list[WebUIBox]     = []
+        self._custom_app_boxes:  list[CustomAppBox] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -876,19 +1268,22 @@ class ManagePage(QWidget):
         app_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         app_scroll.setStyleSheet(f"QScrollArea {{ border:none; background:{PAN}; }}")
 
-        app_row_widget = QWidget()
-        app_row_widget.setStyleSheet(f"background:{PAN};")
-        app_row = QHBoxLayout(app_row_widget)
-        app_row.setContentsMargins(0, 4, 0, 4)
-        app_row.setSpacing(16)
+        self._app_row_widget = QWidget()
+        self._app_row_widget.setStyleSheet(f"background:{PAN};")
+        self._app_row = QHBoxLayout(self._app_row_widget)
+        self._app_row.setContentsMargins(0, 4, 0, 4)
+        self._app_row.setSpacing(16)
 
         for name, icon_file in self._BUILTIN_APPS:
-            box = AppIconBox(name, os.path.join(_ASSETS, icon_file), app_row_widget)
+            box = AppIconBox(name, os.path.join(_ASSETS, icon_file),
+                             self._app_row_widget)
             box.clicked_app.connect(self.open_builtin)
-            app_row.addWidget(box)
+            self._app_row.addWidget(box)
 
-        app_row.addStretch()
-        app_scroll.setWidget(app_row_widget)
+        # Custom app boxes + "+" are appended by _refresh_custom_apps()
+        self._refresh_custom_apps()
+
+        app_scroll.setWidget(self._app_row_widget)
         vbox.addWidget(app_scroll)
 
         # ── WebUI / Loader section ─────────────────────────────────────────
@@ -983,6 +1378,59 @@ class ManagePage(QWidget):
     def _on_image_changed(self, box: WebUIBox) -> None:
         # Image updated in-place — just save
         save_apps(self.apps)
+
+    # ── Custom app management ──────────────────────────────────────────────
+
+    def _refresh_custom_apps(self) -> None:
+        """Remove custom boxes + trailing stretch/add-box, rebuild from self._custom_apps."""
+        builtin_count = len(self._BUILTIN_APPS)
+        # Strip everything appended after the 5 built-in boxes
+        while self._app_row.count() > builtin_count:
+            item = self._app_row.takeAt(builtin_count)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._custom_app_boxes.clear()
+
+        for app in self._custom_apps:
+            box = CustomAppBox(app, self._app_row_widget)
+            box.edit_requested.connect(self._on_custom_edit)
+            box.name_changed.connect(self._on_custom_name_changed)
+            box.delete_requested.connect(self._on_custom_delete)
+            box.image_changed.connect(self._on_custom_image_changed)
+            self._app_row.addWidget(box)
+            self._custom_app_boxes.append(box)
+
+        add_box = AddCustomAppBox(self._app_row_widget)
+        add_box.add_requested.connect(self._create_custom_app)
+        self._app_row.addWidget(add_box)
+        self._app_row.addStretch()
+
+    def _create_custom_app(self) -> None:
+        dlg = CustomAppEntryDialog(parent=self)
+        if dlg.exec():
+            self._custom_apps.append(dlg.get_data())
+            _save_custom_apps(self._custom_apps)
+            self._refresh_custom_apps()
+
+    def _on_custom_edit(self, box: CustomAppBox) -> None:
+        # box.app already updated in-place by the dialog inside CustomAppBox
+        _save_custom_apps(self._custom_apps)
+        self._refresh_custom_apps()
+
+    def _on_custom_name_changed(self, box: CustomAppBox) -> None:
+        _save_custom_apps(self._custom_apps)
+
+    def _on_custom_delete(self, box: CustomAppBox) -> None:
+        try:
+            self._custom_apps.remove(box.app)
+        except ValueError:
+            pass
+        _save_custom_apps(self._custom_apps)
+        self._refresh_custom_apps()
+
+    def _on_custom_image_changed(self, box: CustomAppBox) -> None:
+        _save_custom_apps(self._custom_apps)
 
 
 # ── Poll worker (signals safe across threads) ─────────────────────────────────
@@ -1509,4 +1957,14 @@ class Launcher(QMainWindow):
             view: BrowserView = entry["view"]
             view.setPage(None)
             view.deleteLater()
+        # Release ML model memory and background workers
+        try:
+            from enhancer.enhancer_page     import release_enhancer_model
+            from randomizer.randomizer_page  import release_randomizer_model
+            from tags.tag_handler_page       import shutdown_image_loader
+            release_enhancer_model()
+            release_randomizer_model()
+            shutdown_image_loader()
+        except Exception:
+            pass
         event.accept()

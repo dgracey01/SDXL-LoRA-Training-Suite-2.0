@@ -533,16 +533,13 @@ def calc_cv(lt: str, imgs: int, factor: float, rc: str,
 
 def count_dataset_files(folder: str) -> int:
     try:
-        count = sum(
+        return sum(
             1
             for root, _, files in os.walk(folder)
             for f in files
             if os.path.splitext(f)[1].lower() in IMAGE_EXTS
         )
-        print(f"[calc] count_dataset_files({folder!r}) → {count}")
-        return count
-    except Exception as e:
-        print(f"[calc] count_dataset_files ERROR: {e}")
+    except Exception:
         return 0
 
 

@@ -68,6 +68,28 @@ DEFAULTS = {
     "card_size":       2000,
 }
 
+# ── Model keep-alive cache ─────────────────────────────────────────────────────
+# Keyed by (model_dir_str, device_str).  Avoids reloading the 885 MB model
+# on every Remove BG click within the same session.
+_infer_cache: dict = {}
+
+
+def release_randomizer_model() -> None:
+    """Move cached models back to CPU and clear the cache on app close."""
+    global _infer_cache
+    for (_, device_str), model in list(_infer_cache.items()):
+        try:
+            model.cpu()
+        except Exception:
+            pass
+    _infer_cache.clear()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _make_checkerboard(size: int, tile: int = 20) -> Image.Image:
@@ -169,67 +191,71 @@ class InferenceWorker(QObject):
             torch.set_float32_matmul_precision("high")
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-            # Detect ToonOut-style: has a .pth weights file instead of
-            # standard transformers model.safetensors / pytorch_model.bin.
-            pth_files = list(Path(self._model_dir).glob("*.pth"))
-            if pth_files:
-                # ── Anime (ToonOut) ────────────────────────────────────────
-                self.status.emit("Loading Anime model architecture…")
-                from transformers import AutoModelForImageSegmentation
-                model = AutoModelForImageSegmentation.from_pretrained(
-                    "ZhengPeng7/BiRefNet", trust_remote_code=True)
-                self.status.emit("Loading Anime weights…")
-                state = torch.load(str(pth_files[0]),
-                                   map_location="cpu", weights_only=True)
-                # Strip DDP / torch.compile wrapper prefixes (module._orig_mod., etc.)
-                for prefix in ("module._orig_mod.", "module.", "_orig_mod."):
-                    if any(k.startswith(prefix) for k in state):
-                        state = {k[len(prefix):]: v for k, v in state.items()}
-                        break
-                model.load_state_dict(state)
-            else:
-                # ── Realism (RMBG-2.0) ────────────────────────────────────
-                # Bypass from_pretrained to avoid meta-tensor issues caused
-                # by trunc_normal_ being called on uninitialised meta params
-                # inside BiRefNet's __init__ (Swin-L backbone).
-                # birefnet.py uses a relative import (from .BiRefNet_config …)
-                # so both files must be loaded as a virtual package.
-                import importlib.util, types
-                self.status.emit("Loading Realism model…")
-                _pkg = "_birefnet_pkg"
-                _pkg_mod = types.ModuleType(_pkg)
-                _pkg_mod.__path__ = [self._model_dir]
-                _pkg_mod.__package__ = _pkg
-                sys.modules[_pkg] = _pkg_mod
-                try:
-                    def _load(name, filename):
-                        spec = importlib.util.spec_from_file_location(
-                            f"{_pkg}.{name}",
-                            os.path.join(self._model_dir, filename))
-                        mod = importlib.util.module_from_spec(spec)
-                        mod.__package__ = _pkg
-                        sys.modules[f"{_pkg}.{name}"] = mod
-                        spec.loader.exec_module(mod)
-                        return mod
+            # ── Model cache lookup ─────────────────────────────────────────
+            cache_key = (self._model_dir, device)
+            model = _infer_cache.get(cache_key)
 
-                    _load("BiRefNet_config", "BiRefNet_config.py")
-                    _bm = _load("birefnet", "birefnet.py")
-
-                    model = _bm.BiRefNet(bb_pretrained=False)
-                    from safetensors.torch import load_file as _load_sf
-                    sf = os.path.join(self._model_dir, "model.safetensors")
-                    self.status.emit("Loading Realism weights…")
-                    state = _load_sf(sf)
+            if model is None:
+                # Detect ToonOut-style: has a .pth weights file instead of
+                # standard transformers model.safetensors / pytorch_model.bin.
+                pth_files = list(Path(self._model_dir).glob("*.pth"))
+                if pth_files:
+                    # ── Anime (ToonOut) ────────────────────────────────────
+                    self.status.emit("Loading Anime model architecture…")
+                    from transformers import AutoModelForImageSegmentation
+                    model = AutoModelForImageSegmentation.from_pretrained(
+                        "ZhengPeng7/BiRefNet", trust_remote_code=True)
+                    self.status.emit("Loading Anime weights…")
+                    state = torch.load(str(pth_files[0]),
+                                       map_location="cpu", weights_only=True)
+                    # Strip DDP / torch.compile wrapper prefixes
+                    for prefix in ("module._orig_mod.", "module.", "_orig_mod."):
+                        if any(k.startswith(prefix) for k in state):
+                            state = {k[len(prefix):]: v for k, v in state.items()}
+                            break
                     model.load_state_dict(state)
-                finally:
-                    for k in list(sys.modules):
-                        if k.startswith(_pkg):
-                            del sys.modules[k]
+                else:
+                    # ── Realism (RMBG-2.0) ────────────────────────────────
+                    # Bypass from_pretrained to avoid meta-tensor issues caused
+                    # by trunc_normal_ being called on uninitialised meta params
+                    # inside BiRefNet's __init__ (Swin-L backbone).
+                    import importlib.util, types
+                    self.status.emit("Loading Realism model…")
+                    _pkg = "_birefnet_pkg"
+                    _pkg_mod = types.ModuleType(_pkg)
+                    _pkg_mod.__path__ = [self._model_dir]
+                    _pkg_mod.__package__ = _pkg
+                    sys.modules[_pkg] = _pkg_mod
+                    try:
+                        def _load(name, filename):
+                            spec = importlib.util.spec_from_file_location(
+                                f"{_pkg}.{name}",
+                                os.path.join(self._model_dir, filename))
+                            mod = importlib.util.module_from_spec(spec)
+                            mod.__package__ = _pkg
+                            sys.modules[f"{_pkg}.{name}"] = mod
+                            spec.loader.exec_module(mod)
+                            return mod
 
-            self.status.emit("Preparing model…")
-            model.float()   # ensure float32 — .pth weights may be saved as float16
-            model.eval()
-            model.to(device)
+                        _load("BiRefNet_config", "BiRefNet_config.py")
+                        _bm = _load("birefnet", "birefnet.py")
+
+                        model = _bm.BiRefNet(bb_pretrained=False)
+                        from safetensors.torch import load_file as _load_sf
+                        sf = os.path.join(self._model_dir, "model.safetensors")
+                        self.status.emit("Loading Realism weights…")
+                        state = _load_sf(sf)
+                        model.load_state_dict(state)
+                    finally:
+                        for k in list(sys.modules):
+                            if k.startswith(_pkg):
+                                del sys.modules[k]
+
+                self.status.emit("Preparing model…")
+                model.float()   # ensure float32 — .pth weights may be float16
+                model.eval()
+                model.to(device)
+                _infer_cache[cache_key] = model
 
             self.status.emit("Running inference…")
             src  = self._pil.convert("RGB")

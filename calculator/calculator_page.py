@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import re
 
-from PySide6.QtCore    import Qt, QTimer
+from PySide6.QtCore    import Qt, QTimer, QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
@@ -133,6 +133,18 @@ def _card_style(alt: bool = False) -> str:
     return f"QFrame {{ background:{bg}; border-radius:6px; }}"
 
 
+# ── Background file-count worker ──────────────────────────────────────────────
+class _CountWorker(QObject):
+    finished = Signal(int)   # emits the file count when done
+
+    def __init__(self, folder: str):
+        super().__init__()
+        self._folder = folder
+
+    def run(self):
+        self.finished.emit(count_dataset_files(self._folder))
+
+
 # ── CalculatorPage ─────────────────────────────────────────────────────────────
 class CalculatorPage(QWidget):
     def __init__(self, parent=None):
@@ -145,6 +157,8 @@ class CalculatorPage(QWidget):
 
         self._dataset_path  = ""
         self._at_data: dict = {}
+        self._count_thread: QThread | None = None
+        self._count_worker: _CountWorker | None = None
 
         init_log()
 
@@ -1465,14 +1479,30 @@ class CalculatorPage(QWidget):
     def _browse_dataset(self):
         last = self._cfg.get("last_dataset_dir", "") or ""
         folder = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", last or "/")
-        if folder:
-            self._dataset_path = folder
-            self._cfg["last_dataset_dir"] = os.path.dirname(folder)
-            count = count_dataset_files(folder)
-            self._files_edit.setText(str(count))
-            # Auto-populate LoRA name
-            self._lora_name_edit.setText(os.path.basename(folder))
-            self._calc()
+        if not folder:
+            return
+        self._dataset_path = folder
+        self._cfg["last_dataset_dir"] = os.path.dirname(folder)
+        self._lora_name_edit.setText(os.path.basename(folder))
+        # Show a placeholder immediately; counting runs in the background
+        self._files_edit.setText("…")
+        self._files_edit.setEnabled(False)
+        # Cancel any still-running count from a previous browse
+        if self._count_thread and self._count_thread.isRunning():
+            self._count_thread.quit()
+            self._count_thread.wait(300)
+        self._count_thread = QThread()
+        self._count_worker = _CountWorker(folder)
+        self._count_worker.moveToThread(self._count_thread)
+        self._count_thread.started.connect(self._count_worker.run)
+        self._count_worker.finished.connect(self._on_count_done)
+        self._count_worker.finished.connect(self._count_thread.quit)
+        self._count_thread.start()
+
+    def _on_count_done(self, count: int):
+        self._files_edit.setText(str(count))
+        self._files_edit.setEnabled(True)
+        self._calc()
 
     def _browse_aitoolkit(self):
         last = self._cfg.get("aitoolkit_path", "") or ""

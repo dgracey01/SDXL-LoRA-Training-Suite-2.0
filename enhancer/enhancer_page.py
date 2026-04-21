@@ -59,6 +59,24 @@ ESR_MODELS = {
 MODEL_OPTS   = ["Realistic", "Anime"]
 SCALE_OPTS   = ["1x", "2x", "4x", "Custom"]
 
+# ── Model keep-alive cache ─────────────────────────────────────────────────────
+# Keyed by model name ("Realistic" / "Anime").  Lives for the process lifetime
+# so RealESRGAN weights are only loaded once per session.
+_esr_cache: dict = {}
+
+
+def release_enhancer_model() -> None:
+    """Release cached RealESRGAN models and free GPU memory on app close."""
+    global _esr_cache
+    _esr_cache.clear()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 DEFAULTS = {
     "model":       "Realistic",
     "scale":       "4x",
@@ -204,26 +222,31 @@ class EnhanceWorker(QObject):
             do_upscale = (self._outscale != 1.0 or
                           (self._target_w > 0 and self._target_h > 0))
             if do_upscale:
-                self.status.emit("Loading RealESRGAN model…")
+                anime     = self._model == "Anime"
+                cache_key = "Anime" if anime else "Realistic"
+                upsampler = _esr_cache.get(cache_key)
+
                 _stdout, _stderr = sys.stdout, sys.stderr
                 if sys.stdout is None: sys.stdout = io.StringIO()
                 if sys.stderr is None: sys.stderr = io.StringIO()
                 try:
-                    from basicsr.archs.rrdbnet_arch import RRDBNet
-                    from realesrgan import RealESRGANer
+                    if upsampler is None:
+                        self.status.emit("Loading RealESRGAN model…")
+                        from basicsr.archs.rrdbnet_arch import RRDBNet
+                        from realesrgan import RealESRGANer
 
-                    anime    = self._model == "Anime"
-                    fname    = ("RealESRGAN_x4plus_anime_6B.pth" if anime
-                                else "RealESRGAN_x4plus.pth")
-                    n_blocks = 6 if anime else 23
-                    mdl_path = str(MODELS_DIR / fname)
+                        fname    = ("RealESRGAN_x4plus_anime_6B.pth" if anime
+                                    else "RealESRGAN_x4plus.pth")
+                        n_blocks = 6 if anime else 23
+                        mdl_path = str(MODELS_DIR / fname)
 
-                    rrdb = RRDBNet(num_in_ch=3, num_out_ch=3,
-                                   num_feat=64, num_block=n_blocks,
-                                   num_grow_ch=32, scale=4)
-                    upsampler = RealESRGANer(
-                        scale=4, model_path=mdl_path, model=rrdb,
-                        tile=0, tile_pad=10, pre_pad=0, half=False)
+                        rrdb = RRDBNet(num_in_ch=3, num_out_ch=3,
+                                       num_feat=64, num_block=n_blocks,
+                                       num_grow_ch=32, scale=4)
+                        upsampler = RealESRGANer(
+                            scale=4, model_path=mdl_path, model=rrdb,
+                            tile=0, tile_pad=10, pre_pad=0, half=False)
+                        _esr_cache[cache_key] = upsampler
 
                     if self._target_w > 0 and self._target_h > 0:
                         # Custom dimensions: upscale enough then resize to exact target

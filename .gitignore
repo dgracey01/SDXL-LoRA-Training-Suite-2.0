@@ -29,6 +29,8 @@ gfpgan/weights/*.partial
 
 # ── Secrets — never commit ─────────────────────────────────────────────────────
 launcher/hf_config.json
+launcher/custom_apps.json
+launcher/apps.json
 
 # ── Dataset & working folders ──────────────────────────────────────────────────
 dataset/

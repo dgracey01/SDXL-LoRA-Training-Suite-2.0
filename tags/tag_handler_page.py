@@ -8,6 +8,7 @@ Translated as close to the original as possible.
 
 import os, sys, json, math, threading, shutil, zipfile, csv, re, subprocess
 import importlib, random, datetime
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -420,6 +421,29 @@ def _flush_tag_cache():
     _tag_dirty.clear()
     return count
 
+# ── Background image loader ────────────────────────────────────────────────────
+# Shared thread pool used by PrepareCard to load full-resolution images off the
+# main thread.  4 workers is enough to stay ahead of the scroll speed without
+# saturating the disk.
+_IMAGE_LOAD_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _get_image_executor() -> ThreadPoolExecutor:
+    global _IMAGE_LOAD_EXECUTOR
+    if _IMAGE_LOAD_EXECUTOR is None:
+        _IMAGE_LOAD_EXECUTOR = ThreadPoolExecutor(max_workers=4,
+                                                  thread_name_prefix="img_load")
+    return _IMAGE_LOAD_EXECUTOR
+
+
+def shutdown_image_loader() -> None:
+    """Call on app close to cleanly stop pending image-load tasks."""
+    global _IMAGE_LOAD_EXECUTOR
+    if _IMAGE_LOAD_EXECUTOR is not None:
+        _IMAGE_LOAD_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        _IMAGE_LOAD_EXECUTOR = None
+
+
 # ── Thumbnail cache ────────────────────────────────────────────────────────────
 _TEMP_DIR = os.path.join(os.path.dirname(_HERE), "temp")
 
@@ -597,6 +621,7 @@ class SegmentedButton(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 class PrepareCard(QFrame):
     D = DEFAULT_CARD
+    _image_ready = Signal(object)   # PIL.Image — emitted from bg thread
 
     def __init__(self, parent, img_path, status="normal",
                  saved_offset=None, saved_zoom=1.0, tw=None, th=None,
@@ -620,15 +645,8 @@ class PrepareCard(QFrame):
         self._dox = self._doy = 0.5
         self._pixmap   = None
 
-        try:
-            raw = Image.open(img_path)
-            if raw.mode=="RGBA":
-                bg = Image.new("RGB",raw.size,(22,33,62))
-                bg.paste(raw,mask=raw.split()[3]); self._pil = bg
-            else:
-                self._pil = raw.convert("RGB")
-        except:
-            self._pil = Image.new("RGB",(self.D,self.D),(22,33,62))
+        # Placeholder until the background load completes
+        self._pil = Image.new("RGB", (self.D, self.D), (22, 33, 62))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4,4,4,4)
@@ -718,7 +736,34 @@ class PrepareCard(QFrame):
 
         root.addWidget(self._img_frame)
         self._update_slider_states()
-        self._render()
+        self._render()   # renders placeholder immediately
+
+        # Load the real image on a background thread; update card when ready
+        self._image_ready.connect(self._on_image_loaded)
+        _get_image_executor().submit(self._bg_load_image)
+
+    def _bg_load_image(self):
+        """Background thread: load full image and emit _image_ready."""
+        try:
+            raw = Image.open(self.img_path)
+            if raw.mode == "RGBA":
+                bg = Image.new("RGB", raw.size, (22, 33, 62))
+                bg.paste(raw, mask=raw.split()[3])
+                pil = bg
+            else:
+                pil = raw.convert("RGB")
+        except Exception:
+            pil = Image.new("RGB", (self.D, self.D), (22, 33, 62))
+        self._image_ready.emit(pil)
+
+    def _on_image_loaded(self, pil: Image.Image):
+        """Main thread: replace placeholder with the real image and re-render."""
+        try:
+            self._pil = pil
+            self._update_slider_states()
+            self._render()
+        except RuntimeError:
+            pass   # card was deleted before the load finished
 
     def _slider_ss(self):
         return (f"QSlider::groove:horizontal{{background:#0d0d0d;height:4px;border-radius:2px;}}"
