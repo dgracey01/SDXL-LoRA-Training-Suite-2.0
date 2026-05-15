@@ -2,15 +2,20 @@
 health/health_page.py — LoRA Health Analyzer for Lora Training Suite 2.0
 Designed by: Zero  |  Built by: Jarvis (v2.01)
 
-Loads a .safetensors LoRA file and runs 8 structural checks:
-  1. File Integrity   — hash metadata present
-  2. NaN / Inf        — tensor value sanity
-  3. Rank Consistency — shape agreement and metadata match
-  4. Alpha/Rank Ratio — declared alpha relative to rank
-  5. Rank Range       — rank within community-validated bounds
-  6. Dead Layers      — layers with near-zero weights
-  7. Overbaked        — layers with abnormally high magnitude (overtrained)
-  8. Layer Balance    — hottest vs coldest layer ratio
+Loads a .safetensors LoRA file and runs 8 checks grouped by architectural module:
+
+  File-level:
+    1. File Integrity   — hash metadata present
+    2. NaN / Inf        — tensor value sanity
+    3. Rank Consistency — shape agreement and metadata match
+    4. Alpha/Rank Ratio — declared alpha relative to rank
+    5. Rank Range       — rank within community-validated bounds
+    6. Overbaked        — global mean lora_up magnitude (overtrained signal)
+
+  Per architectural module (UNet Cross-Attn, Self-Attn, Feedforward, Text Encoder):
+    7. Dead Layers      — layers with near-zero weights within each module group
+    8. Layer Balance    — hottest/coldest ratio within each module group
+                         (comparing like-for-like — architecturally identical layers)
 """
 from __future__ import annotations
 
@@ -33,68 +38,132 @@ from shared.theme import (
 from shared.config import HEALTH_CFG, load_json, save_json
 
 
-# ── Community-sourced threshold presets ───────────────────────────────────────
-# Values derived from: kohya-ss training guides, CivitAI wiki,
-# LyCORIS/DyLoRA community benchmarks, and Ostris AI Toolkit documentation.
-THRESHOLD_PRESETS: dict[str, dict[str, dict[str, float]]] = {
-    "sd15": {
-        "Strict": {
-            "rank_min":   8,    "rank_max":  32,
-            "mag_dead":  1e-4,
-            "mag_warn":   4.0,  "mag_fail":  8.0,
-            "bal_warn":  100.0, "bal_fail":  500.0,
-            "ratio_min":  0.25, "ratio_max": 1.0,
-        },
-        "Standard": {
-            "rank_min":   4,    "rank_max":  64,
-            "mag_dead":  1e-5,
-            "mag_warn":   6.0,  "mag_fail": 12.0,
-            "bal_warn":  200.0, "bal_fail": 1000.0,
-            "ratio_min":  0.10, "ratio_max": 1.0,
-        },
-        "Relaxed": {
-            "rank_min":   2,    "rank_max": 128,
-            "mag_dead":  1e-6,
-            "mag_warn":  10.0,  "mag_fail": 20.0,
-            "bal_warn":  500.0, "bal_fail": 5000.0,
-            "ratio_min":  0.05, "ratio_max": 2.0,
-        },
-    },
-    "sdxl": {
-        "Strict": {
-            "rank_min":  16,    "rank_max": 128,
-            "mag_dead":  1e-4,
-            "mag_warn":   3.5,  "mag_fail":  7.0,
-            "bal_warn":  100.0, "bal_fail":  500.0,
-            "ratio_min":  0.25, "ratio_max": 1.0,
-        },
-        "Standard": {
-            "rank_min":   8,    "rank_max": 256,
-            "mag_dead":  1e-5,
-            "mag_warn":   5.0,  "mag_fail": 10.0,
-            "bal_warn":  200.0, "bal_fail": 1000.0,
-            "ratio_min":  0.10, "ratio_max": 1.0,
-        },
-        "Relaxed": {
-            "rank_min":   4,    "rank_max": 512,
-            "mag_dead":  1e-6,
-            "mag_warn":   8.0,  "mag_fail": 16.0,
-            "bal_warn":  500.0, "bal_fail": 5000.0,
-            "ratio_min":  0.05, "ratio_max": 2.0,
-        },
-    },
+# ── Architectural module groups ────────────────────────────────────────────────
+# Keys parsed from lora tensor names to classify each layer into its module role.
+# Comparing layers within the same group is meaningful — they perform the same
+# function at different network depths, so their magnitudes should be comparable.
+MODULE_GROUPS = ["unet_cross_attn", "unet_self_attn", "unet_ff", "te"]
+
+MODULE_LABELS: dict[str, str] = {
+    "unet_cross_attn": "UNet Cross-Attention",
+    "unet_self_attn":  "UNet Self-Attention",
+    "unet_ff":         "UNet Feedforward",
+    "te":              "Text Encoder",
+    "unet_other":      "UNet Other",
 }
 
-THRESHOLD_LABELS: dict[str, str] = {
+_STATUS_ORDER = {"pass": 0, "info": 1, "warn": 2, "fail": 3}
+
+
+def _max_status(a: str, b: str) -> str:
+    return a if _STATUS_ORDER.get(a, 0) >= _STATUS_ORDER.get(b, 0) else b
+
+
+def _classify_key(key: str) -> str:
+    """Map a lora tensor key to an architectural module group."""
+    k = key.lower()
+    if "lora_unet_" in k:
+        if "attn2" in k:
+            return "unet_cross_attn"
+        if "attn1" in k:
+            return "unet_self_attn"
+        if "ff_net" in k or "geglu" in k:
+            return "unet_ff"
+        return "unet_other"       # proj_in, proj_out, resnet layers
+    return "te"                   # lora_te_, lora_te1_, lora_te2_
+
+
+# ── Threshold presets ─────────────────────────────────────────────────────────
+# Global thresholds: rank range, magnitude (overbaked), alpha/rank ratio.
+# Per-module balance thresholds: hottest/coldest ratio within each module group.
+# These are tighter than any global balance check because layers in the same
+# group perform the same function — wide imbalance within a group is abnormal.
+#
+# Values derived from: kohya-ss guides, CivitAI wiki, LyCORIS benchmarks,
+# Ostris AI Toolkit documentation, and community LoRA evaluation threads.
+
+GLOBAL_THRESHOLD_LABELS: dict[str, str] = {
     "rank_min":  "Min Rank",
     "rank_max":  "Max Rank",
     "mag_dead":  "Dead Layer Threshold",
     "mag_warn":  "Overcooked Warning",
     "mag_fail":  "Overcooked Fail",
-    "bal_warn":  "Balance Ratio Warning",
-    "bal_fail":  "Balance Ratio Fail",
     "ratio_min": "Alpha/Rank Min",
     "ratio_max": "Alpha/Rank Max",
+}
+
+MODULE_BAL_LABELS: dict[str, str] = {
+    "unet_cross_attn_bal_warn": "Cross-Attention  Warn",
+    "unet_cross_attn_bal_fail": "Cross-Attention  Fail",
+    "unet_self_attn_bal_warn":  "Self-Attention   Warn",
+    "unet_self_attn_bal_fail":  "Self-Attention   Fail",
+    "unet_ff_bal_warn":         "Feedforward      Warn",
+    "unet_ff_bal_fail":         "Feedforward      Fail",
+    "te_bal_warn":              "Text Encoder     Warn",
+    "te_bal_fail":              "Text Encoder     Fail",
+}
+
+THRESHOLD_LABELS: dict[str, str] = {**GLOBAL_THRESHOLD_LABELS, **MODULE_BAL_LABELS}
+
+THRESHOLD_PRESETS: dict[str, dict[str, dict[str, float]]] = {
+    "sd15": {
+        "Strict": {
+            "rank_min":  8,    "rank_max":  32,
+            "mag_dead":  1e-4, "mag_warn":  4.0,  "mag_fail":  8.0,
+            "ratio_min": 0.25, "ratio_max": 1.0,
+            "unet_cross_attn_bal_warn": 15.0,  "unet_cross_attn_bal_fail":  50.0,
+            "unet_self_attn_bal_warn":  15.0,  "unet_self_attn_bal_fail":   50.0,
+            "unet_ff_bal_warn":         15.0,  "unet_ff_bal_fail":          50.0,
+            "te_bal_warn":              10.0,  "te_bal_fail":               35.0,
+        },
+        "Standard": {
+            "rank_min":  4,    "rank_max":  64,
+            "mag_dead":  1e-5, "mag_warn":  6.0,  "mag_fail": 12.0,
+            "ratio_min": 0.10, "ratio_max": 1.0,
+            "unet_cross_attn_bal_warn": 30.0,  "unet_cross_attn_bal_fail": 100.0,
+            "unet_self_attn_bal_warn":  30.0,  "unet_self_attn_bal_fail":  100.0,
+            "unet_ff_bal_warn":         30.0,  "unet_ff_bal_fail":         100.0,
+            "te_bal_warn":              20.0,  "te_bal_fail":               70.0,
+        },
+        "Relaxed": {
+            "rank_min":  2,    "rank_max": 128,
+            "mag_dead":  1e-6, "mag_warn": 10.0,  "mag_fail": 20.0,
+            "ratio_min": 0.05, "ratio_max": 2.0,
+            "unet_cross_attn_bal_warn": 60.0,  "unet_cross_attn_bal_fail": 200.0,
+            "unet_self_attn_bal_warn":  60.0,  "unet_self_attn_bal_fail":  200.0,
+            "unet_ff_bal_warn":         60.0,  "unet_ff_bal_fail":         200.0,
+            "te_bal_warn":              40.0,  "te_bal_fail":              140.0,
+        },
+    },
+    "sdxl": {
+        "Strict": {
+            "rank_min": 16,    "rank_max": 128,
+            "mag_dead":  1e-4, "mag_warn":  3.5,  "mag_fail":  7.0,
+            "ratio_min": 0.25, "ratio_max": 1.0,
+            "unet_cross_attn_bal_warn": 15.0,  "unet_cross_attn_bal_fail":  50.0,
+            "unet_self_attn_bal_warn":  15.0,  "unet_self_attn_bal_fail":   50.0,
+            "unet_ff_bal_warn":         15.0,  "unet_ff_bal_fail":          50.0,
+            "te_bal_warn":              10.0,  "te_bal_fail":               35.0,
+        },
+        "Standard": {
+            "rank_min":  8,    "rank_max": 256,
+            "mag_dead":  1e-5, "mag_warn":  5.0,  "mag_fail": 10.0,
+            "ratio_min": 0.10, "ratio_max": 1.0,
+            "unet_cross_attn_bal_warn": 30.0,  "unet_cross_attn_bal_fail": 100.0,
+            "unet_self_attn_bal_warn":  30.0,  "unet_self_attn_bal_fail":  100.0,
+            "unet_ff_bal_warn":         30.0,  "unet_ff_bal_fail":         100.0,
+            "te_bal_warn":              20.0,  "te_bal_fail":               70.0,
+        },
+        "Relaxed": {
+            "rank_min":  4,    "rank_max": 512,
+            "mag_dead":  1e-6, "mag_warn":  8.0,  "mag_fail": 16.0,
+            "ratio_min": 0.05, "ratio_max": 2.0,
+            "unet_cross_attn_bal_warn": 60.0,  "unet_cross_attn_bal_fail": 200.0,
+            "unet_self_attn_bal_warn":  60.0,  "unet_self_attn_bal_fail":  200.0,
+            "unet_ff_bal_warn":         60.0,  "unet_ff_bal_fail":         200.0,
+            "te_bal_warn":              40.0,  "te_bal_fail":              140.0,
+        },
+    },
 }
 
 DEFAULTS: dict = {
@@ -137,6 +206,14 @@ def _combo_style() -> str:
     )
 
 
+def _subsection_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"color:{ACC}; font-family:{FONT}; font-size:{FONT_SM}px; font-weight:bold;"
+        f" letter-spacing:1px; background:transparent;")
+    return lbl
+
+
 # ── Analysis worker ────────────────────────────────────────────────────────────
 class _AnalysisWorker(QObject):
     finished = Signal(dict)
@@ -144,8 +221,8 @@ class _AnalysisWorker(QObject):
 
     def __init__(self, path: str, get_threshold_fn, model_type_override: str | None = None):
         super().__init__()
-        self._path       = path
-        self._get_fn     = get_threshold_fn
+        self._path          = path
+        self._get_fn        = get_threshold_fn
         self._type_override = model_type_override
 
     def run(self):
@@ -166,7 +243,7 @@ def _detect_model_type(keys: list[str]) -> str:
 
 
 def _analyse(path: str, get_threshold, model_type_override: str | None = None) -> dict:
-    """Load safetensors and run all 8 checks. Returns result dict."""
+    """Load safetensors and run all checks. Returns result dict."""
     try:
         from safetensors import safe_open
         import torch
@@ -272,14 +349,11 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
         ratio     = declared_alpha / actual_rank
         ratio_str = f"alpha={declared_alpha:.4g} / rank={actual_rank} = {ratio:.4f}"
         if ratio < ratio_min:
-            status = "warn"
-            detail = f"{ratio_str} (below min {ratio_min})"
+            status, detail = "warn", f"{ratio_str} (below min {ratio_min})"
         elif ratio > ratio_max:
-            status = "warn"
-            detail = f"{ratio_str} (above max {ratio_max})"
+            status, detail = "warn", f"{ratio_str} (above max {ratio_max})"
         else:
-            status = "pass"
-            detail = ratio_str
+            status, detail = "pass", ratio_str
         checks.append({"id": "alpha_ratio", "label": "Alpha/Rank Ratio",
                         "status": status, "detail": detail})
     else:
@@ -292,121 +366,132 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
 
     if actual_rank is not None:
         if actual_rank < rank_min_t:
-            checks.append({"id": "rank_range", "label": "Rank Range",
-                            "status": "warn",
+            checks.append({"id": "rank_range", "label": "Rank Range", "status": "warn",
                             "detail": f"rank={actual_rank} below minimum {rank_min_t} for {model_type.upper()}"})
         elif actual_rank > rank_max_t:
-            checks.append({"id": "rank_range", "label": "Rank Range",
-                            "status": "warn",
+            checks.append({"id": "rank_range", "label": "Rank Range", "status": "warn",
                             "detail": f"rank={actual_rank} above recommended {rank_max_t} for {model_type.upper()}"})
         else:
-            checks.append({"id": "rank_range", "label": "Rank Range",
-                            "status": "pass",
+            checks.append({"id": "rank_range", "label": "Rank Range", "status": "pass",
                             "detail": f"rank={actual_rank} within [{rank_min_t}, {rank_max_t}] for {model_type.upper()}"})
     else:
         checks.append({"id": "rank_range", "label": "Rank Range",
                         "status": "info", "detail": "Could not determine rank."})
 
-    # ── Per-layer magnitudes ──────────────────────────────────────────────────
+    # ── Group lora_up layers by architectural module ───────────────────────────
     mag_dead = get_threshold(model_type, "mag_dead")
     mag_warn = get_threshold(model_type, "mag_warn")
     mag_fail = get_threshold(model_type, "mag_fail")
 
-    up_mags:     list[float] = []
-    dead_layers: list[str]   = []
-
+    grouped: dict[str, list[tuple[str, float]]] = {}
     for uk in up_keys:
         mag = float(tensors[uk].abs().mean().item())
-        up_mags.append(mag)
-        if mag < mag_dead:
-            dead_layers.append(uk)
+        mod = _classify_key(uk)
+        grouped.setdefault(mod, []).append((uk, mag))
 
-    # ── 6. Dead Layers ────────────────────────────────────────────────────────
-    if dead_layers:
-        sample = f": {os.path.basename(dead_layers[0])}" if dead_layers else ""
-        checks.append({"id": "dead_layers", "label": "Dead Layers",
-                        "status": "warn",
-                        "detail": f"{len(dead_layers)} layer(s) with mean_abs < {mag_dead:.2g}{sample}"})
-    elif up_mags:
-        checks.append({"id": "dead_layers", "label": "Dead Layers",
-                        "status": "pass",
-                        "detail": f"No dead layers (threshold: {mag_dead:.2g})"})
-    else:
-        checks.append({"id": "dead_layers", "label": "Dead Layers",
-                        "status": "info", "detail": "No lora_up tensors found."})
-
-    # ── 7. Overbaked ──────────────────────────────────────────────────────────
-    if up_mags:
-        mean_mag = sum(up_mags) / len(up_mags)
+    # ── 6. Overbaked (global mean across all lora_up) ─────────────────────────
+    all_mags = [m for layers in grouped.values() for _, m in layers]
+    if all_mags:
+        mean_mag = sum(all_mags) / len(all_mags)
         if mean_mag > mag_fail:
             checks.append({"id": "overbaked", "label": "Overbaked",
                             "status": "fail",
-                            "detail": f"mean magnitude={mean_mag:.4f} — exceeds fail threshold {mag_fail}"})
+                            "detail": f"global mean magnitude={mean_mag:.4f} — exceeds fail threshold {mag_fail}"})
         elif mean_mag > mag_warn:
             checks.append({"id": "overbaked", "label": "Overbaked",
                             "status": "warn",
-                            "detail": f"mean magnitude={mean_mag:.4f} — exceeds warning threshold {mag_warn}"})
+                            "detail": f"global mean magnitude={mean_mag:.4f} — exceeds warning threshold {mag_warn}"})
         else:
             checks.append({"id": "overbaked", "label": "Overbaked",
                             "status": "pass",
-                            "detail": f"mean magnitude={mean_mag:.4f} within normal range (warn>{mag_warn})"})
+                            "detail": f"global mean magnitude={mean_mag:.4f} within normal range (warn>{mag_warn})"})
     else:
         checks.append({"id": "overbaked", "label": "Overbaked",
                         "status": "info", "detail": "No lora_up tensors found."})
 
-    # ── 8. Layer Balance ──────────────────────────────────────────────────────
-    bal_warn = get_threshold(model_type, "bal_warn")
-    bal_fail = get_threshold(model_type, "bal_fail")
+    # ── 7-8. Per-module dead layers and balance ────────────────────────────────
+    # Balance thresholds are per-module — layers of the same architectural role
+    # should have similar magnitudes regardless of UNet depth.
+    module_results: dict[str, dict] = {}
+    display_order = MODULE_GROUPS + ["unet_other"]
 
-    active_mags = [m for m in up_mags if m >= mag_dead]
-    if len(active_mags) >= 2:
-        hottest = max(active_mags)
-        coldest = min(active_mags)
-        ratio   = hottest / coldest if coldest > 0 else float("inf")
-        detail  = f"hottest/coldest = {hottest:.4f}/{coldest:.4f} = {ratio:.2f}x"
-        if ratio > bal_fail:
-            checks.append({"id": "layer_balance", "label": "Layer Balance",
-                            "status": "fail", "detail": detail + f" (fail>{bal_fail}x)"})
-        elif ratio > bal_warn:
-            checks.append({"id": "layer_balance", "label": "Layer Balance",
-                            "status": "warn", "detail": detail + f" (warn>{bal_warn}x)"})
-        else:
-            checks.append({"id": "layer_balance", "label": "Layer Balance",
-                            "status": "pass", "detail": detail})
-    else:
-        checks.append({"id": "layer_balance", "label": "Layer Balance",
-                        "status": "info",
-                        "detail": "Insufficient active layers for balance check."})
+    for mod in display_order:
+        if mod not in grouped:
+            continue
+        layer_mags  = grouped[mod]
+        mags        = [m for _, m in layer_mags]
+        active_mags = [m for m in mags if m >= mag_dead]
+        dead_count  = len(mags) - len(active_mags)
+        mean_mag    = sum(mags) / len(mags) if mags else 0.0
+
+        issues = []
+        status = "pass"
+
+        if dead_count > 0:
+            status = _max_status(status, "warn")
+            issues.append(f"{dead_count} dead layer(s)")
+
+        balance_ratio: float | None = None
+        if len(active_mags) >= 2:
+            hottest = max(active_mags)
+            coldest = min(active_mags)
+            balance_ratio = hottest / coldest if coldest > 0 else float("inf")
+
+            # Use per-module balance key; fall back to unet_self_attn for unet_other
+            base = mod if mod in MODULE_GROUPS else "unet_self_attn"
+            bal_w = get_threshold(model_type, f"{base}_bal_warn")
+            bal_f = get_threshold(model_type, f"{base}_bal_fail")
+
+            if balance_ratio > bal_f:
+                status = _max_status(status, "fail")
+                issues.append(f"balance {balance_ratio:.1f}x (fail>{bal_f:.0f}x)")
+            elif balance_ratio > bal_w:
+                status = _max_status(status, "warn")
+                issues.append(f"balance {balance_ratio:.1f}x (warn>{bal_w:.0f}x)")
+
+        module_results[mod] = {
+            "label":       MODULE_LABELS.get(mod, mod),
+            "count":       len(mags),
+            "mean_abs":    mean_mag,
+            "balance":     balance_ratio,
+            "dead_count":  dead_count,
+            "status":      status,
+            "issues":      issues,
+        }
 
     # ── Overall ───────────────────────────────────────────────────────────────
-    statuses = [c["status"] for c in checks]
-    if "fail" in statuses:
+    all_statuses = [c["status"] for c in checks] + \
+                   [g["status"] for g in module_results.values()]
+    if "fail" in all_statuses:
         overall = "fail"
-    elif "warn" in statuses:
+    elif "warn" in all_statuses:
         overall = "warn"
     else:
         overall = "pass"
 
-    # ── Metadata summary ──────────────────────────────────────────────────────
-    file_size_mb = os.path.getsize(path) / (1024 * 1024)
+    # ── File metadata summary ─────────────────────────────────────────────────
     ratio_display = "?"
     if declared_alpha is not None and actual_rank:
         ratio_display = f"{declared_alpha / actual_rank:.4f}"
 
     meta_summary = {
         "filename":              os.path.basename(path),
-        "size_mb":               f"{file_size_mb:.1f} MB",
+        "size_mb":               f"{os.path.getsize(path) / (1024 * 1024):.1f} MB",
         "model_type":            model_type.upper(),
         "rank":                  str(actual_rank) if actual_rank else "?",
         "alpha":                 f"{declared_alpha:.4g}" if declared_alpha is not None else "?",
         "ratio":                 ratio_display,
         "layers":                str(len(up_keys)),
-        "dead":                  str(len(dead_layers)),
         "ss_base_model_version": metadata.get("ss_base_model_version", ""),
     }
 
-    return {"overall": overall, "checks": checks, "meta": meta_summary,
-            "model_type": model_type}
+    return {
+        "overall":       overall,
+        "checks":        checks,
+        "module_groups": module_results,
+        "meta":          meta_summary,
+        "model_type":    model_type,
+    }
 
 
 # ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -465,7 +550,7 @@ class HealthPage(QWidget):
         self.setStyleSheet(f"background:{PAN};")
 
         self._cfg           = load_json(HEALTH_CFG, DEFAULTS)
-        self._current_file: str | None           = None
+        self._current_file: str | None             = None
         self._worker:       _AnalysisWorker | None = None
         self._thread:       threading.Thread | None = None
 
@@ -494,7 +579,7 @@ class HealthPage(QWidget):
         hdr_row.addWidget(sig)
         root.addWidget(hdr)
 
-        # ── Tab widget ─────────────────────────────────────────────────────
+        # ── Tabs ───────────────────────────────────────────────────────────
         self._tabs = QTabWidget(self)
         self._tabs.setStyleSheet(
             f"QTabWidget::pane {{ border:none; background:{PAN}; }}"
@@ -557,7 +642,6 @@ class HealthPage(QWidget):
         drop_zone.file_dropped.connect(self._on_file_selected)
         fl.addWidget(drop_zone)
 
-        # Model type + run row
         type_row = QHBoxLayout()
         type_row.setSpacing(10)
         type_row.addWidget(_lbl("Model Type:"))
@@ -605,7 +689,7 @@ class HealthPage(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(16)
 
-        # ── Explanation card ───────────────────────────────────────────────
+        # Explanation
         exp_card = QFrame()
         exp_card.setStyleSheet(_card_style())
         el = QVBoxLayout(exp_card)
@@ -613,11 +697,15 @@ class HealthPage(QWidget):
         el.setSpacing(6)
         el.addWidget(_lbl("About These Thresholds", PRI, FONT_MD, bold=True))
         exp_text = QLabel(
-            "Community-sourced defaults based on kohya-ss training guides, CivitAI wiki, "
+            "Community-sourced defaults based on kohya-ss guides, CivitAI wiki, "
             "LyCORIS benchmarks, and Ostris AI Toolkit documentation.\n\n"
-            "Select a preset (Strict / Standard / Relaxed) per model type, or enter a value "
-            "in the Manual Override column to pin a specific threshold. An override always "
-            "takes priority over the preset — clear the field to return to preset behavior."
+            "Global thresholds (rank, magnitude, alpha/rank) apply across the whole file. "
+            "Per-module balance thresholds apply within each architectural group — "
+            "comparing only layers that perform the same function, making the check "
+            "structurally meaningful with appropriately tight bounds.\n\n"
+            "Select a Strict / Standard / Relaxed preset per model type, or enter a value "
+            "in the Manual Override column. An override always takes priority over the "
+            "preset — clear the field to return to preset behavior."
         )
         exp_text.setWordWrap(True)
         exp_text.setStyleSheet(
@@ -625,7 +713,7 @@ class HealthPage(QWidget):
         el.addWidget(exp_text)
         layout.addWidget(exp_card)
 
-        # ── Warning banner ─────────────────────────────────────────────────
+        # Warning banner
         warn_card = QFrame()
         warn_card.setStyleSheet(
             f"QFrame {{ background:{CAR}; border-radius:8px; border:2px solid {AMB}; }}")
@@ -639,12 +727,10 @@ class HealthPage(QWidget):
         wl.addWidget(warn_lbl)
         layout.addWidget(warn_card)
 
-        # ── SD 1.5 section ─────────────────────────────────────────────────
         sd15_card, self._sd15_preset_combo, self._sd15_override_edits = \
             self._build_threshold_section("SD 1.5", "sd15")
         layout.addWidget(sd15_card)
 
-        # ── SDXL section ───────────────────────────────────────────────────
         sdxl_card, self._sdxl_preset_combo, self._sdxl_override_edits = \
             self._build_threshold_section("SDXL", "sdxl")
         layout.addWidget(sdxl_card)
@@ -661,7 +747,7 @@ class HealthPage(QWidget):
         cl.setContentsMargins(16, 14, 16, 16)
         cl.setSpacing(8)
 
-        # Header row — title + preset selector
+        # Header + preset selector
         hdr_row = QHBoxLayout()
         hdr_row.addWidget(_lbl(f"{title} Thresholds", PRI, FONT_LG, bold=True))
         hdr_row.addStretch(1)
@@ -676,50 +762,124 @@ class HealthPage(QWidget):
         hdr_row.addWidget(preset_combo)
         cl.addLayout(hdr_row)
 
-        # Column headers
-        col_hdr = QFrame()
-        col_hdr.setStyleSheet("background:transparent;")
-        ch_row = QHBoxLayout(col_hdr)
-        ch_row.setContentsMargins(8, 0, 8, 0)
-        ch_row.addWidget(_lbl("Threshold", SEC, FONT_SM, bold=True), stretch=2)
-        ch_row.addWidget(_lbl("Preset Default", SEC, FONT_SM, bold=True), stretch=1)
-        ch_row.addWidget(_lbl("Manual Override", AMB, FONT_SM, bold=True), stretch=1)
-        cl.addWidget(col_hdr)
-
-        # Threshold rows
         edits: dict[str, QLineEdit] = {}
-        overrides    = self._cfg.get(f"{key}_overrides", {})
-        preset_name  = self._cfg.get(f"{key}_preset", "Standard")
-        preset_vals  = THRESHOLD_PRESETS[key]
+        overrides   = self._cfg.get(f"{key}_overrides", {})
+        preset_name = self._cfg.get(f"{key}_preset", "Standard")
+        preset_vals = THRESHOLD_PRESETS[key]
 
-        for i, (tk, tlabel) in enumerate(THRESHOLD_LABELS.items()):
-            row = QFrame()
-            row.setStyleSheet(
-                f"QFrame {{ background:{BG if i % 2 == 0 else CAR}; border-radius:4px; }}")
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(8, 6, 8, 6)
-            rl.setSpacing(8)
+        # ── Global thresholds subsection ──────────────────────────────────
+        cl.addWidget(_subsection_label("GLOBAL"))
+        cl.addWidget(self._col_header_row())
 
-            rl.addWidget(_lbl(tlabel, PRI, FONT_SM), stretch=2)
+        for i, (tk, tlabel) in enumerate(GLOBAL_THRESHOLD_LABELS.items()):
+            cl.addWidget(self._threshold_row(
+                i, tk, tlabel, key, overrides, preset_name, preset_vals, edits))
 
-            default_val = preset_vals.get(preset_name, preset_vals["Standard"])[tk]
-            default_lbl = QLabel(f"{default_val:.6g}")
-            default_lbl.setStyleSheet(
-                f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px; background:transparent;")
-            rl.addWidget(default_lbl, stretch=1)
+        # ── Per-module balance subsection ─────────────────────────────────
+        cl.addSpacing(6)
+        cl.addWidget(_subsection_label("LAYER BALANCE  (hottest / coldest within module group)"))
+        cl.addWidget(self._col_header_row())
 
-            ov_edit = QLineEdit(str(overrides.get(tk, "")))
-            ov_edit.setPlaceholderText("override…")
-            ov_edit.setStyleSheet(_amber_edit_style())
-            ov_edit.setFixedWidth(110)
-            ov_edit.textChanged.connect(
-                lambda text, k=key, t=tk: self._override_changed(k, t, text))
-            edits[tk] = ov_edit
-            rl.addWidget(ov_edit, stretch=1)
-
-            cl.addWidget(row)
+        # Pair rows: warn + fail side-by-side per module group
+        mod_pairs = [
+            ("unet_cross_attn", "Cross-Attention"),
+            ("unet_self_attn",  "Self-Attention"),
+            ("unet_ff",         "Feedforward"),
+            ("te",              "Text Encoder"),
+        ]
+        row_idx = len(GLOBAL_THRESHOLD_LABELS)
+        for mod_key, mod_label in mod_pairs:
+            warn_tk = f"{mod_key}_bal_warn"
+            fail_tk = f"{mod_key}_bal_fail"
+            cl.addWidget(self._bal_pair_row(
+                row_idx, mod_label, warn_tk, fail_tk,
+                key, overrides, preset_name, preset_vals, edits))
+            row_idx += 1
 
         return card, preset_combo, edits
+
+    def _col_header_row(self) -> QWidget:
+        w = QWidget()
+        w.setStyleSheet("background:transparent;")
+        r = QHBoxLayout(w)
+        r.setContentsMargins(8, 0, 8, 0)
+        r.addWidget(_lbl("Threshold", SEC, FONT_SM, bold=True), stretch=2)
+        r.addWidget(_lbl("Preset Default", SEC, FONT_SM, bold=True), stretch=1)
+        r.addWidget(_lbl("Manual Override", AMB, FONT_SM, bold=True), stretch=1)
+        return w
+
+    def _threshold_row(self, idx: int, tk: str, tlabel: str, model_key: str,
+                        overrides: dict, preset_name: str, preset_vals: dict,
+                        edits: dict) -> QFrame:
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background:{BG if idx % 2 == 0 else CAR}; border-radius:4px; }}")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8, 6, 8, 6)
+        rl.setSpacing(8)
+
+        rl.addWidget(_lbl(tlabel, PRI, FONT_SM), stretch=2)
+
+        default_val = preset_vals.get(preset_name, preset_vals["Standard"])[tk]
+        rl.addWidget(QLabel(f"{default_val:.6g}"), stretch=1)
+
+        ov_edit = QLineEdit(str(overrides.get(tk, "")))
+        ov_edit.setPlaceholderText("override…")
+        ov_edit.setStyleSheet(_amber_edit_style())
+        ov_edit.setFixedWidth(110)
+        ov_edit.textChanged.connect(
+            lambda text, k=model_key, t=tk: self._override_changed(k, t, text))
+        edits[tk] = ov_edit
+        rl.addWidget(ov_edit, stretch=1)
+        return row
+
+    def _bal_pair_row(self, idx: int, mod_label: str,
+                       warn_tk: str, fail_tk: str, model_key: str,
+                       overrides: dict, preset_name: str, preset_vals: dict,
+                       edits: dict) -> QFrame:
+        """Warn + Fail side-by-side in a single row for one module group."""
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background:{BG if idx % 2 == 0 else CAR}; border-radius:4px; }}")
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8, 6, 8, 6)
+        rl.setSpacing(8)
+
+        rl.addWidget(_lbl(mod_label, PRI, FONT_SM, bold=True), stretch=2)
+
+        pv = preset_vals.get(preset_name, preset_vals["Standard"])
+
+        # Warn
+        warn_default = QLabel(f"warn: {pv[warn_tk]:.6g}")
+        warn_default.setStyleSheet(
+            f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px; background:transparent;")
+        rl.addWidget(warn_default, stretch=0)
+
+        warn_edit = QLineEdit(str(overrides.get(warn_tk, "")))
+        warn_edit.setPlaceholderText("warn…")
+        warn_edit.setStyleSheet(_amber_edit_style())
+        warn_edit.setFixedWidth(80)
+        warn_edit.textChanged.connect(
+            lambda text, k=model_key, t=warn_tk: self._override_changed(k, t, text))
+        edits[warn_tk] = warn_edit
+        rl.addWidget(warn_edit)
+
+        # Fail
+        fail_default = QLabel(f"fail: {pv[fail_tk]:.6g}")
+        fail_default.setStyleSheet(
+            f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px; background:transparent;")
+        rl.addWidget(fail_default, stretch=0)
+
+        fail_edit = QLineEdit(str(overrides.get(fail_tk, "")))
+        fail_edit.setPlaceholderText("fail…")
+        fail_edit.setStyleSheet(_amber_edit_style())
+        fail_edit.setFixedWidth(80)
+        fail_edit.textChanged.connect(
+            lambda text, k=model_key, t=fail_tk: self._override_changed(k, t, text))
+        edits[fail_tk] = fail_edit
+        rl.addWidget(fail_edit)
+
+        return row
 
     # ══════════════════════════════════════════════════════════════════════════
     # Help tab
@@ -739,55 +899,54 @@ class HealthPage(QWidget):
 
         sections = [
             ("What Does LoRA Health Check?",
-             "LoRA Health loads a .safetensors LoRA file and runs 8 structural checks without "
-             "running inference. All checks are computed directly from tensor shapes, values, "
-             "and embedded metadata."),
+             "LoRA Health loads a .safetensors LoRA file and runs 8 checks without inference. "
+             "Checks 1–6 are file-wide. Checks 7–8 (dead layers and layer balance) run "
+             "per architectural module, so balance comparisons are structurally meaningful."),
             ("1.  File Integrity",
-             "Verifies that kohya/sd-scripts hash metadata (sshs_model_hash, sshs_legacy_hash) "
-             "is present. Missing hashes may indicate the file was not saved by a standard "
-             "trainer, but is otherwise harmless."),
+             "Verifies kohya/sd-scripts hash metadata (sshs_model_hash, sshs_legacy_hash) is "
+             "present. Missing hashes are harmless but indicate the file was not produced by "
+             "a standard kohya trainer."),
             ("2.  NaN / Inf",
              "Scans every tensor for Not-a-Number and Infinity values. These are catastrophic — "
-             "a LoRA with NaN or Inf values will produce corrupted or blank images."),
+             "a LoRA with NaN or Inf will produce corrupted or blank images."),
             ("3.  Rank Consistency",
-             "Compares lora_down and lora_up tensor shapes to verify they agree on rank. "
-             "Also checks against ss_network_dim in metadata if present."),
+             "Compares lora_down / lora_up tensor shapes to confirm rank agreement. Also checks "
+             "the declared ss_network_dim metadata if present."),
             ("4.  Alpha/Rank Ratio",
-             "Computes declared_alpha / actual_rank. A ratio below 0.10 produces very weak "
-             "effect; above 1.0 can cause color shifts and overexposure. Standard practice "
-             "sets alpha = rank (ratio = 1.0) or alpha = rank/2 (ratio = 0.5)."),
+             "Computes declared_alpha / actual_rank. Below 0.10 produces very weak effect; "
+             "above 1.0 can cause colour shifts. Standard practice sets alpha = rank (ratio 1.0) "
+             "or alpha = rank/2 (ratio 0.5)."),
             ("5.  Rank Range",
-             "Checks whether the rank falls within community-validated bounds for the detected "
-             "model type. Very low rank (<4) limits expressiveness; very high rank (>128 for "
-             "SD1.5, >256 for SDXL) increases file size without meaningful quality gain."),
-            ("6.  Dead Layers",
-             "Identifies lora_up layers whose mean absolute value is below the dead threshold. "
-             "Dead layers contribute nothing to the output and indicate undertrained modules "
-             "or a training collapse."),
-            ("7.  Overbaked",
-             "Detects LoRAs trained to excess ('overcooked'). Mean lora_up magnitude above the "
-             "warning threshold suggests aggressive training that may produce burned-in style "
-             "with low prompt adherence. Above the fail threshold, the LoRA will likely "
-             "saturate or destroy image quality."),
-            ("8.  Layer Balance",
-             "Computes max(lora_up mean_abs) / min(lora_up mean_abs) across all active layers. "
-             "Important: a LoRA spans many different architectural modules (attention Q/K/V, "
-             "cross-attention, MLP, text encoder, UNet at different depths) that naturally "
-             "operate at very different weight scales. A ratio of 50x–500x is completely normal "
-             "for a healthy LoRA — this is structural variation, not a problem. The check only "
-             "warns above 200x and fails above 1000x (Standard preset), which indicates a "
-             "catastrophic training collapse where one module is essentially dead while another "
-             "is wildly overfit."),
+             "Validates rank against community bounds for the detected model type. Very low rank "
+             "limits expressiveness; very high rank adds file size without quality gain."),
+            ("6.  Overbaked",
+             "Computes the global mean of all lora_up tensor mean-absolute values. Elevated "
+             "values suggest aggressive or excessive training that may burn in style and reduce "
+             "prompt responsiveness."),
+            ("7.  Dead Layers  (per module)",
+             "Within each architectural group, identifies lora_up layers whose mean absolute "
+             "value is below the dead threshold. A dead layer contributes nothing to the output "
+             "and indicates a collapsed or untrained module."),
+            ("8.  Layer Balance  (per module)",
+             "Computes max(mean_abs) / min(mean_abs) within each architectural group:\n\n"
+             "  • UNet Cross-Attention  — attn2 layers (text conditioning)\n"
+             "  • UNet Self-Attention   — attn1 layers (spatial relationships)\n"
+             "  • UNet Feedforward      — ff_net layers (channel mixing)\n"
+             "  • Text Encoder          — TE / TE1 / TE2 layers\n\n"
+             "Layers in the same group perform the same function at different UNet depths, so "
+             "wide magnitude imbalance within a group is genuinely abnormal — unlike a "
+             "global comparison across architecturally incompatible modules.\n\n"
+             "Standard warn/fail thresholds: 30x / 100x (much tighter than any global metric)."),
             ("Threshold Presets",
-             "Strict:    tight bounds — flags anything outside high-quality training range.\n"
-             "Standard:  community-recommended defaults — practical for most LoRAs.\n"
-             "Relaxed:   permissive — useful for experimental or artistic LoRAs.\n\n"
-             "Set individual overrides in the Thresholds tab. Clear any override to return "
-             "to the selected preset."),
+             "Strict:    tight bounds, flags anything outside high-quality training range.\n"
+             "Standard:  community-recommended defaults, practical for most LoRAs.\n"
+             "Relaxed:   permissive, useful for experimental or artistic LoRAs.\n\n"
+             "Individual thresholds can be overridden in the Thresholds tab. "
+             "Clear any override to return to the selected preset."),
             ("Model Type Detection",
              "Auto-detect checks for lora_te2_ keys (SDXL dual text encoder) and total "
-             "lora_up layer count (>300 = SDXL). Use the Model Type dropdown to override "
-             "if auto-detection is incorrect."),
+             "lora_up layer count (>300 = SDXL). Use the Model Type dropdown if "
+             "auto-detection is incorrect."),
         ]
 
         for title, body in sections:
@@ -842,10 +1001,8 @@ class HealthPage(QWidget):
         elif type_sel == "SDXL":
             forced_type = "sdxl"
 
-        if forced_type:
-            get_fn = lambda mt, k: self.get_threshold(forced_type, k)
-        else:
-            get_fn = self.get_threshold
+        get_fn = (lambda mt, k: self.get_threshold(forced_type, k)) \
+                 if forced_type else self.get_threshold
 
         self._worker = _AnalysisWorker(self._current_file, get_fn, forced_type)
         self._worker.finished.connect(self._on_analysis_done)
@@ -872,18 +1029,21 @@ class HealthPage(QWidget):
                 item.widget().deleteLater()
 
     def _show_results(self, result: dict):
-        overall    = result["overall"]
-        checks     = result["checks"]
-        meta       = result["meta"]
-        model_type = result["model_type"]
+        overall       = result["overall"]
+        checks        = result["checks"]
+        meta          = result["meta"]
+        module_groups = result.get("module_groups", {})
+        model_type    = result["model_type"]
+
+        STATUS_COLORS = {"pass": GRN, "warn": AMB, "fail": RED, "info": ACC}
+        STATUS_ICONS  = {"pass": "✓", "warn": "⚠", "fail": "✗", "info": "ℹ"}
 
         # ── Overall badge ──────────────────────────────────────────────────
-        badge_colors = {"pass": GRN,  "warn": AMB,   "fail": RED}
+        badge_colors = {"pass": GRN, "warn": AMB, "fail": RED}
         badge_texts  = {"pass": "✓  PASS", "warn": "⚠  WARN", "fail": "✗  FAIL"}
 
         badge_row = QHBoxLayout()
         badge_row.setSpacing(16)
-
         badge = QLabel(badge_texts.get(overall, overall.upper()))
         badge.setStyleSheet(
             f"color:{PRI}; background:{badge_colors.get(overall, MUT)};"
@@ -892,13 +1052,12 @@ class HealthPage(QWidget):
         badge_row.addWidget(badge)
         badge_row.addWidget(_lbl(f"Detected: {model_type.upper()}", SEC, FONT_MD))
         badge_row.addStretch(1)
-
         badge_w = QWidget()
         badge_w.setStyleSheet("background:transparent;")
         badge_w.setLayout(badge_row)
         self._results_layout.addWidget(badge_w)
 
-        # ── Metadata card ──────────────────────────────────────────────────
+        # ── File metadata card ─────────────────────────────────────────────
         meta_card = QFrame()
         meta_card.setStyleSheet(_card_style())
         ml = QVBoxLayout(meta_card)
@@ -914,7 +1073,6 @@ class HealthPage(QWidget):
             ("Alpha",     meta["alpha"]),
             ("α/r Ratio", meta["ratio"]),
             ("Layers",    meta["layers"]),
-            ("Dead",      meta["dead"]),
         ]
         if meta.get("ss_base_model_version"):
             fields.append(("Base", meta["ss_base_model_version"]))
@@ -925,20 +1083,17 @@ class HealthPage(QWidget):
             col = (i % 2) * 2
             row = i // 2
             grid.addWidget(_lbl(f"{lk}:", SEC, FONT_SM), row, col)
-            grid.addWidget(_lbl(lv, PRI, FONT_SM),       row, col + 1)
+            grid.addWidget(_lbl(lv, PRI, FONT_SM), row, col + 1)
         ml.addLayout(grid)
         self._results_layout.addWidget(meta_card)
 
-        # ── Check rows ─────────────────────────────────────────────────────
-        checks_card = QFrame()
-        checks_card.setStyleSheet(_card_style())
-        cl = QVBoxLayout(checks_card)
-        cl.setContentsMargins(16, 12, 16, 12)
-        cl.setSpacing(4)
-        cl.addWidget(_lbl("Diagnostic Results", PRI, FONT_MD, bold=True))
-
-        status_colors = {"pass": GRN, "warn": AMB, "fail": RED, "info": ACC}
-        status_icons  = {"pass": "✓", "warn": "⚠", "fail": "✗", "info": "ℹ"}
+        # ── Structural checks card (file-level) ────────────────────────────
+        struct_card = QFrame()
+        struct_card.setStyleSheet(_card_style())
+        sl = QVBoxLayout(struct_card)
+        sl.setContentsMargins(16, 12, 16, 12)
+        sl.setSpacing(4)
+        sl.addWidget(_lbl("Structural Checks", PRI, FONT_MD, bold=True))
 
         for i, check in enumerate(checks):
             row = QFrame()
@@ -948,8 +1103,8 @@ class HealthPage(QWidget):
             rl.setContentsMargins(8, 7, 8, 7)
             rl.setSpacing(10)
 
-            sc = status_colors.get(check["status"], SEC)
-            si = status_icons.get(check["status"], "?")
+            sc = STATUS_COLORS.get(check["status"], SEC)
+            si = STATUS_ICONS.get(check["status"], "?")
 
             icon_lbl = QLabel(si)
             icon_lbl.setFixedWidth(18)
@@ -967,17 +1122,85 @@ class HealthPage(QWidget):
             detail_lbl.setStyleSheet(
                 f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px; background:transparent;")
             rl.addWidget(detail_lbl, stretch=1)
+            sl.addWidget(row)
 
-            cl.addWidget(row)
+        self._results_layout.addWidget(struct_card)
 
-        self._results_layout.addWidget(checks_card)
+        # ── Module analysis card ───────────────────────────────────────────
+        if module_groups:
+            mod_card = QFrame()
+            mod_card.setStyleSheet(_card_style())
+            mcl = QVBoxLayout(mod_card)
+            mcl.setContentsMargins(16, 12, 16, 12)
+            mcl.setSpacing(4)
+            mcl.addWidget(_lbl("Module Analysis", PRI, FONT_MD, bold=True))
+
+            # Column header
+            col_hdr = QWidget()
+            col_hdr.setStyleSheet("background:transparent;")
+            chr_ = QHBoxLayout(col_hdr)
+            chr_.setContentsMargins(26, 0, 8, 0)
+            chr_.addWidget(_lbl("Module", SEC, FONT_SM, bold=True), stretch=3)
+            chr_.addWidget(_lbl("Layers", SEC, FONT_SM, bold=True), stretch=0)
+            chr_.addWidget(_lbl("Mean abs", SEC, FONT_SM, bold=True), stretch=1)
+            chr_.addWidget(_lbl("Balance", SEC, FONT_SM, bold=True), stretch=1)
+            chr_.addWidget(_lbl("Notes", SEC, FONT_SM, bold=True), stretch=3)
+            mcl.addWidget(col_hdr)
+
+            display_order = MODULE_GROUPS + ["unet_other"]
+            for i, mod in enumerate(display_order):
+                if mod not in module_groups:
+                    continue
+                grp = module_groups[mod]
+
+                row = QFrame()
+                row.setStyleSheet(
+                    f"QFrame {{ background:{BG if i % 2 == 0 else CAR}; border-radius:4px; }}")
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(8, 7, 8, 7)
+                rl.setSpacing(10)
+
+                sc = STATUS_COLORS.get(grp["status"], SEC)
+                si = STATUS_ICONS.get(grp["status"], "?")
+                icon_lbl = QLabel(si)
+                icon_lbl.setFixedWidth(18)
+                icon_lbl.setStyleSheet(
+                    f"color:{sc}; font-family:{FONT}; font-size:{FONT_MD}px;"
+                    f" font-weight:bold; background:transparent;")
+                rl.addWidget(icon_lbl)
+
+                rl.addWidget(_lbl(grp["label"], PRI, FONT_SM, bold=True), stretch=3)
+
+                count_lbl = _lbl(str(grp["count"]), SEC, FONT_SM)
+                count_lbl.setFixedWidth(40)
+                rl.addWidget(count_lbl)
+
+                rl.addWidget(_lbl(f"{grp['mean_abs']:.5f}", SEC, FONT_SM), stretch=1)
+
+                if grp["balance"] is not None:
+                    bal_str = f"{grp['balance']:.1f}x"
+                    bal_color = RED if grp["status"] == "fail" else (
+                        AMB if grp["status"] == "warn" else SEC)
+                else:
+                    bal_str, bal_color = "—", MUT
+                rl.addWidget(_lbl(bal_str, bal_color, FONT_SM), stretch=1)
+
+                notes = ", ".join(grp["issues"]) if grp["issues"] else "—"
+                notes_lbl = QLabel(notes)
+                notes_lbl.setWordWrap(True)
+                notes_lbl.setStyleSheet(
+                    f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                    f" background:transparent;")
+                rl.addWidget(notes_lbl, stretch=3)
+                mcl.addWidget(row)
+
+            self._results_layout.addWidget(mod_card)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Threshold helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def get_threshold(self, model_type: str, key: str) -> float:
-        """Return effective threshold: override if set and valid, else preset value."""
         ov = str(self._cfg.get(f"{model_type}_overrides", {}).get(key, "")).strip()
         if ov:
             try:
