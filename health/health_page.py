@@ -39,48 +39,48 @@ from shared.config import HEALTH_CFG, load_json, save_json
 THRESHOLD_PRESETS: dict[str, dict[str, dict[str, float]]] = {
     "sd15": {
         "Strict": {
-            "rank_min":  8,    "rank_max":  32,
+            "rank_min":   8,    "rank_max":  32,
             "mag_dead":  1e-4,
-            "mag_warn":  4.0,  "mag_fail":  8.0,
-            "bal_warn":  3.0,  "bal_fail": 10.0,
-            "ratio_min": 0.25, "ratio_max": 1.0,
+            "mag_warn":   4.0,  "mag_fail":  8.0,
+            "bal_warn":  100.0, "bal_fail":  500.0,
+            "ratio_min":  0.25, "ratio_max": 1.0,
         },
         "Standard": {
-            "rank_min":  4,    "rank_max":  64,
+            "rank_min":   4,    "rank_max":  64,
             "mag_dead":  1e-5,
-            "mag_warn":  6.0,  "mag_fail": 12.0,
-            "bal_warn":  5.0,  "bal_fail": 20.0,
-            "ratio_min": 0.10, "ratio_max": 1.0,
+            "mag_warn":   6.0,  "mag_fail": 12.0,
+            "bal_warn":  200.0, "bal_fail": 1000.0,
+            "ratio_min":  0.10, "ratio_max": 1.0,
         },
         "Relaxed": {
-            "rank_min":  2,    "rank_max": 128,
+            "rank_min":   2,    "rank_max": 128,
             "mag_dead":  1e-6,
-            "mag_warn": 10.0,  "mag_fail": 20.0,
-            "bal_warn": 10.0,  "bal_fail": 50.0,
-            "ratio_min": 0.05, "ratio_max": 2.0,
+            "mag_warn":  10.0,  "mag_fail": 20.0,
+            "bal_warn":  500.0, "bal_fail": 5000.0,
+            "ratio_min":  0.05, "ratio_max": 2.0,
         },
     },
     "sdxl": {
         "Strict": {
-            "rank_min": 16,    "rank_max": 128,
+            "rank_min":  16,    "rank_max": 128,
             "mag_dead":  1e-4,
-            "mag_warn":  3.5,  "mag_fail":  7.0,
-            "bal_warn":  3.0,  "bal_fail": 10.0,
-            "ratio_min": 0.25, "ratio_max": 1.0,
+            "mag_warn":   3.5,  "mag_fail":  7.0,
+            "bal_warn":  100.0, "bal_fail":  500.0,
+            "ratio_min":  0.25, "ratio_max": 1.0,
         },
         "Standard": {
-            "rank_min":  8,    "rank_max": 256,
+            "rank_min":   8,    "rank_max": 256,
             "mag_dead":  1e-5,
-            "mag_warn":  5.0,  "mag_fail": 10.0,
-            "bal_warn":  5.0,  "bal_fail": 20.0,
-            "ratio_min": 0.10, "ratio_max": 1.0,
+            "mag_warn":   5.0,  "mag_fail": 10.0,
+            "bal_warn":  200.0, "bal_fail": 1000.0,
+            "ratio_min":  0.10, "ratio_max": 1.0,
         },
         "Relaxed": {
-            "rank_min":  4,    "rank_max": 512,
+            "rank_min":   4,    "rank_max": 512,
             "mag_dead":  1e-6,
-            "mag_warn":  8.0,  "mag_fail": 16.0,
-            "bal_warn": 10.0,  "bal_fail": 50.0,
-            "ratio_min": 0.05, "ratio_max": 2.0,
+            "mag_warn":   8.0,  "mag_fail": 16.0,
+            "bal_warn":  500.0, "bal_fail": 5000.0,
+            "ratio_min":  0.05, "ratio_max": 2.0,
         },
     },
 }
@@ -770,9 +770,14 @@ class HealthPage(QWidget):
              "with low prompt adherence. Above the fail threshold, the LoRA will likely "
              "saturate or destroy image quality."),
             ("8.  Layer Balance",
-             "Computes the ratio of the hottest (highest magnitude) to coldest active layer. "
-             "A very high ratio means training energy was unevenly distributed — some modules "
-             "are overfit while others learned very little."),
+             "Computes max(lora_up mean_abs) / min(lora_up mean_abs) across all active layers. "
+             "Important: a LoRA spans many different architectural modules (attention Q/K/V, "
+             "cross-attention, MLP, text encoder, UNet at different depths) that naturally "
+             "operate at very different weight scales. A ratio of 50x–500x is completely normal "
+             "for a healthy LoRA — this is structural variation, not a problem. The check only "
+             "warns above 200x and fails above 1000x (Standard preset), which indicates a "
+             "catastrophic training collapse where one module is essentially dead while another "
+             "is wildly overfit."),
             ("Threshold Presets",
              "Strict:    tight bounds — flags anything outside high-quality training range.\n"
              "Standard:  community-recommended defaults — practical for most LoRAs.\n"
