@@ -14,6 +14,18 @@ import sys
 import os
 import ctypes
 
+# ── Single-instance guard (Windows named mutex) ───────────────────────────────
+_MUTEX_NAME = "ZeroJarvis.LoraSuite.2.SingleInstance"
+_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        "Lora Training Suite is already running.",
+        "Already Running",
+        0x30,  # MB_ICONWARNING
+    )
+    sys.exit(0)
+
 # ── Windows taskbar: treat as its own app (not grouped under pythonw.exe) ─────
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
     "ZeroJarvis.LoraSuite.Launcher.2")
