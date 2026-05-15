@@ -20,11 +20,12 @@ Architecture:
 from __future__ import annotations
 
 import os
+import weakref
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore    import Qt, QUrl, QTimer, QSize, Signal, QObject
-from PySide6.QtGui     import QFont, QCursor, QIcon, QPixmap, QColor
+from PySide6.QtGui     import QFont, QCursor, QIcon, QPixmap, QColor, QImage
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QFrame, QStackedWidget,
     QScrollArea, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -130,8 +131,9 @@ class TabButton(QWidget):
     Active state is set via QSS dynamic property.
     """
 
-    clicked         = Signal()
-    close_requested = Signal()
+    clicked           = Signal()
+    close_requested   = Signal()
+    refresh_requested = Signal()
 
     _STYLE_BTN = f"""
         QPushButton {{
@@ -166,8 +168,10 @@ class TabButton(QWidget):
 
     def __init__(self, label: str,
                  show_dot: bool = False, show_close: bool = False,
+                 enable_refresh: bool = False,
                  parent=None):
         super().__init__(parent)
+        self._enable_refresh = enable_refresh
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
@@ -202,6 +206,17 @@ class TabButton(QWidget):
         if self._dot:
             self._dot.setStyleSheet(
                 self._STYLE_DOT_ON if online else self._STYLE_DOT_OFF)
+
+    def contextMenuEvent(self, event):
+        if not self._enable_refresh:
+            event.ignore()
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(_MENU_QSS)
+        act_refresh = menu.addAction("↺  Refresh")
+        chosen = menu.exec(event.globalPos())
+        if chosen == act_refresh:
+            self.refresh_requested.emit()
 
 
 # ── App icon box (Manage page — Applications section) ────────────────────────
@@ -292,6 +307,24 @@ class AppIconBox(QFrame):
     def leaveEvent(self, event):
         self.setStyleSheet(self._STYLE)
         super().leaveEvent(event)
+
+
+# ── Background image scaling ──────────────────────────────────────────────────
+# QImage is thread-safe; QPixmap must only be created on the main thread.
+_IMG_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="img_scale")
+
+
+def _scale_qimage_bg(path: str, w: int, h: int):
+    """Load, scale-to-fill, and center-crop a QImage off the main thread."""
+    img = QImage(path)
+    if img.isNull():
+        return None
+    scaled = img.scaled(w, h,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+    x = max(0, (scaled.width()  - w) // 2)
+    y = max(0, (scaled.height() - h) // 2)
+    return scaled.copy(x, y, w, h)
 
 
 # ── WebUI entry box (Manage page — WebUI/Loader section) ─────────────────────
@@ -391,20 +424,29 @@ class WebUIBox(QFrame):
     def _refresh_image(self):
         img_path = self.app.get("image", "")
         if img_path and os.path.isfile(img_path):
-            px = QPixmap(img_path)
-            if not px.isNull():
-                # scale to fill, then center-crop
-                scaled = px.scaled(self._W - 4, self._IMG_H,
-                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                   Qt.TransformationMode.SmoothTransformation)
-                x = max(0, (scaled.width()  - (self._W - 4)) // 2)
-                y = max(0, (scaled.height() - self._IMG_H)   // 2)
-                cropped = scaled.copy(x, y, self._W - 4, self._IMG_H)
-                self._img_lbl.setPixmap(cropped)
-                self._img_lbl.setStyleSheet(
-                    "border:none; border-radius:6px 6px 0 0;")
-                return
-        # Placeholder
+            w, h = self._W - 4, self._IMG_H
+            weak_self = weakref.ref(self)
+            def _done(fut):
+                self_ref = weak_self()
+                if self_ref is None:
+                    return
+                result = fut.result()
+                def _apply():
+                    try:
+                        if result is not None and not result.isNull():
+                            self_ref._img_lbl.setPixmap(QPixmap.fromImage(result))
+                            self_ref._img_lbl.setStyleSheet(
+                                "border:none; border-radius:6px 6px 0 0;")
+                        else:
+                            self_ref._show_image_placeholder()
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(0, _apply)
+            _IMG_EXECUTOR.submit(_scale_qimage_bg, img_path, w, h).add_done_callback(_done)
+            return
+        self._show_image_placeholder()
+
+    def _show_image_placeholder(self):
         self._img_lbl.clear()
         self._img_lbl.setText("Drop image here")
         self._img_lbl.setStyleSheet(
@@ -754,18 +796,29 @@ class CustomAppBox(QFrame):
     def _refresh_image(self):
         img_path = self.app.get("image", "")
         if img_path and os.path.isfile(img_path):
-            px = QPixmap(img_path)
-            if not px.isNull():
-                scaled = px.scaled(self._W - 4, self._IMG_H,
-                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                   Qt.TransformationMode.SmoothTransformation)
-                x = max(0, (scaled.width()  - (self._W - 4)) // 2)
-                y = max(0, (scaled.height() - self._IMG_H)   // 2)
-                cropped = scaled.copy(x, y, self._W - 4, self._IMG_H)
-                self._img_lbl.setPixmap(cropped)
-                self._img_lbl.setStyleSheet(
-                    "border:none; border-radius:6px 6px 0 0;")
-                return
+            w, h = self._W - 4, self._IMG_H
+            weak_self = weakref.ref(self)
+            def _done(fut):
+                self_ref = weak_self()
+                if self_ref is None:
+                    return
+                result = fut.result()
+                def _apply():
+                    try:
+                        if result is not None and not result.isNull():
+                            self_ref._img_lbl.setPixmap(QPixmap.fromImage(result))
+                            self_ref._img_lbl.setStyleSheet(
+                                "border:none; border-radius:6px 6px 0 0;")
+                        else:
+                            self_ref._show_image_placeholder()
+                    except RuntimeError:
+                        pass
+                QTimer.singleShot(0, _apply)
+            _IMG_EXECUTOR.submit(_scale_qimage_bg, img_path, w, h).add_done_callback(_done)
+            return
+        self._show_image_placeholder()
+
+    def _show_image_placeholder(self):
         self._img_lbl.clear()
         self._img_lbl.setText("Drop image here")
         self._img_lbl.setStyleSheet(
@@ -1219,11 +1272,12 @@ class ManagePage(QWidget):
     apps_changed = Signal(list) # webui list changed — notify Launcher/poller
 
     _BUILTIN_APPS = [
-        ("Tags",       "tags.png"),
-        ("Calculator", "calculator.png"),
-        ("Enhancer",   "Enhancer.png"),
-        ("Face Swap",  "Face Swap.png"),
-        ("Randomizer", "Randomizer.png"),
+        ("Tags",        "tags.png"),
+        ("Calculator",  "calculator.png"),
+        ("Enhancer",    "Enhancer.png"),
+        ("Face Swap",   "Face Swap.png"),
+        ("Randomizer",  "Randomizer.png"),
+        ("LoRA Health", "health.png"),
     ]
 
     _SECTION_LABEL = (
@@ -1439,21 +1493,33 @@ class PollWorker(QObject):
 
     def __init__(self, apps: list[dict], parent=None):
         super().__init__(parent)
-        self.apps      = apps
-        self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="poll")
+        self.apps             = apps
+        # Separate executors: checkers run in parallel; one collector waits for them.
+        # Using two pools eliminates the per-cycle threading.Thread() churn.
+        self._check_executor  = ThreadPoolExecutor(max_workers=4,
+                                                   thread_name_prefix="poll_check")
+        self._collect_executor = ThreadPoolExecutor(max_workers=1,
+                                                    thread_name_prefix="poll_collect")
 
     def run(self) -> None:
-        urls    = [a["url"] for a in self.apps]
-        futures = {url: self._executor.submit(check_port, url) for url in urls}
+        urls = [a["url"] for a in self.apps]
+        if not urls:
+            self.results_ready.emit({})
+            return
+        futures = {url: self._check_executor.submit(check_port, url) for url in urls}
 
         def collect():
             results = {url: f.result() for url, f in futures.items()}
             self.results_ready.emit(results)
 
-        threading.Thread(target=collect, daemon=True).start()
+        self._collect_executor.submit(collect)
 
     def update_apps(self, apps: list[dict]) -> None:
         self.apps = apps
+
+    def shutdown(self) -> None:
+        self._check_executor.shutdown(wait=False)
+        self._collect_executor.shutdown(wait=False)
 
 
 # ── Main Launcher window ──────────────────────────────────────────────────────
@@ -1492,11 +1558,14 @@ class Launcher(QMainWindow):
         self._rand_page     = None
         self._face_page     = None
         self._enh_page      = None
+        self._health_page   = None
         self._tags_index:   int | None = None
         self._calc_index:   int | None = None
         self._rand_index:   int | None = None
         self._face_index:   int | None = None
         self._enh_index:    int | None = None
+        self._health_index: int | None = None
+        self._poll_timer:   QTimer | None = None
 
         self._build_ui()
         self._start_polling()
@@ -1541,17 +1610,20 @@ class Launcher(QMainWindow):
             "Randomizer", self._show_randomizer, closeable=True)
         self._face_tab = self._make_nav_tab(
             "Face Swap", self._show_faceswap, closeable=True)
-        self._enh_tab  = self._make_nav_tab(
+        self._enh_tab    = self._make_nav_tab(
             "Enhancer", self._show_enhancer, closeable=True)
+        self._health_tab = self._make_nav_tab(
+            "LoRA Health", self._show_health, closeable=True)
 
         self._tags_tab.close_requested.connect(self._close_tags)
         self._calc_tab.close_requested.connect(self._close_calculator)
         self._rand_tab.close_requested.connect(self._close_randomizer)
         self._face_tab.close_requested.connect(self._close_faceswap)
         self._enh_tab.close_requested.connect(self._close_enhancer)
+        self._health_tab.close_requested.connect(self._close_health)
 
         for btn in (self._tags_tab, self._calc_tab, self._rand_tab,
-                    self._face_tab, self._enh_tab):
+                    self._face_tab, self._enh_tab, self._health_tab):
             hrow.addWidget(btn)
             hrow.addSpacing(4)
             btn.setVisible(False)   # hidden until app is opened
@@ -1659,6 +1731,7 @@ class Launcher(QMainWindow):
         self._rand_tab.set_active(False)
         self._face_tab.set_active(False)
         self._enh_tab.set_active(False)
+        self._health_tab.set_active(False)
         for entry in self._tab_data.values():
             entry["tab_btn"].set_active(False)
 
@@ -1668,14 +1741,17 @@ class Launcher(QMainWindow):
         self._active_url = None
         self._stack.setCurrentIndex(self.MANAGE_INDEX)
         self._set_zoom_display(1.0)
+        if self._poll_timer:
+            self._poll_timer.setInterval(3_000)   # fast poll — dots visible on Manage page
 
     def _open_builtin(self, name: str) -> None:
         dispatch = {
-            "Tags":       self._show_tags,
-            "Calculator": self._show_calculator,
-            "Enhancer":   self._show_enhancer,
-            "Face Swap":  self._show_faceswap,
-            "Randomizer": self._show_randomizer,
+            "Tags":        self._show_tags,
+            "Calculator":  self._show_calculator,
+            "Enhancer":    self._show_enhancer,
+            "Face Swap":   self._show_faceswap,
+            "Randomizer":  self._show_randomizer,
+            "LoRA Health": self._show_health,
         }
         fn = dispatch.get(name)
         if fn:
@@ -1746,6 +1822,19 @@ class Launcher(QMainWindow):
         self._stack.setCurrentIndex(self._enh_index)
         self._set_zoom_display(1.0)
 
+    def _show_health(self):
+        self._health_tab.setVisible(True)
+        if self._health_page is None:
+            from health.health_page import HealthPage
+            self._health_page  = HealthPage()
+            self._health_index = self._stack.addWidget(self._health_page)
+            self._health_tab.set_dot_online(True)
+        self._deactivate_all()
+        self._health_tab.set_active(True)
+        self._active_url = None
+        self._stack.setCurrentIndex(self._health_index)
+        self._set_zoom_display(1.0)
+
     def _open_app_tab(self, url: str):
         if url in self._tab_data:
             self._switch_to_tab(url)
@@ -1758,9 +1847,10 @@ class Launcher(QMainWindow):
         app     = next((a for a in self.apps if a["url"] == url),
                        {"name": url, "url": url})
         tab_btn = TabButton(app["name"], show_dot=True, show_close=True,
-                            parent=self._header)
+                            enable_refresh=True, parent=self._header)
         tab_btn.clicked.connect(lambda u=url: self._switch_to_tab(u))
         tab_btn.close_requested.connect(lambda u=url: self._close_tab(u))
+        tab_btn.refresh_requested.connect(view.reload)
         self._app_tabs_area.addWidget(tab_btn)
 
         self._tab_data[url] = {"view": view, "tab_btn": tab_btn, "app": app}
@@ -1775,6 +1865,8 @@ class Launcher(QMainWindow):
         view: BrowserView = self._tab_data[url]["view"]
         self._set_zoom_display(view.get_zoom())
         self._stack.setCurrentIndex(self._stack_index[url])
+        if self._poll_timer:
+            self._poll_timer.setInterval(10_000)  # slow poll — status dots not visible
 
     def _close_tab(self, url: str):
         if url not in self._tab_data:
@@ -1869,6 +1961,19 @@ class Launcher(QMainWindow):
         self._rebuild_stack_index()
         self._show_manage()
 
+    def _close_health(self):
+        if self._health_page is None:
+            return
+        self._stack.removeWidget(self._health_page)
+        self._health_page.deleteLater()
+        self._health_page  = None
+        self._health_index = None
+        self._health_tab.set_active(False)
+        self._health_tab.set_dot_online(False)
+        self._health_tab.setVisible(False)
+        self._rebuild_stack_index()
+        self._show_manage()
+
     def _rebuild_stack_index(self):
         self._stack_index.clear()
         for url, entry in self._tab_data.items():
@@ -1885,6 +1990,8 @@ class Launcher(QMainWindow):
             self._face_index = self._stack.indexOf(self._face_page)
         if self._enh_page:
             self._enh_index = self._stack.indexOf(self._enh_page)
+        if self._health_page:
+            self._health_index = self._stack.indexOf(self._health_page)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Settings
@@ -1952,6 +2059,8 @@ class Launcher(QMainWindow):
 
     def closeEvent(self, event):
         self._poll_timer.stop()
+        self._poller.shutdown()
+        _IMG_EXECUTOR.shutdown(wait=False)
         for url in list(self._tab_data.keys()):
             entry             = self._tab_data.pop(url)
             view: BrowserView = entry["view"]

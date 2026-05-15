@@ -49,6 +49,20 @@ Designed by **Zero** | Built by **Jarvis**
   - Enable **Copy tags** to copy matching `.txt` tag files to the output folder, also renamed with `-FS`
   - **Intended workflow — real person anonymization:** select multiple generic AI faces in the panel, enable **Blend**, then run Batch Swap All. The blended face is a unique synthetic identity that does not correspond to any real person, allowing the dataset to be used or published on platforms that prohibit real-person imagery.
 
+### LoRA Health
+- Load any `.safetensors` LoRA file and run 8 structural checks without inference
+- **File Integrity** — verifies kohya hash metadata is present
+- **NaN / Inf** — scans every tensor for corrupted values
+- **Rank Consistency** — shape agreement between lora_down / lora_up and metadata
+- **Alpha/Rank Ratio** — checks declared alpha relative to rank against community bounds
+- **Rank Range** — validates rank is within recommended range per model type (SD1.5 / SDXL)
+- **Dead Layers** — detects layers with near-zero weights (undertrained or collapsed modules)
+- **Overbaked** — detects overtrained LoRAs via elevated lora_up mean magnitude
+- **Layer Balance** — flags extreme hottest/coldest layer ratio (uneven training energy)
+- Auto-detects SD 1.5 vs SDXL; manual override via dropdown
+- Drag-and-drop file input
+- Configurable thresholds — Strict / Standard / Relaxed presets per model type, with per-threshold manual overrides (amber fields, same pattern as Calculator TOS)
+
 ### Launcher
 - Embedded Chromium browser (no Chrome/Edge dependency)
 - Open any local WebUI or external URL in a tab
@@ -123,7 +137,8 @@ Lora Training Suite 2.0/
 ├── calculator/              # LoRA Calculator page
 ├── randomizer/              # Randomizer / background removal page
 ├── faces/                   # Face Swap page
-└── enhancer/                # Enhancer / upscaling page
+├── enhancer/                # Enhancer / upscaling page
+└── health/                  # LoRA Health analyzer
 ```
 
 ---
