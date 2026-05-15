@@ -1964,6 +1964,7 @@ class Launcher(QMainWindow):
     def _close_health(self):
         if self._health_page is None:
             return
+        self._health_page.cleanup()
         self._stack.removeWidget(self._health_page)
         self._health_page.deleteLater()
         self._health_page  = None

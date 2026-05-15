@@ -1021,6 +1021,16 @@ class HealthPage(QWidget):
         self._thread = threading.Thread(target=self._worker.run, daemon=True)
         self._thread.start()
 
+    def cleanup(self):
+        """Disconnect any in-flight worker before the widget is deleted."""
+        if self._worker is not None:
+            try:
+                self._worker.finished.disconnect()
+                self._worker.error.disconnect()
+            except RuntimeError:
+                pass
+            self._worker = None
+
     def _on_analysis_done(self, result: dict):
         self._run_btn.setEnabled(True)
         self._run_btn.setText("▶  Analyze")
