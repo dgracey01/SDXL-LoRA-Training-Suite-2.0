@@ -50,16 +50,18 @@ Designed by **Zero** | Built by **Jarvis**
   - **Intended workflow — real person anonymization:** select multiple generic AI faces in the panel, enable **Blend**, then run Batch Swap All. The blended face is a unique synthetic identity that does not correspond to any real person, allowing the dataset to be used or published on platforms that prohibit real-person imagery.
 
 ### LoRA Health
-- Load any `.safetensors` LoRA file and run 8 structural checks without inference
+- Load any `.safetensors` LoRA file and run structural checks without inference
 - **File Integrity** — verifies kohya hash metadata is present
 - **NaN / Inf** — scans every tensor for corrupted values
 - **Rank Consistency** — shape agreement between lora_down / lora_up and metadata
 - **Alpha/Rank Ratio** — checks declared alpha relative to rank against community bounds
 - **Rank Range** — validates rank is within recommended range per model type (SD1.5 / SDXL)
-- **Dead Layers** — detects layers with near-zero weights (undertrained or collapsed modules)
-- **Overbaked** — detects overtrained LoRAs via elevated lora_up mean magnitude
-- **Layer Balance** — flags extreme hottest/coldest layer ratio (uneven training energy)
+- **Overbaked** — detects overtrained LoRAs via elevated global lora_up mean magnitude
+- **Module Analysis** — breaks down Dead Layers and Layer Balance per architectural group:
+  - UNet Cross-Attention (`attn2`) · UNet Self-Attention (`attn1`) · UNet Feedforward (`ff_net`) · Text Encoder (`lora_te*`)
+  - Compares like-for-like layers within each group, so a near-zero `to_k`/`to_v` in cross-attention (normal for AI-Toolkit training) doesn't pollute the self-attention or feedforward result
 - Auto-detects SD 1.5 vs SDXL; manual override via dropdown
+- File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
 - Drag-and-drop file input
 - Configurable thresholds — Strict / Standard / Relaxed presets per model type, with per-threshold manual overrides (amber fields, same pattern as Calculator TOS)
 
