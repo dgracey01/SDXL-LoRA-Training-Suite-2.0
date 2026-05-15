@@ -105,63 +105,74 @@ MODULE_BAL_LABELS: dict[str, str] = {
 
 THRESHOLD_LABELS: dict[str, str] = {**GLOBAL_THRESHOLD_LABELS, **MODULE_BAL_LABELS}
 
+# Overbaked (mag_warn / mag_fail):
+#   lora-inspector community reference shows healthy LoRA global mean_abs ≈ 0.009–0.014.
+#   Overtrained LoRAs typically show 3–10× that value before becoming visibly broken.
+#   Source: rockerBOO/lora-inspector sample output from multiple community LoRAs.
+#
+# Layer balance (bal_warn / bal_fail):
+#   Within a module group, per-layer mean_abs values realistically span ~0.002–0.06,
+#   producing natural ratios of 20–50× even in healthy LoRAs. Cross-attention groups
+#   also include to_q, to_k, to_v, to_out — some training configs intentionally leave
+#   to_k/to_v near-zero, which looks like imbalance by design. Thresholds must be
+#   permissive enough to ignore this normal variation and only flag pathological cases.
 THRESHOLD_PRESETS: dict[str, dict[str, dict[str, float]]] = {
     "sd15": {
         "Strict": {
             "rank_min":  8,    "rank_max":  32,
-            "mag_dead":  1e-4, "mag_warn":  4.0,  "mag_fail":  8.0,
+            "mag_dead":  1e-4, "mag_warn":  0.04,  "mag_fail": 0.08,
             "ratio_min": 0.25, "ratio_max": 1.0,
-            "unet_cross_attn_bal_warn": 15.0,  "unet_cross_attn_bal_fail":  50.0,
-            "unet_self_attn_bal_warn":  15.0,  "unet_self_attn_bal_fail":   50.0,
-            "unet_ff_bal_warn":         15.0,  "unet_ff_bal_fail":          50.0,
-            "te_bal_warn":              10.0,  "te_bal_fail":               35.0,
+            "unet_cross_attn_bal_warn":  80.0, "unet_cross_attn_bal_fail": 300.0,
+            "unet_self_attn_bal_warn":   60.0, "unet_self_attn_bal_fail":  200.0,
+            "unet_ff_bal_warn":          60.0, "unet_ff_bal_fail":         200.0,
+            "te_bal_warn":               40.0, "te_bal_fail":              150.0,
         },
         "Standard": {
             "rank_min":  4,    "rank_max":  64,
-            "mag_dead":  1e-5, "mag_warn":  6.0,  "mag_fail": 12.0,
+            "mag_dead":  1e-5, "mag_warn":  0.06,  "mag_fail": 0.12,
             "ratio_min": 0.10, "ratio_max": 1.0,
-            "unet_cross_attn_bal_warn": 30.0,  "unet_cross_attn_bal_fail": 100.0,
-            "unet_self_attn_bal_warn":  30.0,  "unet_self_attn_bal_fail":  100.0,
-            "unet_ff_bal_warn":         30.0,  "unet_ff_bal_fail":         100.0,
-            "te_bal_warn":              20.0,  "te_bal_fail":               70.0,
+            "unet_cross_attn_bal_warn": 120.0, "unet_cross_attn_bal_fail": 500.0,
+            "unet_self_attn_bal_warn":  100.0, "unet_self_attn_bal_fail":  400.0,
+            "unet_ff_bal_warn":         100.0, "unet_ff_bal_fail":         400.0,
+            "te_bal_warn":               60.0, "te_bal_fail":              250.0,
         },
         "Relaxed": {
             "rank_min":  2,    "rank_max": 128,
-            "mag_dead":  1e-6, "mag_warn": 10.0,  "mag_fail": 20.0,
+            "mag_dead":  1e-6, "mag_warn":  0.10,  "mag_fail": 0.20,
             "ratio_min": 0.05, "ratio_max": 2.0,
-            "unet_cross_attn_bal_warn": 60.0,  "unet_cross_attn_bal_fail": 200.0,
-            "unet_self_attn_bal_warn":  60.0,  "unet_self_attn_bal_fail":  200.0,
-            "unet_ff_bal_warn":         60.0,  "unet_ff_bal_fail":         200.0,
-            "te_bal_warn":              40.0,  "te_bal_fail":              140.0,
+            "unet_cross_attn_bal_warn": 200.0, "unet_cross_attn_bal_fail": 1000.0,
+            "unet_self_attn_bal_warn":  200.0, "unet_self_attn_bal_fail":  1000.0,
+            "unet_ff_bal_warn":         200.0, "unet_ff_bal_fail":         1000.0,
+            "te_bal_warn":              100.0, "te_bal_fail":               500.0,
         },
     },
     "sdxl": {
         "Strict": {
             "rank_min": 16,    "rank_max": 128,
-            "mag_dead":  1e-4, "mag_warn":  3.5,  "mag_fail":  7.0,
+            "mag_dead":  1e-4, "mag_warn":  0.04,  "mag_fail": 0.08,
             "ratio_min": 0.25, "ratio_max": 1.0,
-            "unet_cross_attn_bal_warn": 15.0,  "unet_cross_attn_bal_fail":  50.0,
-            "unet_self_attn_bal_warn":  15.0,  "unet_self_attn_bal_fail":   50.0,
-            "unet_ff_bal_warn":         15.0,  "unet_ff_bal_fail":          50.0,
-            "te_bal_warn":              10.0,  "te_bal_fail":               35.0,
+            "unet_cross_attn_bal_warn":  80.0, "unet_cross_attn_bal_fail": 300.0,
+            "unet_self_attn_bal_warn":   60.0, "unet_self_attn_bal_fail":  200.0,
+            "unet_ff_bal_warn":          60.0, "unet_ff_bal_fail":         200.0,
+            "te_bal_warn":               40.0, "te_bal_fail":              150.0,
         },
         "Standard": {
             "rank_min":  8,    "rank_max": 256,
-            "mag_dead":  1e-5, "mag_warn":  5.0,  "mag_fail": 10.0,
+            "mag_dead":  1e-5, "mag_warn":  0.06,  "mag_fail": 0.12,
             "ratio_min": 0.10, "ratio_max": 1.0,
-            "unet_cross_attn_bal_warn": 30.0,  "unet_cross_attn_bal_fail": 100.0,
-            "unet_self_attn_bal_warn":  30.0,  "unet_self_attn_bal_fail":  100.0,
-            "unet_ff_bal_warn":         30.0,  "unet_ff_bal_fail":         100.0,
-            "te_bal_warn":              20.0,  "te_bal_fail":               70.0,
+            "unet_cross_attn_bal_warn": 120.0, "unet_cross_attn_bal_fail": 500.0,
+            "unet_self_attn_bal_warn":  100.0, "unet_self_attn_bal_fail":  400.0,
+            "unet_ff_bal_warn":         100.0, "unet_ff_bal_fail":         400.0,
+            "te_bal_warn":               60.0, "te_bal_fail":              250.0,
         },
         "Relaxed": {
             "rank_min":  4,    "rank_max": 512,
-            "mag_dead":  1e-6, "mag_warn":  8.0,  "mag_fail": 16.0,
+            "mag_dead":  1e-6, "mag_warn":  0.10,  "mag_fail": 0.20,
             "ratio_min": 0.05, "ratio_max": 2.0,
-            "unet_cross_attn_bal_warn": 60.0,  "unet_cross_attn_bal_fail": 200.0,
-            "unet_self_attn_bal_warn":  60.0,  "unet_self_attn_bal_fail":  200.0,
-            "unet_ff_bal_warn":         60.0,  "unet_ff_bal_fail":         200.0,
-            "te_bal_warn":              40.0,  "te_bal_fail":              140.0,
+            "unet_cross_attn_bal_warn": 200.0, "unet_cross_attn_bal_fail": 1000.0,
+            "unet_self_attn_bal_warn":  200.0, "unet_self_attn_bal_fail":  1000.0,
+            "unet_ff_bal_warn":         200.0, "unet_ff_bal_fail":         1000.0,
+            "te_bal_warn":              100.0, "te_bal_fail":               500.0,
         },
     },
 }
