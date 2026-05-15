@@ -42,6 +42,9 @@ push.bat
 # ── Build artifacts ────────────────────────────────────────────────────────────
 *.zip
 
+# ── Runtime logs (kept local for diagnostics — never commit) ──────────────────
+*.log
+
 # ── Stray image files in root ──────────────────────────────────────────────────
 /*.png
 /*.jpg
