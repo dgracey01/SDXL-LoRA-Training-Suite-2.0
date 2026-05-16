@@ -82,7 +82,7 @@ WD = {"character": 0.009, "concept": 0.008, "style": 0.004, "outfit": 0.008, "po
 CD = {"character": 0.15,  "concept": 0.12,  "style": 0.10,  "outfit": 0.14,  "pose": 0.10}
 
 MAX_LOG         = 20
-IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif', '.txt'}
+IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.txt'}
 RANK_CAP_OPTIONS = ["auto", "min", "outfit", "default", "large", "xlarge", "max"]
 
 PRELOADED_AT = [
@@ -110,7 +110,7 @@ PRELOADED_AT = [
 
 SHARED_HELP = [
     ("Batch Size",    "Maximum number of images to be loaded at once. Highly dependent on your GPU's VRAM."),
-    ("Dataset Files", "The total number of files in the training folder. Only .jpg, .jpeg, .png and .txt files are counted. Unsupported file types (e.g. .db, .webp, .bmp) are ignored."),
+    ("Dataset Files", "The total number of files in the training folder. Only .jpg, .jpeg, .png and .txt files are counted. Other formats (.webp, .bmp, .tiff, etc.) are not supported by AI-Toolkit and are excluded."),
     ("Tagged",        "Check if Dataset is already tagged. When ON, Total Images = Dataset Files ÷ 2."),
     ("Rank Cap",      "Controls Linear Rank calculation. Auto = dataset-size driven (recommended). Presets: min=16, outfit=20, default=32, large=64, xlarge=128, max=256."),
 ]
