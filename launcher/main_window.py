@@ -1579,7 +1579,54 @@ class Launcher(QMainWindow):
     # UI construction
     # ═══════════════════════════════════════════════════════════════════════════
 
+    def _setup_menubar(self):
+        mb = self.menuBar()
+        mb.setStyleSheet(f"""
+            QMenuBar {{
+                background: {CAR};
+                color: {PRI};
+                font-family: {FONT};
+                font-size: {FONT_SM}px;
+                border-bottom: 1px solid {MUT};
+                spacing: 2px;
+                padding: 1px 4px;
+            }}
+            QMenuBar::item {{
+                background: transparent;
+                padding: 4px 10px;
+                border-radius: 3px;
+            }}
+            QMenuBar::item:selected {{ background: {ACC}; }}
+            QMenu {{
+                background: {CAR};
+                color: {PRI};
+                border: 1px solid {MUT};
+                font-family: {FONT};
+                font-size: {FONT_SM}px;
+                padding: 4px 0;
+            }}
+            QMenu::item {{ padding: 5px 20px; }}
+            QMenu::item:selected {{ background: {ACC}; }}
+            QMenu::separator {{
+                background: {MUT};
+                height: 1px;
+                margin: 4px 8px;
+            }}
+        """)
+
+        file_menu = mb.addMenu("File")
+
+        act_settings = file_menu.addAction("Settings…")
+        act_settings.triggered.connect(self._open_settings)
+
+        file_menu.addSeparator()
+
+        act_exit = file_menu.addAction("Exit")
+        act_exit.triggered.connect(self.close)
+
     def _build_ui(self):
+        self._setup_menubar()
+
         root        = QWidget(self)
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -1655,24 +1702,6 @@ class Launcher(QMainWindow):
         zoom_row.addWidget(self._zoom_lbl)
         zoom_row.addWidget(btn_plus)
         hrow.addWidget(zoom_frame)
-        hrow.addSpacing(6)
-
-        # ⚙ Settings button
-        settings_btn = QPushButton("⚙", self._header)
-        settings_btn.setFixedSize(QSize(28, 28))
-        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        settings_btn.setToolTip("Settings")
-        settings_btn.setStyleSheet(f"""
-            QPushButton {{
-                background:{MUT}; color:{PRI}; border:none;
-                border-radius:4px; font-size:15px;
-            }}
-            QPushButton:hover {{ background:{ACC}; }}
-        """)
-        settings_btn.clicked.connect(self._open_settings)
-        hrow.addWidget(settings_btn)
-        hrow.addSpacing(8)
-
         # Signature
         sig = QLabel(SIGNATURE, self._header)
         sig.setStyleSheet(f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;")
@@ -1906,6 +1935,10 @@ class Launcher(QMainWindow):
         self._tags_tab.set_active(False)
         self._tags_tab.set_dot_online(False)
         self._tags_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("tags"):
+                del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -1919,6 +1952,10 @@ class Launcher(QMainWindow):
         self._calc_tab.set_active(False)
         self._calc_tab.set_dot_online(False)
         self._calc_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("calculator") or key == "shared.calc_engine":
+                del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -1932,6 +1969,10 @@ class Launcher(QMainWindow):
         self._rand_tab.set_active(False)
         self._rand_tab.set_dot_online(False)
         self._rand_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("randomizer"):
+                del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -1945,6 +1986,10 @@ class Launcher(QMainWindow):
         self._face_tab.set_active(False)
         self._face_tab.set_dot_online(False)
         self._face_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("faces"):
+                del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -1958,6 +2003,10 @@ class Launcher(QMainWindow):
         self._enh_tab.set_active(False)
         self._enh_tab.set_dot_online(False)
         self._enh_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("enhancer"):
+                del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 
@@ -1972,6 +2021,10 @@ class Launcher(QMainWindow):
         self._health_tab.set_active(False)
         self._health_tab.set_dot_online(False)
         self._health_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("health"):
+                del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 

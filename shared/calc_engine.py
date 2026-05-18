@@ -78,8 +78,8 @@ TOS_RANGES = {
 MIN_IMAGES  = {"character": 50, "concept": 40, "style": 50, "outfit": 50, "pose": 50}
 CIVITAI_MAX = {"character": 500, "concept": 700, "style": 300, "outfit": 700, "pose": 600}
 
-WD = {"character": 0.009, "concept": 0.008, "style": 0.004, "outfit": 0.008, "pose": 0.007}
-CD = {"character": 0.15,  "concept": 0.12,  "style": 0.10,  "outfit": 0.14,  "pose": 0.10}
+WD = {"character": 0.01,  "concept": 0.01,  "style": 0.01,  "outfit": 0.01,  "pose": 0.01}
+CD = {"character": 0.05,  "concept": 0.05,  "style": 0.10,  "outfit": 0.08,  "pose": 0.10}
 
 MAX_LOG         = 20
 IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.txt'}
@@ -112,19 +112,19 @@ SHARED_HELP = [
     ("Batch Size",    "Maximum number of images to be loaded at once. Highly dependent on your GPU's VRAM."),
     ("Dataset Files", "The total number of files in the training folder. Only .jpg, .jpeg, .png and .txt files are counted. Other formats (.webp, .bmp, .tiff, etc.) are not supported by AI-Toolkit and are excluded."),
     ("Tagged",        "Check if Dataset is already tagged. When ON, Total Images = Dataset Files ÷ 2."),
-    ("Rank Cap",      "Controls Linear Rank calculation. Auto = dataset-size driven (recommended). Presets: min=16, outfit=20, default=32, large=64, xlarge=128, max=256."),
+    ("Rank Cap",      "Controls Linear Rank calculation. Auto = type-aware (recommended). Presets: min=16, outfit=20, default=32, large=64, xlarge=128, max=256."),
 ]
 
 HELP_CONTENT = {
     "AI-Toolkit": [
         ("LoRA Type",          "Dropdown with 5 types: character, concept, style, outfit, pose. Controls all auto-calculated parameters including LR, weight decay, caption dropout, grad accum, TOS target."),
         ("Steps",              "Total training steps. Sole training control in ai-toolkit — repeats and epochs are not reliably enforced. Formula: (Images × TOS) ÷ Effective Batch × Factor."),
-        ("Learning Rate",      "UNet learning rate. Type-specific: Character/Concept/Style=0.000036, Outfit/Pose=0.00003."),
-        ("Weight Decay",       "Regularization to prevent overfitting: Character=0.009, Concept=0.008, Style=0.004, Outfit=0.008, Pose=0.007."),
-        ("Caption Dropout",    "Rate at which captions are randomly dropped during training: Character=0.15, Concept=0.12, Style=0.10, Outfit=0.14, Pose=0.10."),
-        ("Grad Accum",         "Gradient accumulation. Auto-scaled by dataset size and LoRA type. Capped at 6 for ai-toolkit."),
+        ("Learning Rate",      "UNet learning rate. Character/Concept: dataset-size curve — ≤50=5e-5, ≤200=7e-5, >200=1e-4. Style/Outfit/Pose: flat 1e-4."),
+        ("Weight Decay",       "AdamW8bit regularization. Flat 0.01 for all types — matches the optimizer's own default (weight_decay=1e-2). Type-specific values were spreadsheet rounding errors."),
+        ("Caption Dropout",    "Rate at which captions are randomly dropped during training: Character/Concept=0.05, Outfit=0.08, Style/Pose=0.10."),
+        ("Grad Accum",         "Gradient accumulation. Inverted curve — smaller datasets get lower accum for more frequent updates: ≤100=1, ≤300=2, ≤700=3, >700=4."),
         ("Eff Batch",          "Effective batch = Batch Size × Grad Accum. This is the actual gradient update frequency."),
-        ("Linear Rank",        "LoRA network dimension. Auto: ≤50=128, ≤100=96, ≤200=64, ≤500=32, ≤1000=24, >1000=16."),
+        ("Linear Rank",        "LoRA network dimension. Auto (type-aware): character/concept=32 flat; style=32 (≤200 imgs) / 64 (>200 imgs); outfit/pose=16."),
         ("Conv Rank",          "Convolutional rank. Derived from Linear Rank: Character/Concept/Style=50%, Outfit=40%, Pose=35%. Clamped 2–32."),
         ("ETS Signal",         "Effective Training Signal. Compares actual TOS/image against target with 5% tolerance. Good/Underfit/Overfit."),
         ("Suggested Factor",   "The R2 factor value needed to bring ETS back to Good. Copy into Manual Factor field."),
@@ -140,14 +140,14 @@ HELP_CONTENT = {
         ("Repeats",          "Times each image is seen per epoch. Auto: dataset-size curve MAX(1,MIN(15,800/images))."),
         ("Epochs",           "Full training passes. Smooth power 0.55 curve: Character 50img=5ep/500img=20ep, Concept 40img=2ep/1000img=20ep, Style 50img=8ep/300img=20ep."),
         ("Steps",            "Total steps = Repeats × Epochs × Images ÷ Batch. Informational in Kohya — controlled by Repeats and Epochs."),
-        ("UNet LR",          "UNet learning rate. Character/Concept=0.0001, Style/Pose=0.00008, Outfit=0.0001."),
+        ("UNet LR",          "UNet learning rate. Character/Concept: ≤50=5e-5, ≤200=7e-5, >200=1e-4. Style/Outfit/Pose: flat 1e-4. Text Encoder LR = UNet LR ÷ 10."),
         ("Text Enc LR",      "Text Encoder LR = UNet LR ÷ 10. The 10:1 ratio is community confirmed for SDXL Kohya training."),
         ("LR Scheduler",     "Pose always uses linear. All others use cosine_with_restarts with Adafactor/AdamW8bit, cosine with Prodigy/Automagic."),
         ("Optimizer",        "AdamW8bit recommended for 24GB VRAM. Reduces VRAM 25-30% with negligible quality loss."),
         ("Network Alpha",    "Set equal to Linear Rank (1:1 ratio). Effective LR = LR × (Alpha ÷ Dim). At 1:1 the LR is applied at full strength."),
         ("Min SNR Gamma",    "Fixed at 5 for all types. Community unanimous recommendation for SDXL Kohya training."),
         ("Noise Offset",     "Fixed at 0.1 for Kohya. Introduces true darkness and highlights into the model."),
-        ("Grad Accum",       "Capped at 4 for Kohya (vs 6 for ai-toolkit)."),
+        ("Grad Accum",       "Same inverted curve as AI-Toolkit, capped at 4: ≤100=1, ≤300=2, ≤700=3, >700=4."),
         ("Save Every (ep)",  "Save checkpoint every N epochs. ≤10 epochs=every 1, ≤20 epochs=every 2, >20 epochs=every 5."),
         ("Suggested Factor", "Exact factor value needed to hit target TOS. Copy into Manual Factor."),
     ],
@@ -263,12 +263,12 @@ def calculate(p: TrainingParams) -> TrainingEstimate:
 
 # ── Bucket resolution list ────────────────────────────────────────────────────
 def get_bucket_resolutions(bucket_512: bool, bucket_256: bool) -> list[int]:
-    buckets = [768, 1024, 1280, 1536]
-    if bucket_512:
-        buckets = [512] + buckets
+    lower = []
     if bucket_256:
-        buckets = [256] + buckets
-    return buckets
+        lower.append(256)
+    if bucket_512:
+        lower.append(512)
+    return lower + [1280]
 
 
 # ── Simple YAML export (sd_trainer style) ────────────────────────────────────
@@ -344,28 +344,41 @@ def get_images(files: str, tagged: bool) -> int:
         return 0
 
 
+def lr_at(lt: str, imgs: int) -> float:
+    if lt in ("character", "concept"):
+        if imgs <= 50:    return 5e-5
+        elif imgs <= 200: return 7e-5
+        return 1e-4
+    return 1e-4
+
+
 def grad_at(lt: str, imgs: int, batch: int = 2) -> int:
-    m  = {"character": 1.0, "concept": 1.0, "style": 1.2, "outfit": 1.2, "pose": 1.5}.get(lt, 1.0)
-    ds = 6 if imgs <= 200 else (4 if imgs <= 500 else (3 if imgs <= 1000 else 2))
-    return max(1, min(6, round(m * ds)))
+    # Inverted: small datasets need more frequent updates (low accum), not larger batches
+    if imgs <= 100:   return 1
+    elif imgs <= 300: return 2
+    elif imgs <= 700: return 3
+    return 4
 
 
 def grad_ko(lt: str, imgs: int, batch: int = 2) -> int:
-    m  = {"character": 1.0, "concept": 1.0, "style": 1.2, "outfit": 1.2, "pose": 1.5}.get(lt, 1.0)
-    ds = 6 if imgs <= 200 else (4 if imgs <= 500 else (3 if imgs <= 1000 else 2))
-    return max(1, min(4, round(m * ds)))
+    if imgs <= 100:   return 1
+    elif imgs <= 300: return 2
+    elif imgs <= 700: return 3
+    return 4
 
 
-def lin_rank(imgs: int, rc: str = "auto") -> int:
+def lin_rank(imgs: int, rc: str = "auto", lt: str = "character") -> int:
     presets = {"min": 16, "outfit": 20, "default": 32, "large": 64, "xlarge": 128, "max": 256}
     if rc.lower() in presets:
         return presets[rc.lower()]
-    if imgs <= 50:    return 128
-    elif imgs <= 100: return 96
-    elif imgs <= 200: return 64
-    elif imgs <= 500: return 32
-    elif imgs <= 1000: return 24
-    return 16
+    if lt in ("character", "concept"):
+        return 32                          # flat — community sweet spot regardless of dataset size
+    elif lt == "style":
+        return 32 if imgs <= 200 else 64   # style benefits from higher rank at scale
+    elif lt == "outfit":
+        return 16                          # garment details captured efficiently at low rank
+    else:                                  # pose
+        return 16                          # geometric patterns need minimal rank
 
 
 def conv_rank(lt: str, lr: int) -> int:
@@ -417,9 +430,8 @@ def calc_at(lt: str, imgs: int, factor: float, rc: str,
     g      = grad_at(lt, imgs, batch)
     eb     = batch * g
     steps  = round((imgs * tos / eb) * factor)
-    lr_val = {"character": 0.000036, "concept": 0.000036, "style": 0.000036,
-              "outfit": 0.00003, "pose": 0.00003}.get(lt, 0.000036)
-    lrank  = lin_rank(imgs, rc)
+    lr_val = lr_at(lt, imgs)
+    lrank  = lin_rank(imgs, rc, lt)
     crank  = conv_rank(lt, lrank)
     actual = round((steps * eb) / imgs, 1)
     ets, col = ets_check(actual, tos)
@@ -450,10 +462,9 @@ def calc_ko(lt: str, imgs: int, factor: float, rc: str,
     g      = grad_ko(lt, imgs, batch)
     eb     = batch * g
     steps  = round((imgs * tos / eb) * factor)
-    lr_val = {"character": 0.0001, "concept": 0.0001, "style": 0.00008,
-              "outfit": 0.0001, "pose": 0.00008}.get(lt, 0.0001)
+    lr_val = lr_at(lt, imgs)
     te     = round(lr_val / 10, 6)
-    lrank  = lin_rank(imgs, rc)
+    lrank  = lin_rank(imgs, rc, lt)
     crank  = conv_rank(lt, lrank)
     ep     = epochs_smooth(lt, imgs)
     rep    = max(1, min(15, round(800 / imgs)))
@@ -493,7 +504,7 @@ def calc_cv(lt: str, imgs: int, factor: float, rc: str,
     lr_val = {"character": 0.0003, "concept": 0.0005, "style": 0.0003,
               "outfit": 0.0004, "pose": 0.0004}.get(lt, 0.0003)
     te     = round(lr_val / 10, 6)
-    lrank  = lin_rank(imgs, rc)
+    lrank  = lin_rank(imgs, rc, lt)
     sch    = "linear" if lt == "pose" else "cosine_with_restarts"
     no     = {"character": 0.1, "concept": 0.08, "style": 0.06,
               "outfit": 0.09, "pose": 0.04}.get(lt, 0.1)

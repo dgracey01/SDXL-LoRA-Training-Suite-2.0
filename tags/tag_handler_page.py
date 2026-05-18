@@ -19,7 +19,7 @@ from PySide6.QtCore    import (Qt, QTimer, QThread, QObject, Signal,
 from PySide6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
-    QSlider, QProgressBar, QScrollArea, QTabWidget, QSplitter,
+    QSlider, QProgressBar, QScrollArea, QTabWidget, QSplitter, QStackedWidget,
     QFileDialog, QSizePolicy, QMessageBox, QInputDialog,
     QPlainTextEdit, QDialog, QProgressDialog, QApplication,
     QMenu, QSpacerItem, QSpinBox,
@@ -632,7 +632,8 @@ class PrepareCard(QFrame):
             f"PrepareCard{{background:{CAR};border:3px solid {bc};"
             f"border-radius:6px;}}")
         self.setObjectName("PrepareCard")
-        self.setFixedWidth(self.D + 8)   # 4px margin each side
+        self.setFixedWidth(self.D + 8)    # 4px margin each side
+        self.setFixedHeight(self.D + 28)  # header(~20) + spacing(2) + image(D) + margins(8)
         self.img_path  = img_path
         self.status    = status
         self.on_deleted = on_deleted
@@ -644,6 +645,7 @@ class PrepareCard(QFrame):
         self._dsx = self._dsy = 0
         self._dox = self._doy = 0.5
         self._pixmap   = None
+        self._load_gen = 0   # generation counter; incremented on each assign()
 
         # Placeholder until the background load completes
         self._pil = Image.new("RGB", (self.D, self.D), (22, 33, 62))
@@ -673,6 +675,7 @@ class PrepareCard(QFrame):
         fname_s = fname if len(fname)<=30 else fname[:27]+"…"
         nm = QLabel(fname_s, hdr)
         nm.setStyleSheet(f"color:{MUT};font-family:{FONT};font-size:9px;background:transparent;")
+        self._nm_lbl = nm
         hlay.addWidget(nm)
         if status=="duplicate":
             dup = QLabel(" ⚠ DUP", hdr)
@@ -740,12 +743,16 @@ class PrepareCard(QFrame):
 
         # Load the real image on a background thread; update card when ready
         self._image_ready.connect(self._on_image_loaded)
-        _get_image_executor().submit(self._bg_load_image)
+        if img_path:
+            _get_image_executor().submit(self._bg_load_image, 0, img_path)
 
-    def _bg_load_image(self):
-        """Background thread: load full image and emit _image_ready."""
+    def _bg_load_image(self, gen: int = 0, path: str = None):
+        """Background thread: load full image and emit _image_ready if gen is current."""
+        load_path = path if path is not None else self.img_path
+        if not load_path:
+            return
         try:
-            raw = Image.open(self.img_path)
+            raw = Image.open(load_path)
             if raw.mode == "RGBA":
                 bg = Image.new("RGB", raw.size, (22, 33, 62))
                 bg.paste(raw, mask=raw.split()[3])
@@ -754,7 +761,8 @@ class PrepareCard(QFrame):
                 pil = raw.convert("RGB")
         except Exception:
             pil = Image.new("RGB", (self.D, self.D), (22, 33, 62))
-        self._image_ready.emit(pil)
+        if gen == self._load_gen:
+            self._image_ready.emit(pil)
 
     def _on_image_loaded(self, pil: Image.Image):
         """Main thread: replace placeholder with the real image and re-render."""
@@ -871,6 +879,38 @@ class PrepareCard(QFrame):
         tw,th = RATIO_MAP.get(ratio,(1024,1024))
         self._tw=tw; self._th=th
         self._update_slider_states(); self._render()
+
+    def assign(self, img_path: str, status: str = "normal",
+               saved_offset=None, saved_zoom: float = 1.0,
+               tw: int = None, th: int = None, is_manual: bool = False):
+        """Reassign this pool card to a new image (virtual scroll)."""
+        self._load_gen += 1
+        gen = self._load_gen
+        self.img_path  = img_path
+        self.status    = status
+        self.offset_x  = saved_offset[0] if saved_offset else 0.5
+        self.offset_y  = saved_offset[1] if saved_offset else 0.5
+        self.card_zoom = float(saved_zoom) if saved_zoom else 1.0
+        self._tw       = tw if tw else self.D
+        self._th       = th if th else self.D
+        self._pil      = Image.new("RGB", (self.D, self.D), (22, 33, 62))
+        fname   = os.path.basename(img_path)
+        fname_s = fname if len(fname) <= 30 else fname[:27] + "…"
+        self._nm_lbl.setText(fname_s)
+        bc = {"normal": ACC, "nonsquare": RED, "duplicate": AMB}.get(status, ACC)
+        self.setStyleSheet(
+            f"PrepareCard{{background:{CAR};border:3px solid {bc};border-radius:6px;}}")
+        self.set_manual_mode(is_manual)
+        _izv = max(-50, min(50, int(round((self.card_zoom - 1.0) / 0.4 * 10))))
+        for sl, val in [
+            (self._izs, _izv),
+            (self._xs,  int(self.offset_x * 1000)),
+            (self._ys,  int(self.offset_y * 1000)),
+        ]:
+            sl.blockSignals(True); sl.setValue(val); sl.blockSignals(False)
+        self._update_slider_states()
+        self._render()
+        _get_image_executor().submit(self._bg_load_image, gen, img_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1655,6 +1695,8 @@ class TagHandlerPage(QWidget):
         self._prep_card_widgets: list[PrepareCard] = []
         self._crop_offsets: dict = {}   # img_path → (ox, oy, zoom, tw, th)
         self._prep_loaded: int = 0      # how many cards have been appended so far
+        self._prep_pool_cards: list  = []   # virtual scroll pool
+        self._prep_pool_cols:  int   = 0    # cols when pool was last built
 
         # tagger state
         self._tagger_thread_obj = None
@@ -1800,14 +1842,23 @@ class TagHandlerPage(QWidget):
 
         # scroll area for cards
         self._prep_scroll = QScrollArea(self._prepare_tab)
-        self._prep_scroll.setWidgetResizable(True)
+        self._prep_scroll.setWidgetResizable(False)
+        self._prep_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._prep_scroll.setStyleSheet(f"QScrollArea{{border:none;background:{BG};}}")
+
+        # Legacy grid container (kept for compatibility with _update_res_indicator internals)
         self._prep_inner  = QWidget()
         self._prep_inner.setStyleSheet(f"background:{BG};")
         self._prep_grid   = QGridLayout(self._prep_inner)
         self._prep_grid.setSpacing(6)
         self._prep_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._prep_scroll.setWidget(self._prep_inner)
+
+        # Virtual-scroll container (absolute positioning)
+        self._prep_container = QWidget()
+        self._prep_container.setStyleSheet(f"background:{BG};")
+        self._prep_container.setFixedSize(100, 100)
+
+        self._prep_scroll.setWidget(self._prep_container)
         self._prep_scroll.verticalScrollBar().valueChanged.connect(
             self._on_prep_scroll)
         v.addWidget(self._prep_scroll, stretch=1)
@@ -1816,37 +1867,90 @@ class TagHandlerPage(QWidget):
         # init ratio label
         self._update_res_indicator(self._res_combo.currentText())
 
-    def _render_prepare_page(self):
-        """Clear all cards and load the first batch (infinite-scroll reset)."""
-        # snapshot any currently visible cards before clearing
-        for card in self._prep_card_widgets:
-            ox, oy = card.get_offset()
-            tw_c, th_c = card.get_resolution()
-            self._crop_offsets[card.img_path] = (ox, oy, card.get_zoom(), tw_c, th_c)
+    # ── Prepare virtual-scroll helpers ────────────────────────────────────────
 
-        for card in self._prep_card_widgets:
-            card.setParent(None)
-            card.deleteLater()
-        self._prep_card_widgets.clear()
+    PREP_CARD_W   = DEFAULT_CARD + 8
+    PREP_CARD_H   = DEFAULT_CARD + 28
+    PREP_CARD_GAP = 6
+    PREP_POOL_BUF = 1
 
-        while self._prep_grid.count():
-            item = self._prep_grid.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
+    def _prep_save_visible_offsets(self):
+        """Snapshot all pool cards' current pan/zoom into _crop_offsets."""
+        for card in self._prep_pool_cards:
+            if card.img_path:
+                ox, oy = card.get_offset()
+                tw_c, th_c = card.get_resolution()
+                self._crop_offsets[card.img_path] = (ox, oy, card.get_zoom(), tw_c, th_c)
 
-        self._prep_loaded = 0
-        if not self._images:
+    def _prep_update_container_size(self):
+        rows_count = len(self._images)
+        cols   = self._prep_cols_spin.value()
+        n_rows = (rows_count + cols - 1) // cols if rows_count else 0
+        step_h = self.PREP_CARD_H + self.PREP_CARD_GAP
+        vp_h   = self._prep_scroll.viewport().height()
+        vp_w   = self._prep_scroll.viewport().width()
+        cont_h = n_rows * step_h - self.PREP_CARD_GAP + 8 if n_rows else 0
+        self._prep_container.setFixedSize(vp_w, max(cont_h, vp_h))
+
+    def _prep_rebuild_pool(self):
+        cols  = self._prep_cols_spin.value()
+        vp_h  = self._prep_scroll.viewport().height()
+        vis   = max(1, (vp_h + self.PREP_CARD_GAP) // (self.PREP_CARD_H + self.PREP_CARD_GAP) + 1)
+        target = (vis + 2 * self.PREP_POOL_BUF) * cols
+
+        if cols != self._prep_pool_cols:
+            self._prep_save_visible_offsets()
+            for c in self._prep_pool_cards:
+                c.setParent(None)
+                c.deleteLater()
+            self._prep_pool_cards.clear()
+            self._prep_pool_cols = cols
+
+        while len(self._prep_pool_cards) < target:
+            card = PrepareCard(self._prep_container, "",
+                               on_deleted=self._on_prepare_image_deleted)
+            card.hide()
+            self._prep_pool_cards.append(card)
+
+        while len(self._prep_pool_cards) > target:
+            c = self._prep_pool_cards.pop()
+            if c.img_path:
+                ox, oy = c.get_offset()
+                tw_c, th_c = c.get_resolution()
+                self._crop_offsets[c.img_path] = (ox, oy, c.get_zoom(), tw_c, th_c)
+            c.deleteLater()
+
+        self._prep_update_container_size()
+        self._prep_assign_pool()
+
+    def _prep_assign_pool(self):
+        if not self._prep_pool_cards:
             return
-        self._append_prepare_cards(0, min(PREP_BATCH, len(self._images)))
-
-    def _append_prepare_cards(self, start: int, end: int):
-        """Append cards for self._images[start:end] to the grid."""
-        cols      = self._prep_cols_spin.value()
+        sb_val    = self._prep_scroll.verticalScrollBar().value()
+        cols      = self._prep_pool_cols or self._prep_cols_spin.value()
+        cw        = self.PREP_CARD_W
+        step_h    = self.PREP_CARD_H + self.PREP_CARD_GAP
+        first_row = max(0, sb_val // step_h - self.PREP_POOL_BUF)
+        first_idx = first_row * cols
         res_txt   = self._res_combo.currentText()
         is_manual = (res_txt == "Manual")
         tw, th, _ = RES_MAP.get(res_txt, (1024, 1024, "1:1"))
 
-        for i, img_path in enumerate(self._images[start:end], start=start):
+        for pi, card in enumerate(self._prep_pool_cards):
+            data_idx = first_idx + pi
+            if data_idx >= len(self._images):
+                card.hide()
+                continue
+            img_path = self._images[data_idx]
+            # Save state of outgoing image before reassignment
+            if card.img_path and card.img_path != img_path:
+                ox, oy = card.get_offset()
+                tw_c, th_c = card.get_resolution()
+                self._crop_offsets[card.img_path] = (ox, oy, card.get_zoom(), tw_c, th_c)
+            row_i = data_idx // cols
+            col_i = data_idx % cols
+            card.move(col_i * (cw + self.PREP_CARD_GAP) + 4,
+                      row_i * step_h + 4)
             saved    = self._crop_offsets.get(img_path)
             s_offset = (saved[0], saved[1]) if saved else None
             s_zoom   = saved[2] if saved else 1.0
@@ -1854,34 +1958,34 @@ class TagHandlerPage(QWidget):
                 _tw, _th = saved[3], saved[4]
             else:
                 _tw, _th = tw, th
-            card = PrepareCard(self._prep_inner, img_path,
-                               saved_offset=s_offset, saved_zoom=s_zoom,
-                               tw=_tw, th=_th,
-                               on_deleted=self._on_prepare_image_deleted)
-            if is_manual:
-                card.set_manual_mode(True)
-            self._prep_card_widgets.append(card)
-            row, col = divmod(i, cols)
-            self._prep_grid.addWidget(card, row, col)
+            card.assign(img_path, "normal", s_offset, s_zoom, _tw, _th, is_manual)
+            card.show()
 
-        self._prep_loaded = end
+    def _render_prepare_page(self):
+        """Reset the virtual-scroll pool and show images from the start."""
+        self._prep_save_visible_offsets()
+        self._prep_pool_cols = 0   # force pool rebuild on col-count change
+        if not self._images:
+            for c in self._prep_pool_cards:
+                c.hide()
+            self._prep_update_container_size()
+            self._prep_status.setText("")
+            return
+        self._prep_update_container_size()
+        self._prep_rebuild_pool()
         total = len(self._images)
-        if end < total:
-            self._prep_status.setText(
-                f"{end} of {total} shown — scroll down to load more")
-        else:
-            self._prep_status.setText(
-                f"{total} images loaded from {os.path.basename(self._dataset_folder)}")
+        self._prep_status.setText(
+            f"{total} images loaded from {os.path.basename(self._dataset_folder)}")
+
+    def _append_prepare_cards(self, start: int, end: int):
+        """Legacy stub — no-op (virtual scroll replaces batch loading)."""
 
     def _on_prep_scroll(self, value: int):
-        """Load next batch when scrolled to 85% of the current content."""
-        if self._prep_loaded >= len(self._images):
-            return
-        sb = self._prep_scroll.verticalScrollBar()
-        if sb.maximum() > 0 and value >= sb.maximum() * 0.85:
-            nxt = min(self._prep_loaded + PREP_BATCH, len(self._images))
-            self._append_prepare_cards(self._prep_loaded, nxt)
+        self._prep_assign_pool()
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QTimer.singleShot(50, self._prep_rebuild_pool)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  TAGGER TAB
@@ -2251,14 +2355,14 @@ class TagHandlerPage(QWidget):
         txt = text or self._res_combo.currentText()
         if txt == "Manual":
             self._res_ratio_lbl.setText("Manual")
-            for card in self._prep_card_widgets:
+            for card in self._prep_pool_cards:
                 if card.isVisible():
                     card.set_manual_mode(True)
         else:
             _, _, ratio = RES_MAP.get(txt, (1024, 1024, "1:1"))
             self._res_ratio_lbl.setText(ratio)
             tw, th, _ = RES_MAP.get(txt, (1024, 1024, "1:1"))
-            for card in self._prep_card_widgets:
+            for card in self._prep_pool_cards:
                 if card.isVisible():
                     card.set_manual_mode(False)
                     card.set_resolution(tw, th)
@@ -2482,6 +2586,10 @@ class TagHandlerPage(QWidget):
             on_replace=self._batch_replace_prompt,
             on_filter=self._on_cloud_filter_set,
         )
+        self._cap_fr_panel = self._build_cap_fr_panel()
+        self._right_stack = QStackedWidget(None)
+        self._right_stack.addWidget(self._tag_cloud)     # index 0 — Tag Viewer
+        self._right_stack.addWidget(self._cap_fr_panel)  # index 1 — Caption F&R
 
         self._editor_scroll = QScrollArea()
         self._editor_scroll.setWidgetResizable(True)
@@ -2504,7 +2612,7 @@ class TagHandlerPage(QWidget):
         # Remove old body from main vbox and detach shared widgets
         if self._ed_body is not None:
             self._ed_main_vbox.removeWidget(self._ed_body)
-            self._tag_cloud.setParent(None)
+            self._right_stack.setParent(None)
             self._editor_scroll.setParent(None)
             self._ed_body.deleteLater()
             self._ed_body = None
@@ -2514,9 +2622,9 @@ class TagHandlerPage(QWidget):
             bv = QVBoxLayout(body)
             bv.setContentsMargins(0, 0, 0, 0)
             bv.setSpacing(6)
-            self._tag_cloud.setMinimumHeight(100)
-            self._tag_cloud.setMaximumHeight(200)
-            bv.addWidget(self._tag_cloud)
+            self._right_stack.setMinimumHeight(100)
+            self._right_stack.setMaximumHeight(200)
+            bv.addWidget(self._right_stack)
             bv.addWidget(self._editor_scroll, stretch=1)
             self._tag_cloud.set_single_column(False)
 
@@ -2533,8 +2641,9 @@ class TagHandlerPage(QWidget):
             self._tag_cloud.setMinimumHeight(0)
             self._tag_cloud.setMaximumHeight(16777215)
             self._tag_cloud.setMinimumWidth(100)
-            body.addWidget(self._tag_cloud)
-            body.setSizes([900, 170])
+            self._right_stack.setMinimumWidth(100)
+            body.addWidget(self._right_stack)
+            body.setSizes([900, 200])
             body.setCollapsible(1, True)
             self._tag_cloud.set_single_column(True)
 
@@ -2609,6 +2718,20 @@ class TagHandlerPage(QWidget):
 
         QTimer.singleShot(100, self._prefetch_next_thumbs)
 
+    def _refresh_editor_visible_cards(self):
+        """Refresh already-loaded editor cards in-place without resetting scroll position."""
+        highlighted  = self._tag_cloud.selected
+        view_mode    = self._view_seg.get()
+        trigger_word = self._editor_trigger_entry.text().strip()
+        for i in range(self._editor_loaded):
+            if i < len(self._editor_visible):
+                self._editor_cards[i].recycle(
+                    self._editor_visible[i],
+                    highlighted_tags=highlighted,
+                    view_mode=view_mode,
+                    trigger_word=trigger_word,
+                )
+
     def _on_editor_scroll(self, value: int):
         """Load next batch when scrolled to 85% of current content."""
         if self._editor_loaded >= len(self._editor_visible):
@@ -2645,6 +2768,7 @@ class TagHandlerPage(QWidget):
         self._rebuild_tag_freq()
 
     def _on_label_type_change(self, val: str):
+        self._right_stack.setCurrentIndex(1 if val == "Caption" else 0)
         self._render_editor_page()
 
     def _on_image_deleted(self, img_path: str):
@@ -3017,11 +3141,8 @@ class TagHandlerPage(QWidget):
         use_esr    = scale_mode.startswith("RealESRGAN")
         esr_anime  = scale_mode == "RealESRGAN 4x (Anime)"
 
-        # snapshot all card states before processing
-        for card in self._prep_card_widgets:
-            ox, oy = card.get_offset()
-            tw_c, th_c = card.get_resolution()
-            self._crop_offsets[card.img_path] = (ox, oy, card.get_zoom(), tw_c, th_c)
+        # snapshot all visible pool card states before processing
+        self._prep_save_visible_offsets()
 
         resample = Image.LANCZOS
 
@@ -3374,6 +3495,136 @@ class TagHandlerPage(QWidget):
         self._rebuild_tag_freq()
         self._render_editor_page()
         self._batch_log(f"Replaced '{src}' → '{dst}' in {count} files.")
+
+    # ── Caption Find & Replace panel ─────────────────────────────────────────
+
+    def _build_cap_fr_panel(self):
+        panel = QFrame(None)
+        panel.setStyleSheet(f"QFrame{{background:{PAN};border-radius:6px;border:none;}}")
+        root = QVBoxLayout(panel)
+        root.setContentsMargins(10, 8, 10, 10)
+        root.setSpacing(8)
+
+        # Header
+        hdr = QWidget(panel)
+        hdr.setStyleSheet("background:transparent;")
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+        ttl = QLabel("Caption Find & Replace", hdr)
+        ttl.setStyleSheet(
+            f"color:{ACC};font-weight:bold;font-size:13px;background:transparent;")
+        hl.addWidget(ttl)
+        hl.addStretch()
+        root.addWidget(hdr)
+
+        sep = QFrame(panel)
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"QFrame{{color:{MUT};background:{MUT};}}")
+        sep.setFixedHeight(1)
+        root.addWidget(sep)
+
+        # Find field
+        find_lbl = QLabel("Find:", panel)
+        find_lbl.setStyleSheet(f"color:{SEC};font-size:11px;background:transparent;")
+        root.addWidget(find_lbl)
+        self._cap_find_edit = QLineEdit(panel)
+        self._cap_find_edit.setPlaceholderText("Text to find in captions...")
+        self._cap_find_edit.setFixedHeight(30)
+        self._cap_find_edit.setStyleSheet(
+            f"QLineEdit{{background:{CAR};color:{PRI};border:1px solid {MUT};"
+            f"border-radius:4px;padding:2px 8px;font-size:12px;}}"
+            f"QLineEdit:focus{{border-color:{ACC};}}")
+        root.addWidget(self._cap_find_edit)
+
+        # Replace field
+        repl_lbl = QLabel("Replace with:", panel)
+        repl_lbl.setStyleSheet(f"color:{SEC};font-size:11px;background:transparent;")
+        root.addWidget(repl_lbl)
+        self._cap_repl_edit = QLineEdit(panel)
+        self._cap_repl_edit.setPlaceholderText("Replacement text (blank to delete)...")
+        self._cap_repl_edit.setFixedHeight(30)
+        self._cap_repl_edit.setStyleSheet(
+            f"QLineEdit{{background:{CAR};color:{PRI};border:1px solid {MUT};"
+            f"border-radius:4px;padding:2px 8px;font-size:12px;}}"
+            f"QLineEdit:focus{{border-color:{ACC};}}")
+        root.addWidget(self._cap_repl_edit)
+
+        # Options row
+        opts = QWidget(panel)
+        opts.setStyleSheet("background:transparent;")
+        ol = QHBoxLayout(opts)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setSpacing(8)
+        self._cap_case_chk = QCheckBox("Case sensitive", opts)
+        self._cap_case_chk.setStyleSheet(
+            f"QCheckBox{{color:{SEC};font-size:11px;background:transparent;}}")
+        ol.addWidget(self._cap_case_chk)
+        ol.addStretch()
+        root.addWidget(opts)
+
+        # Replace button
+        btn = QPushButton("Replace in All Captions", panel)
+        btn.setFixedHeight(34)
+        btn.setStyleSheet(
+            f"QPushButton{{background:{ACC};color:{PRI};border:none;border-radius:4px;"
+            f"font-weight:bold;font-size:12px;}}"
+            f"QPushButton:hover{{background:#185FA5;}}")
+        btn.clicked.connect(self._batch_caption_replace)
+        self._cap_find_edit.returnPressed.connect(self._batch_caption_replace)
+        self._cap_repl_edit.returnPressed.connect(self._batch_caption_replace)
+        root.addWidget(btn)
+
+        # Status label
+        self._cap_fr_status = QLabel("", panel)
+        self._cap_fr_status.setWordWrap(True)
+        self._cap_fr_status.setStyleSheet(
+            f"color:{MUT};font-size:11px;background:transparent;")
+        root.addWidget(self._cap_fr_status)
+
+        root.addStretch()
+        return panel
+
+    def _batch_caption_replace(self):
+        find = self._cap_find_edit.text()
+        repl = self._cap_repl_edit.text()
+        if not find:
+            self._cap_fr_status.setStyleSheet(
+                f"color:{AMB};font-size:11px;background:transparent;")
+            self._cap_fr_status.setText("Enter text to find.")
+            return
+        if not self._images:
+            self._cap_fr_status.setStyleSheet(
+                f"color:{AMB};font-size:11px;background:transparent;")
+            self._cap_fr_status.setText("No dataset loaded.")
+            return
+        case = self._cap_case_chk.isChecked()
+        self._push_undo()
+        count = 0
+        for img in self._images:
+            all_items = _read_tags(img)
+            tags, caps = _split_tags_captions(all_items)
+            new_caps = []
+            changed = False
+            for cap in caps:
+                if case:
+                    new = cap.replace(find, repl)
+                else:
+                    new = re.sub(re.escape(find), lambda m: repl, cap, flags=re.IGNORECASE)
+                if new != cap:
+                    changed = True
+                new_caps.append(new)
+            if changed:
+                _write_tags(img, tags + new_caps)
+                count += 1
+        _flush_tag_cache()
+        self._refresh_editor_visible_cards()
+        color = GRN if count else MUT
+        self._cap_fr_status.setStyleSheet(
+            f"color:{color};font-size:11px;background:transparent;")
+        self._cap_fr_status.setText(
+            f"Replaced '{find}' → '{repl}' in {count} file(s)." if count
+            else f"'{find}' not found in any caption.")
 
     def _find_missing(self):
         if not self._images:

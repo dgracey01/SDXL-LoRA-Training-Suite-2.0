@@ -17,6 +17,7 @@ Designed by **Zero** | Built by **Jarvis**
 - Extra Instructions field: steer caption output per run (e.g. "Focus on outfit and accessories.")
 - Upscale images with **Real-ESRGAN** (photo and anime modes)
 - Batch tag operations: add, remove, replace, shuffle, sort
+- Caption Find & Replace preserves scroll position — the gallery does not jump back to the top after each replacement
 - Tag frequency chart and profile system
 - Model integrity check on startup — detects corrupt or incomplete downloads before loading
 
@@ -60,6 +61,11 @@ Designed by **Zero** | Built by **Jarvis**
 - **Module Analysis** — breaks down Dead Layers and Layer Balance per architectural group:
   - UNet Cross-Attention (`attn2`) · UNet Self-Attention (`attn1`) · UNet Feedforward (`ff_net`) · Text Encoder (`lora_te*`)
   - Compares like-for-like layers within each group, so a near-zero `to_k`/`to_v` in cross-attention (normal for AI-Toolkit training) doesn't pollute the self-attention or feedforward result
+- **Batch Compare** — point to a training output folder to rank all `.safetensors` candidates at once:
+  - Runs all 8 checks on every file in the background with a live progress bar
+  - Scores each candidate (lower = better): NaN/Inf → disqualified; penalty points for fail/warn checks, overbaked magnitude, dead layers, and layer imbalance
+  - Highlights the best candidate with a Copy Path button
+  - **Open in Analyze ↗** on any row loads that file into the single-file tab for full module inspection
 - Auto-detects SD 1.5 vs SDXL; manual override via dropdown
 - File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
 - Drag-and-drop file input

@@ -506,14 +506,13 @@ class CalculatorPage(QWidget):
             f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px; background:transparent;")
         rb_row.addWidget(bres)
         rb_row.addSpacing(8)
-        for res in ["768", "1024", "1280", "1536"]:
-            rl = QLabel(res)
-            rl.setStyleSheet(
-                f"color:{GRN}; font-family:{FONT}; font-size:{FONT_SM}px;"
-                f"font-weight:bold; background:transparent;")
-            rl.setFixedWidth(36)
-            rl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            rb_row.addWidget(rl)
+        rl_1280 = QLabel("1280")
+        rl_1280.setStyleSheet(
+            f"color:{GRN}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f"font-weight:bold; background:transparent;")
+        rl_1280.setFixedWidth(36)
+        rl_1280.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rb_row.addWidget(rl_1280)
         self._bucket_512_cb = QCheckBox("512")
         self._bucket_512_cb.setChecked(bool(self._cfg.get("bucket_512", False)))
         self._bucket_512_cb.setStyleSheet(_check_style())
@@ -1621,7 +1620,7 @@ class CalculatorPage(QWidget):
                         "network_kwargs": {"ignore_if_contains": []},
                     },
                     "save": {
-                        "dtype": "fp16", "save_every": save_every,
+                        "dtype": "bf16", "save_every": save_every,
                         "max_step_saves_to_keep": max_saves,
                         "save_format": "diffusers", "push_to_hub": False,
                     },
@@ -1633,8 +1632,9 @@ class CalculatorPage(QWidget):
                         "cache_latents_to_disk": self._cache_latents_cb.isChecked(),
                         "is_reg": False, "network_weight": 1,
                         "resolution": buckets,
-                        "controls": [], "shrink_video_to_frames": True,
-                        "num_frames": 1, "do_i2v": True, "flip_x": True, "flip_y": False,
+                        "controls": [],
+                        "shrink_video_to_frames": False, "num_frames": 1, "do_i2v": False,
+                        "flip_x": False, "flip_y": False,
                     }],
                     "train": {
                         "batch_size": batch, "bypass_guidance_embedding": False,

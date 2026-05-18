@@ -190,7 +190,7 @@ def _lbl(text: str, color: str = SEC, size: int = FONT_MD, bold: bool = False) -
     lbl = QLabel(text)
     lbl.setStyleSheet(
         f"color:{color}; font-family:{FONT}; font-size:{size}px;"
-        f" font-weight:{'bold' if bold else 'normal'}; background:transparent;")
+        f" font-weight:{'bold' if bold else 'normal'}; background:transparent; border:none;")
     return lbl
 
 
@@ -496,13 +496,51 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
         "ss_base_model_version": metadata.get("ss_base_model_version", ""),
     }
 
+    _global_mag = (sum(all_mags) / len(all_mags)) if all_mags else 0.0
+    _total_dead = sum(g["dead_count"] for g in module_results.values())
+    _worst_bal  = max(
+        (g["balance"] for g in module_results.values() if g["balance"] is not None),
+        default=1.0,
+    )
+
     return {
         "overall":       overall,
         "checks":        checks,
         "module_groups": module_results,
         "meta":          meta_summary,
         "model_type":    model_type,
+        "metrics": {
+            "mean_mag":      _global_mag,
+            "total_dead":    _total_dead,
+            "worst_balance": _worst_bal,
+        },
     }
+
+
+# ── Batch candidate scoring ────────────────────────────────────────────────────
+def _score_result(result: dict) -> float:
+    """Penalty score for batch ranking — lower is better.
+    Returns infinity for NaN/Inf failures (disqualified, do not pick as best)."""
+    for check in result["checks"]:
+        if check["id"] == "nan_inf" and check["status"] == "fail":
+            return float("inf")
+
+    score = 0.0
+    penalty = {"fail": 100, "warn": 20}
+    boost   = {"overbaked": 2.0, "rank_consistency": 3.0}
+    for check in result["checks"]:
+        if check["id"] == "nan_inf":
+            continue
+        score += penalty.get(check["status"], 0) * boost.get(check["id"], 1.0)
+
+    m = result.get("metrics", {})
+    score += m.get("mean_mag",      0.0) * 500   # 0.06 warn ≈ +30 pts
+    score += m.get("total_dead",    0)   * 10
+    worst  = m.get("worst_balance", 1.0) or 1.0
+    if worst != float("inf"):
+        score += max(0.0, worst - 50.0) * 0.3
+
+    return score
 
 
 # ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -552,6 +590,34 @@ class _DropZone(QFrame):
                 self.file_dropped.emit(path)
 
 
+# ── Batch analysis worker ──────────────────────────────────────────────────────
+class _BatchWorker(QObject):
+    progress = Signal(int, int, str)  # index (1-based), total, current filename
+    finished = Signal(list)           # list of {path, result, error}
+
+    def __init__(self, paths: list, get_threshold_fn):
+        super().__init__()
+        self._paths  = paths
+        self._get_fn = get_threshold_fn
+        self._stop   = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        out   = []
+        total = len(self._paths)
+        for i, path in enumerate(self._paths):
+            if self._stop:
+                break
+            self.progress.emit(i + 1, total, os.path.basename(path))
+            try:
+                out.append({"path": path, "result": _analyse(path, self._get_fn), "error": None})
+            except Exception as exc:
+                out.append({"path": path, "result": None, "error": str(exc)})
+        self.finished.emit(out)
+
+
 # ── HealthPage ────────────────────────────────────────────────────────────────
 class HealthPage(QWidget):
     """LoRA Health Analyzer — integrated page for Lora Training Suite 2.0."""
@@ -561,9 +627,11 @@ class HealthPage(QWidget):
         self.setStyleSheet(f"background:{PAN};")
 
         self._cfg           = load_json(HEALTH_CFG, DEFAULTS)
-        self._current_file: str | None             = None
-        self._worker:       _AnalysisWorker | None = None
+        self._current_file: str | None              = None
+        self._worker:       _AnalysisWorker | None  = None
         self._thread:       threading.Thread | None = None
+        self._batch_worker: _BatchWorker | None     = None
+        self._batch_thread: threading.Thread | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -604,6 +672,7 @@ class HealthPage(QWidget):
         root.addWidget(self._tabs, stretch=1)
 
         self._build_analyze_tab()
+        self._build_batch_tab()
         self._build_thresholds_tab()
         self._build_help_tab()
 
@@ -683,6 +752,395 @@ class HealthPage(QWidget):
 
         layout.addStretch(1)
         self._tabs.addTab(scroll, "Analyze")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Batch Compare tab
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_batch_tab(self):
+        from PySide6.QtWidgets import QProgressBar, QSizePolicy
+
+        w = QWidget()
+        w.setStyleSheet(f"background:{PAN};")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(w)
+        scroll.setStyleSheet(f"QScrollArea {{ border:none; background:{PAN}; }}")
+
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
+
+        # ── Folder picker card ─────────────────────────────────────────────
+        folder_card = QFrame()
+        folder_card.setStyleSheet(_card_style())
+        fl = QVBoxLayout(folder_card)
+        fl.setContentsMargins(16, 14, 16, 14)
+        fl.setSpacing(10)
+
+        fl.addWidget(_lbl("Batch Candidate Compare", PRI, FONT_MD, bold=True))
+        fl.addWidget(_lbl(
+            "Point to an output folder from a training run. Every .safetensors file "
+            "found will be analysed and scored. The best candidate is highlighted.",
+            SEC, FONT_SM))
+
+        pick_row = QHBoxLayout()
+        pick_row.setSpacing(8)
+        self._batch_folder_edit = QLineEdit()
+        self._batch_folder_edit.setPlaceholderText("Browse to training output folder…")
+        self._batch_folder_edit.setReadOnly(True)
+        self._batch_folder_edit.setStyleSheet(
+            f"QLineEdit {{ background:{BG}; color:{SEC}; border:2px solid {MUT};"
+            f" border-radius:4px; padding:4px 8px; font-family:{FONT}; font-size:{FONT_MD}px; }}")
+        pick_row.addWidget(self._batch_folder_edit, stretch=1)
+
+        batch_browse_btn = QPushButton("Browse…")
+        batch_browse_btn.setFixedHeight(32)
+        batch_browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        batch_browse_btn.clicked.connect(self._on_batch_browse)
+        pick_row.addWidget(batch_browse_btn)
+        fl.addLayout(pick_row)
+
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(10)
+        ctrl_row.addWidget(_lbl("Model Type:"))
+        self._batch_type_combo = QComboBox()
+        self._batch_type_combo.addItems(["Auto-detect", "SD 1.5", "SDXL"])
+        self._batch_type_combo.setStyleSheet(_combo_style())
+        self._batch_type_combo.setFixedWidth(160)
+        ctrl_row.addWidget(self._batch_type_combo)
+        ctrl_row.addStretch(1)
+
+        self._batch_run_btn = QPushButton("▶  Compare All")
+        self._batch_run_btn.setFixedHeight(36)
+        self._batch_run_btn.setEnabled(False)
+        self._batch_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._batch_run_btn.clicked.connect(self._on_batch_run)
+        ctrl_row.addWidget(self._batch_run_btn)
+        fl.addLayout(ctrl_row)
+        layout.addWidget(folder_card)
+
+        # ── Progress area ──────────────────────────────────────────────────
+        prog_card = QFrame()
+        prog_card.setStyleSheet(_card_style())
+        prog_card.setVisible(False)
+        pl = QVBoxLayout(prog_card)
+        pl.setContentsMargins(16, 12, 16, 12)
+        pl.setSpacing(8)
+
+        prog_top = QHBoxLayout()
+        self._batch_prog_lbl = _lbl("Preparing…", SEC, FONT_SM)
+        prog_top.addWidget(self._batch_prog_lbl, stretch=1)
+        self._batch_cancel_btn = QPushButton("Cancel")
+        self._batch_cancel_btn.setFixedHeight(28)
+        self._batch_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._batch_cancel_btn.clicked.connect(self._on_batch_cancel)
+        prog_top.addWidget(self._batch_cancel_btn)
+        pl.addLayout(prog_top)
+
+        self._batch_progress_bar = QProgressBar()
+        self._batch_progress_bar.setRange(0, 100)
+        self._batch_progress_bar.setValue(0)
+        self._batch_progress_bar.setFixedHeight(10)
+        self._batch_progress_bar.setTextVisible(False)
+        self._batch_progress_bar.setStyleSheet(
+            f"QProgressBar {{ background:{BG}; border:none; border-radius:5px; }}"
+            f"QProgressBar::chunk {{ background:{ACC}; border-radius:5px; }}")
+        pl.addWidget(self._batch_progress_bar)
+        self._batch_prog_card = prog_card
+        layout.addWidget(prog_card)
+
+        # ── Results area ───────────────────────────────────────────────────
+        self._batch_results_widget = QWidget()
+        self._batch_results_widget.setStyleSheet("background:transparent;")
+        self._batch_results_layout = QVBoxLayout(self._batch_results_widget)
+        self._batch_results_layout.setContentsMargins(0, 0, 0, 0)
+        self._batch_results_layout.setSpacing(12)
+        layout.addWidget(self._batch_results_widget)
+
+        layout.addStretch(1)
+        self._tabs.addTab(scroll, "Batch Compare")
+
+    # ── Batch slots ────────────────────────────────────────────────────────────
+
+    def _on_batch_browse(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Training Output Folder")
+        if not folder:
+            return
+        self._batch_folder_edit.setText(folder)
+        files = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(".safetensors")
+        ]
+        count = len(files)
+        self._batch_run_btn.setEnabled(count > 0)
+        if count == 0:
+            self._batch_run_btn.setText("▶  Compare All")
+            self._batch_folder_edit.setStyleSheet(
+                self._batch_folder_edit.styleSheet().replace(MUT, RED))
+        else:
+            self._batch_run_btn.setText(f"▶  Compare All  ({count} files)")
+            self._batch_folder_edit.setStyleSheet(
+                f"QLineEdit {{ background:{BG}; color:{SEC}; border:2px solid {MUT};"
+                f" border-radius:4px; padding:4px 8px; font-family:{FONT}; font-size:{FONT_MD}px; }}")
+
+    def _on_batch_run(self):
+        folder = self._batch_folder_edit.text()
+        if not folder or not os.path.isdir(folder):
+            return
+        files = sorted(
+            [os.path.join(folder, f) for f in os.listdir(folder)
+             if f.lower().endswith(".safetensors")]
+        )
+        if not files:
+            return
+
+        self._batch_run_btn.setEnabled(False)
+        self._batch_run_btn.setText("Analyzing…")
+        self._batch_prog_card.setVisible(True)
+        self._batch_progress_bar.setValue(0)
+        self._batch_prog_lbl.setText(f"Starting — {len(files)} files…")
+        self._clear_batch_results()
+
+        type_sel    = self._batch_type_combo.currentText()
+        forced_type = {"SD 1.5": "sd15", "SDXL": "sdxl"}.get(type_sel)
+        get_fn      = (lambda mt, k: self.get_threshold(forced_type, k)) \
+                      if forced_type else self.get_threshold
+
+        self._batch_worker = _BatchWorker(files, get_fn)
+        self._batch_worker.progress.connect(self._on_batch_progress)
+        self._batch_worker.finished.connect(self._on_batch_finished)
+        self._batch_thread = threading.Thread(target=self._batch_worker.run, daemon=True)
+        self._batch_thread.start()
+
+    def _on_batch_cancel(self):
+        if self._batch_worker is not None:
+            self._batch_worker.stop()
+        self._batch_prog_card.setVisible(False)
+        folder = self._batch_folder_edit.text()
+        if folder and os.path.isdir(folder):
+            files = [f for f in os.listdir(folder) if f.lower().endswith(".safetensors")]
+            self._batch_run_btn.setText(f"▶  Compare All  ({len(files)} files)")
+            self._batch_run_btn.setEnabled(len(files) > 0)
+        else:
+            self._batch_run_btn.setText("▶  Compare All")
+            self._batch_run_btn.setEnabled(False)
+
+    def _on_batch_progress(self, idx: int, total: int, filename: str):
+        pct = int(idx / total * 100)
+        self._batch_progress_bar.setValue(pct)
+        self._batch_prog_lbl.setText(f"Analyzing {idx} of {total}:  {filename}")
+
+    def _on_batch_finished(self, results: list):
+        self._batch_prog_card.setVisible(False)
+        folder = self._batch_folder_edit.text()
+        files  = [f for f in os.listdir(folder) if f.lower().endswith(".safetensors")] \
+                 if folder and os.path.isdir(folder) else []
+        self._batch_run_btn.setText(f"▶  Compare All  ({len(files)} files)" if files else "▶  Compare All")
+        self._batch_run_btn.setEnabled(bool(files))
+        self._batch_worker = None
+        self._show_batch_results(results)
+
+    def _clear_batch_results(self):
+        while self._batch_results_layout.count():
+            item = self._batch_results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _show_batch_results(self, results: list):
+        STATUS_COLORS = {"pass": GRN, "warn": AMB, "fail": RED, "info": ACC}
+        STATUS_ICONS  = {"pass": "✓", "warn": "⚠", "fail": "✗", "info": "ℹ"}
+
+        # Score and sort — errors go to the bottom
+        scored = []
+        for entry in results:
+            if entry["result"] is not None:
+                s = _score_result(entry["result"])
+                scored.append((s, entry))
+            else:
+                scored.append((float("inf"), entry))
+        scored.sort(key=lambda x: x[0])
+
+        valid = [(s, e) for s, e in scored if e["result"] is not None and s < float("inf")]
+        best  = valid[0] if valid else None
+
+        # ── Winner banner ──────────────────────────────────────────────────
+        if best:
+            best_score, best_entry = best
+            best_path   = best_entry["path"]
+            best_result = best_entry["result"]
+            best_meta   = best_result["meta"]
+
+            winner_card = QFrame()
+            winner_card.setStyleSheet(
+                f"QFrame {{ background:{CAR}; border-radius:8px; border:2px solid {GRN}; }}")
+            wl = QVBoxLayout(winner_card)
+            wl.setContentsMargins(16, 14, 16, 14)
+            wl.setSpacing(8)
+
+            title_row = QHBoxLayout()
+            star_lbl = QLabel("★  BEST CANDIDATE")
+            star_lbl.setStyleSheet(
+                f"color:{GRN}; font-family:{FONT}; font-size:{FONT_MD}px;"
+                f" font-weight:bold; background:transparent; border:none;")
+            title_row.addWidget(star_lbl)
+            title_row.addStretch(1)
+
+            overall = best_result["overall"]
+            badge_colors = {"pass": GRN, "warn": AMB, "fail": RED}
+            badge_texts  = {"pass": "✓  PASS", "warn": "⚠  WARN", "fail": "✗  FAIL"}
+            badge = QLabel(badge_texts.get(overall, overall.upper()))
+            badge.setStyleSheet(
+                f"color:{PRI}; background:{badge_colors.get(overall, MUT)};"
+                f" border-radius:4px; padding:4px 12px;"
+                f" font-family:{FONT}; font-size:{FONT_SM}px; font-weight:bold;")
+            title_row.addWidget(badge)
+            wl.addLayout(title_row)
+
+            fname_lbl = _lbl(best_meta["filename"], PRI, FONT_LG, bold=True)
+            wl.addWidget(fname_lbl)
+
+            detail_row = QHBoxLayout()
+            detail_row.setSpacing(20)
+            m = best_result.get("metrics", {})
+            detail_row.addWidget(_lbl(
+                f"Score: {best_score:.1f}  ·  "
+                f"Magnitude: {m.get('mean_mag', 0):.5f}  ·  "
+                f"Dead layers: {m.get('total_dead', 0)}  ·  "
+                f"{best_meta['model_type']}  rank {best_meta['rank']}",
+                SEC, FONT_SM))
+            detail_row.addStretch(1)
+
+            copy_btn = QPushButton("Copy Path")
+            copy_btn.setFixedHeight(30)
+            copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            def _do_copy(p=best_path, btn=copy_btn):
+                try:
+                    import pyperclip as _pc
+                    _pc.copy(p)
+                    btn.setText("Copied ✓")
+                except Exception:
+                    from PySide6.QtWidgets import QApplication
+                    QApplication.clipboard().setText(p)
+                    btn.setText("Copied ✓")
+            copy_btn.clicked.connect(_do_copy)
+            detail_row.addWidget(copy_btn)
+
+            open_btn = QPushButton("Open in Analyze ↗")
+            open_btn.setFixedHeight(30)
+            open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            open_btn.clicked.connect(lambda _=False, p=best_path: self._open_in_analyze(p))
+            detail_row.addWidget(open_btn)
+            wl.addLayout(detail_row)
+            self._batch_results_layout.addWidget(winner_card)
+
+        # ── Results table ──────────────────────────────────────────────────
+        table_card = QFrame()
+        table_card.setStyleSheet(_card_style())
+        tl = QVBoxLayout(table_card)
+        tl.setContentsMargins(16, 12, 16, 12)
+        tl.setSpacing(4)
+
+        header_row = QWidget()
+        header_row.setStyleSheet("background:transparent;")
+        hr = QHBoxLayout(header_row)
+        hr.setContentsMargins(8, 4, 8, 4)
+        hr.setSpacing(8)
+        hr.addWidget(_lbl("#",          SEC, FONT_SM, bold=True), stretch=0)
+        hr.addWidget(_lbl("File",       SEC, FONT_SM, bold=True), stretch=5)
+        hr.addWidget(_lbl("Overall",    SEC, FONT_SM, bold=True), stretch=1)
+        hr.addWidget(_lbl("Magnitude",  SEC, FONT_SM, bold=True), stretch=1)
+        hr.addWidget(_lbl("Dead",       SEC, FONT_SM, bold=True), stretch=0)
+        hr.addWidget(_lbl("Score ↓",    SEC, FONT_SM, bold=True), stretch=1)
+        hr.addWidget(_lbl("",           SEC, FONT_SM),             stretch=1)
+        tl.addWidget(header_row)
+
+        for rank_idx, (score, entry) in enumerate(scored):
+            is_winner = (rank_idx == 0 and best is not None and score < float("inf"))
+            is_error  = entry["result"] is None
+
+            row = QFrame()
+            if is_winner:
+                row.setStyleSheet(
+                    f"QFrame {{ background:{BG}; border-radius:4px; border-left:3px solid {GRN}; }}")
+            else:
+                row.setStyleSheet(
+                    f"QFrame {{ background:{BG if rank_idx % 2 == 0 else CAR}; border-radius:4px; }}")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(8, 7, 8, 7)
+            rl.setSpacing(8)
+
+            rank_lbl = QLabel(f"★" if is_winner else str(rank_idx + 1))
+            rank_lbl.setFixedWidth(22)
+            rank_lbl.setStyleSheet(
+                f"color:{GRN if is_winner else MUT}; font-family:{FONT};"
+                f" font-size:{FONT_SM}px; font-weight:bold; background:transparent; border:none;")
+            rl.addWidget(rank_lbl)
+
+            fname = os.path.basename(entry["path"])
+            fname_lbl = QLabel(fname)
+            fname_lbl.setStyleSheet(
+                f"color:{PRI}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
+            rl.addWidget(fname_lbl, stretch=5)
+
+            if is_error:
+                err_lbl = _lbl(f"Error: {entry['error']}", RED, FONT_SM)
+                err_lbl.setWordWrap(True)
+                rl.addWidget(err_lbl, stretch=4)
+            else:
+                result  = entry["result"]
+                overall = result["overall"]
+                m       = result.get("metrics", {})
+
+                badge_colors = {"pass": GRN, "warn": AMB, "fail": RED}
+                badge_texts  = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}
+                ov_lbl = QLabel(badge_texts.get(overall, overall.upper()))
+                ov_lbl.setStyleSheet(
+                    f"color:{PRI}; background:{badge_colors.get(overall, MUT)};"
+                    f" border-radius:3px; padding:2px 6px; font-family:{FONT};"
+                    f" font-size:{FONT_SM}px; font-weight:bold; border:none;")
+                rl.addWidget(ov_lbl, stretch=1)
+
+                mag_val = m.get("mean_mag", 0.0)
+                mag_color = RED if overall == "fail" else (AMB if overall == "warn" else GRN)
+                rl.addWidget(_lbl(f"{mag_val:.5f}", mag_color, FONT_SM), stretch=1)
+
+                dead_val = m.get("total_dead", 0)
+                dead_color = AMB if dead_val > 0 else SEC
+                dead_lbl = QLabel(str(dead_val))
+                dead_lbl.setFixedWidth(30)
+                dead_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                dead_lbl.setStyleSheet(
+                    f"color:{dead_color}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                    f" background:transparent; border:none;")
+                rl.addWidget(dead_lbl)
+
+                score_txt = "∞ (disqualified)" if score == float("inf") else f"{score:.1f}"
+                rl.addWidget(_lbl(score_txt, MUT if score == float("inf") else SEC, FONT_SM), stretch=1)
+
+                open_row_btn = QPushButton("Open ↗")
+                open_row_btn.setFixedHeight(24)
+                open_row_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                open_row_btn.setStyleSheet(
+                    f"QPushButton {{ background:{BG}; color:{ACC}; border:1px solid {MUT};"
+                    f" border-radius:3px; font-family:{FONT}; font-size:{FONT_SM}px; padding:1px 6px; }}"
+                    f"QPushButton:hover {{ border-color:{ACC}; }}")
+                open_row_btn.clicked.connect(
+                    lambda _=False, p=entry["path"]: self._open_in_analyze(p))
+                rl.addWidget(open_row_btn, stretch=1)
+
+            tl.addWidget(row)
+
+        note_lbl = _lbl("Score: lower is better  ·  ∞ = NaN/Inf detected (file unusable)", MUT, FONT_SM)
+        tl.addWidget(note_lbl)
+        self._batch_results_layout.addWidget(table_card)
+
+    def _open_in_analyze(self, path: str):
+        """Load a file into the Analyze tab and switch to it."""
+        self._on_file_selected(path)
+        self._tabs.setCurrentIndex(0)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Thresholds tab
@@ -934,20 +1392,63 @@ class HealthPage(QWidget):
              "Computes the global mean of all lora_up tensor mean-absolute values. Elevated "
              "values suggest aggressive or excessive training that may burn in style and reduce "
              "prompt responsiveness."),
+            ("Module Analysis",
+             "Checks 7 and 8 (Dead Layers and Layer Balance) run per architectural module, not "
+             "globally. The LoRA network is split into 4 groups based on tensor key names:\n\n"
+             "  UNet Cross-Attention (attn2) — text conditioning layers. These receive the "
+             "prompt embeddings and control what the image depicts. In AI-Toolkit training, "
+             "to_k and to_v projections are intentionally left near-zero — the trainer focuses "
+             "weight on to_q and to_out. This is by design, not a defect. The checker compares "
+             "layers within cross-attention only, so this normal variation does not affect the "
+             "self-attention or feedforward results.\n\n"
+             "  UNet Self-Attention (attn1) — spatial relationship layers. These handle how "
+             "image regions relate to each other (structure, composition). All four projections "
+             "(to_q, to_k, to_v, to_out) are expected to be active.\n\n"
+             "  UNet Feedforward (ff_net / geglu) — channel mixing layers located between "
+             "attention blocks. Responsible for non-linear feature transformation.\n\n"
+             "  Text Encoder (lora_te*, lora_te1*, lora_te2*) — modifies how the model "
+             "interprets text tokens. SDXL has two encoders (CLIP-L and OpenCLIP-G); "
+             "both are grouped here.\n\n"
+             "Comparing layers across groups is meaningless — they operate in different "
+             "dimensional spaces with different magnitude scales. Per-group comparison makes "
+             "the balance thresholds structurally tight and the dead-layer check accurate."),
             ("7.  Dead Layers  (per module)",
              "Within each architectural group, identifies lora_up layers whose mean absolute "
              "value is below the dead threshold. A dead layer contributes nothing to the output "
              "and indicates a collapsed or untrained module."),
             ("8.  Layer Balance  (per module)",
-             "Computes max(mean_abs) / min(mean_abs) within each architectural group:\n\n"
-             "  • UNet Cross-Attention  — attn2 layers (text conditioning)\n"
-             "  • UNet Self-Attention   — attn1 layers (spatial relationships)\n"
-             "  • UNet Feedforward      — ff_net layers (channel mixing)\n"
-             "  • Text Encoder          — TE / TE1 / TE2 layers\n\n"
+             "Computes max(mean_abs) / min(mean_abs) within each architectural group. "
              "Layers in the same group perform the same function at different UNet depths, so "
              "wide magnitude imbalance within a group is genuinely abnormal — unlike a "
              "global comparison across architecturally incompatible modules.\n\n"
-             "Standard warn/fail thresholds: 30x / 100x (much tighter than any global metric)."),
+             "Note: cross-attention balance is evaluated only across active layers. Near-zero "
+             "to_k / to_v (AI-Toolkit default) are counted as dead, not as imbalance — "
+             "preventing false balance failures on otherwise healthy AI-Toolkit LoRAs."),
+            ("Batch Compare",
+             "The Batch Compare tab analyses every .safetensors file in a folder and "
+             "ranks them so you can pick the best checkpoint from a training run.\n\n"
+             "How to use:\n"
+             "  1. Click Browse and select your training output folder.\n"
+             "  2. The button shows how many .safetensors files were found.\n"
+             "  3. Click Compare All. A progress bar tracks each file as it is analysed.\n"
+             "  4. When complete, the Best Candidate banner shows the top-ranked file "
+             "with a Copy Path button and an Open in Analyze button.\n"
+             "  5. The full ranking table below lists every file with its overall status, "
+             "magnitude, dead layer count, and score.\n"
+             "  6. Click Open ↗ on any row to load that file into the Analyze tab for "
+             "the full per-module breakdown.\n\n"
+             "Scoring (lower is better):\n"
+             "  · NaN / Inf present → score ∞, disqualified (never selected as best).\n"
+             "  · Each fail check adds 100 pts; each warn adds 20 pts.\n"
+             "    Overbaked and Rank Consistency failures are weighted more heavily.\n"
+             "  · Global mean magnitude contributes a continuous penalty "
+             "(magnitude × 500), so two files with the same check statuses are "
+             "separated by how far into the warn/fail zone their magnitude sits.\n"
+             "  · Dead layers add 10 pts each.\n"
+             "  · Extreme layer balance (above 50×) adds a small continuous penalty.\n\n"
+             "The score is a relative ranking tool, not an absolute quality number. "
+             "Two files both scoring 0 are equally healthy — use the Analyze tab to "
+             "inspect the module details and make the final call."),
             ("Threshold Presets",
              "Strict:    tight bounds, flags anything outside high-quality training range.\n"
              "Standard:  community-recommended defaults, practical for most LoRAs.\n"
@@ -970,7 +1471,8 @@ class HealthPage(QWidget):
             body_lbl = QLabel(body)
             body_lbl.setWordWrap(True)
             body_lbl.setStyleSheet(
-                f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px; background:transparent;")
+                f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
             sl.addWidget(body_lbl)
             layout.addWidget(sec)
 
@@ -1022,7 +1524,7 @@ class HealthPage(QWidget):
         self._thread.start()
 
     def cleanup(self):
-        """Disconnect any in-flight worker before the widget is deleted."""
+        """Disconnect any in-flight workers before the widget is deleted."""
         if self._worker is not None:
             try:
                 self._worker.finished.disconnect()
@@ -1030,6 +1532,14 @@ class HealthPage(QWidget):
             except RuntimeError:
                 pass
             self._worker = None
+        if self._batch_worker is not None:
+            self._batch_worker.stop()
+            try:
+                self._batch_worker.progress.disconnect()
+                self._batch_worker.finished.disconnect()
+            except RuntimeError:
+                pass
+            self._batch_worker = None
 
     def _on_analysis_done(self, result: dict):
         self._run_btn.setEnabled(True)
