@@ -784,15 +784,17 @@ def _compute_rank_efficiency(tensors: dict, up_keys: list[str],
 
 # ── Plain-language rank verdict ───────────────────────────────────────────────
 
-def _rank_verdict(rank_efficiency: dict, log_data: dict | None = None) -> tuple:
+def _rank_verdict(rank_efficiency: dict, log_data: dict | None = None,
+                  declared_rank: int | None = None) -> tuple:
     """Return (verdict_text, color) or (None, None) if data unavailable.
 
     Decision tree:
-      - Saturated (≥88%) + steep spectrum (Q2 ≥ 90%) → Balanced rank (concept
-        fits naturally; saturation is expected, not a constraint)
-      - Saturated (≥88%) + flat/unknown spectrum      → May benefit from higher rank
-      - Mid-range (45–87%)                            → Balanced rank
-      - Low utilization (<45%)                        → May benefit from lower rank
+      - Saturated (≥88%) + steep spectrum (Q2 ≥ 90%) → Balanced rank
+      - Saturated (≥88%) + declared rank ≥ 128        → Balanced rank
+        (at practical ceiling — 256 is not a meaningful recommendation)
+      - Saturated (≥88%) + flat/unknown spectrum       → May benefit from higher rank
+      - Mid-range (45–87%)                             → Balanced rank
+      - Low utilization (<45%)                         → May benefit from lower rank
     """
     mean_eff = rank_efficiency.get("mean_efficiency")
     if mean_eff is None:
@@ -800,7 +802,7 @@ def _rank_verdict(rank_efficiency: dict, log_data: dict | None = None) -> tuple:
     spectral = rank_efficiency.get("spectral") or {}
     q2 = spectral.get("q2")
     if mean_eff >= 0.88:
-        if q2 is not None and q2 >= 0.90:
+        if (q2 is not None and q2 >= 0.90) or (declared_rank is not None and declared_rank >= 128):
             return "Balanced rank", GRN
         return "May benefit from higher rank", AMB
     if mean_eff >= 0.45:
@@ -1682,9 +1684,11 @@ class HealthPage(QWidget):
                 spec_row.addStretch(1)
                 wl.addLayout(spec_row)
 
+            _best_rank = int(best_meta.get("rank") or 0) or None
             verdict_text, verdict_color = _rank_verdict(
                 best_result.get("rank_efficiency", {}),
                 best_result.get("log_data"),
+                declared_rank=_best_rank,
             )
             if verdict_text:
                 vrow = QHBoxLayout()
@@ -2411,9 +2415,11 @@ class HealthPage(QWidget):
             grid.addWidget(_lbl(lv, PRI, FONT_SM), row, col_base + 1)
         ml.addLayout(grid)
 
+        _declared_rank = int(meta.get("rank") or 0) or None
         verdict_text, verdict_color = _rank_verdict(
             result.get("rank_efficiency", {}),
             result.get("log_data"),
+            declared_rank=_declared_rank,
         )
         if verdict_text:
             vrow = QHBoxLayout()
