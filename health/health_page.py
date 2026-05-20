@@ -646,6 +646,9 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         default=1.0,
     )
 
+    # ── 9. Rank efficiency (SVD) ─────────────────────────────────────────────
+    rank_efficiency = _compute_rank_efficiency(tensors, up_keys)
+
     # ── AI Toolkit log analysis ───────────────────────────────────────────────
     log_data: dict = {}
     if trainer == "aitoolkit":
@@ -661,18 +664,69 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
                     log_data.get("checkpoint_losses", {}).get(ckpt_step)
 
     return {
-        "overall":       overall,
-        "checks":        checks,
-        "module_groups": module_results,
-        "meta":          meta_summary,
-        "model_type":    model_type,
-        "trainer":       trainer,
-        "log_data":      log_data,
+        "overall":         overall,
+        "checks":          checks,
+        "module_groups":   module_results,
+        "meta":            meta_summary,
+        "model_type":      model_type,
+        "trainer":         trainer,
+        "log_data":        log_data,
+        "rank_efficiency": rank_efficiency,
         "metrics": {
-            "mean_mag":      _global_mag,
-            "total_dead":    _total_dead,
-            "worst_balance": _worst_bal,
+            "mean_mag":        _global_mag,
+            "total_dead":      _total_dead,
+            "worst_balance":   _worst_bal,
+            "mean_efficiency": rank_efficiency.get("mean_efficiency"),
         },
+    }
+
+
+# ── Rank efficiency via SVD ───────────────────────────────────────────────────
+
+def _compute_rank_efficiency(tensors: dict, up_keys: list[str],
+                             threshold: float = 0.01) -> dict:
+    """SVD-based rank efficiency per layer and per module group.
+
+    For each lora_down [r, in], computes singular values and counts how many
+    exceed 1% of the largest one.  effective_rank / declared_rank = efficiency.
+
+    Returns {"mean_efficiency": float, "groups": {mod: float}} or {} on failure.
+    Uses lora_down only (smallest matrix in the pair; sufficient for inter-
+    checkpoint comparison where rank and architecture are identical).
+    """
+    import torch
+
+    layer_effs: list[float]             = []
+    group_effs: dict[str, list[float]]  = {}
+
+    for uk in up_keys:
+        dk = uk.replace("lora_up", "lora_down")
+        if dk not in tensors:
+            continue
+        down = tensors[dk]
+        if down.ndim != 2:
+            continue
+        r = down.shape[0]
+        if r < 2:
+            continue
+        try:
+            S     = torch.linalg.svdvals(down.float())
+            s_max = S[0].item()
+            if s_max == 0:
+                continue
+            eff_rank   = int((S > s_max * threshold).sum().item())
+            efficiency = eff_rank / r
+            mod = _classify_key(uk)
+            group_effs.setdefault(mod, []).append(efficiency)
+            layer_effs.append(efficiency)
+        except Exception:
+            continue
+
+    if not layer_effs:
+        return {}
+    return {
+        "mean_efficiency": sum(layer_effs) / len(layer_effs),
+        "groups": {mod: sum(e) / len(e) for mod, e in group_effs.items()},
     }
 
 
@@ -697,31 +751,34 @@ def _score_result(result: dict, profile: str = "concept",
         step_ratio = min(1.0, checkpoint_step / total_steps)
 
     mag_frac = min(1.0, mean_mag / mag_warn) if mag_warn > 0 else 0.0
+    eff      = m.get("mean_efficiency")   # None if SVD was unavailable
 
     if profile == "identity":
         # Hard disqualify: overbaked LoRA overpowers other LoRAs
         if mean_mag >= mag_fail:
             return float("inf")
-        # Prefer: latest checkpoint (strong step weight), highest safe magnitude
-        # step 0→100 pts  ·  mag 0 (at warn) → 40 pts (near zero)  ·  dead 15 pts each
-        return (1.0 - step_ratio) * 100 + (1.0 - mag_frac) * 40 + dead * 15
+        # Prefer: latest checkpoint, highest safe magnitude, highest rank efficiency
+        # step 0→100  ·  mag 0 (at warn)→40 (near zero)  ·  eff 0%→30  ·  dead 15 each
+        eff_penalty = (1.0 - eff) * 30 if eff is not None else 15.0
+        return (1.0 - step_ratio) * 100 + (1.0 - mag_frac) * 40 + dead * 15 + eff_penalty
 
     if profile == "outfit":
         # Hard disqualify: overbaked outfit bleeds into skin/hair/character
         if mean_mag >= mag_fail:
             return float("inf")
-        # Prefer: moderate-to-late steps, magnitude sweet spot ~65% of warn
-        # Deviation from sweet spot is penalised from both sides
-        sweet    = 0.65 * mag_warn
-        mag_dev  = abs(mean_mag - sweet) / mag_warn if mag_warn > 0 else 0.0
-        return (1.0 - step_ratio) * 60 + mag_dev * 50 + dead * 12
+        # Prefer: moderate-to-late steps, magnitude sweet spot ~65% of warn, good efficiency
+        sweet       = 0.65 * mag_warn
+        mag_dev     = abs(mean_mag - sweet) / mag_warn if mag_warn > 0 else 0.0
+        eff_penalty = (1.0 - eff) * 20 if eff is not None else 10.0
+        return (1.0 - step_ratio) * 60 + mag_dev * 50 + dead * 12 + eff_penalty
 
     if profile == "style":
         # Hard disqualify: overbaked style flattens all outputs
         if mean_mag >= mag_fail:
             return float("inf")
-        # Prefer: lower magnitude (subtle influence), mild step preference
-        return (1.0 - step_ratio) * 25 + mag_frac * 60 + dead * 10
+        # Prefer: lower magnitude (subtle influence), mild step preference, decent efficiency
+        eff_penalty = (1.0 - eff) * 15 if eff is not None else 7.5
+        return (1.0 - step_ratio) * 25 + mag_frac * 60 + dead * 10 + eff_penalty
 
     # ── Concept / Pose (default) ──────────────────────────────────────────────
     # Concepts and poses are learned quickly; step count is not decisive.
@@ -738,6 +795,7 @@ def _score_result(result: dict, profile: str = "concept",
     worst  = m.get("worst_balance", 1.0) or 1.0
     if worst != float("inf"):
         score += max(0.0, worst - 50.0) * 0.3
+    score += (1.0 - eff) * 25 if eff is not None else 0.0   # rank efficiency penalty
     return score
 
 
@@ -1489,10 +1547,13 @@ class HealthPage(QWidget):
             spi_part  = ""
             if folder_log_data.get("steps_per_image") is not None:
                 spi_part = f"  ·  {folder_log_data['steps_per_image']:.0f} steps/img"
+            best_eff  = m.get("mean_efficiency")
+            eff_part  = f"  ·  Rank eff: {best_eff:.0%}" if best_eff is not None else ""
             detail_row.addWidget(_lbl(
                 f"Score: {best_score:.1f}  ·  "
                 f"Magnitude: {m.get('mean_mag', 0):.5f}  ·  "
-                f"Dead layers: {m.get('total_dead', 0)}  ·  "
+                f"Dead layers: {m.get('total_dead', 0)}"
+                f"{eff_part}  ·  "
                 f"{best_meta['model_type']}  rank {best_meta['rank']}"
                 f"{loss_part}{spi_part}",
                 SEC, FONT_SM))
@@ -2275,9 +2336,11 @@ class HealthPage(QWidget):
             chr_.addWidget(_lbl("Layers", SEC, FONT_SM, bold=True), stretch=0)
             chr_.addWidget(_lbl("Mean abs", SEC, FONT_SM, bold=True), stretch=1)
             chr_.addWidget(_lbl("Balance", SEC, FONT_SM, bold=True), stretch=1)
+            chr_.addWidget(_lbl("Eff %", SEC, FONT_SM, bold=True), stretch=1)
             chr_.addWidget(_lbl("Notes", SEC, FONT_SM, bold=True), stretch=3)
             mcl.addWidget(col_hdr)
 
+            rank_eff_groups = result.get("rank_efficiency", {}).get("groups", {})
             display_order = MODULE_GROUPS + ["unet_other"]
             for i, mod in enumerate(display_order):
                 if mod not in module_groups:
@@ -2315,6 +2378,13 @@ class HealthPage(QWidget):
                 else:
                     bal_str, bal_color = "—", MUT
                 rl.addWidget(_lbl(bal_str, bal_color, FONT_SM), stretch=1)
+
+                grp_eff = rank_eff_groups.get(mod)
+                eff_str   = f"{grp_eff:.0%}" if grp_eff is not None else "—"
+                eff_color = (GRN if grp_eff is not None and grp_eff >= 0.6 else
+                             AMB if grp_eff is not None and grp_eff >= 0.35 else
+                             RED if grp_eff is not None else MUT)
+                rl.addWidget(_lbl(eff_str, eff_color, FONT_SM), stretch=1)
 
                 notes = ", ".join(grp["issues"]) if grp["issues"] else "—"
                 notes_lbl = QLabel(notes)
