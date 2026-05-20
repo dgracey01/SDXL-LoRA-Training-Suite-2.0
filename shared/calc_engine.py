@@ -124,7 +124,7 @@ HELP_CONTENT = {
         ("Caption Dropout",    "Rate at which captions are randomly dropped during training: Character/Concept=0.05, Outfit=0.08, Style/Pose=0.10."),
         ("Grad Accum",         "Gradient accumulation. Inverted curve — smaller datasets get lower accum for more frequent updates: ≤100=1, ≤300=2, ≤700=3, >700=4."),
         ("Eff Batch",          "Effective batch = Batch Size × Grad Accum. This is the actual gradient update frequency."),
-        ("Linear Rank",        "LoRA network dimension. Auto (type-aware): character/concept=32 flat; style=32 (≤200 imgs) / 64 (>200 imgs); outfit/pose=16."),
+        ("Linear Rank",        "LoRA network dimension. Auto scales with dataset size: character=32/64/128 (≤50/≤150/>150 imgs); concept=32/64 (≤100/>100 imgs); style=32/64 (≤200/>200 imgs); outfit=16/32 (≤50/>50 imgs); pose=16 flat."),
         ("Conv Rank",          "Convolutional rank. Derived from Linear Rank: Character/Concept/Style=50%, Outfit=40%, Pose=35%. Clamped 2–32."),
         ("ETS Signal",         "Effective Training Signal. Compares actual TOS/image against target with 5% tolerance. Good/Underfit/Overfit."),
         ("Suggested Factor",   "The R2 factor value needed to bring ETS back to Good. Copy into Manual Factor field."),
@@ -371,14 +371,25 @@ def lin_rank(imgs: int, rc: str = "auto", lt: str = "character") -> int:
     presets = {"min": 16, "outfit": 20, "default": 32, "large": 64, "xlarge": 128, "max": 256}
     if rc.lower() in presets:
         return presets[rc.lower()]
-    if lt in ("character", "concept"):
-        return 32                          # flat — community sweet spot regardless of dataset size
+    if lt == "character":
+        # Photos/character datasets are information-dense and fill rank slots at scale.
+        # SVD analysis confirms flat spectral spread — rank is the limiting factor for
+        # large datasets with outfit/expression/background variation.
+        if imgs <= 50:   return 32
+        if imgs <= 150:  return 64
+        return 128
+    elif lt == "concept":
+        # Concepts are simpler (object/idea, less variation than a full character).
+        if imgs <= 100:  return 32
+        return 64
     elif lt == "style":
-        return 32 if imgs <= 200 else 64   # style benefits from higher rank at scale
+        return 32 if imgs <= 200 else 64   # existing — style benefits from rank at scale
     elif lt == "outfit":
-        return 16                          # garment details captured efficiently at low rank
+        # Garment details at scale need more rank to capture texture and cut variation.
+        if imgs <= 50:   return 16
+        return 32
     else:                                  # pose
-        return 16                          # geometric patterns need minimal rank
+        return 16                          # geometric patterns are naturally low-dimensional
 
 
 def conv_rank(lt: str, lr: int) -> int:
