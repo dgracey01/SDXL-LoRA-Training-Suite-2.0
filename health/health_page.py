@@ -291,6 +291,8 @@ _LOG_STEP_RE    = re.compile(r'\|\s*(\d+)/(\d+)\s*\[.*?loss:\s*([\d.e+\-]+)\]')
 _LOG_PREPROC_RE = re.compile(r'0/(\d+)\s*\[')
 _LOG_SAVE_RE    = re.compile(r'^Saving at step (\d+)')
 _CKPT_STEP_RE   = re.compile(r'_(\d{9})\.safetensors$')
+_LOG_BATCH_RE   = re.compile(r'"batch_size"\s*:\s*(\d+)')
+_LOG_ACCUM_RE   = re.compile(r'"gradient_accumulation"\s*:\s*(\d+)')
 
 
 def _get_checkpoint_step(filename: str) -> int | None:
@@ -314,9 +316,20 @@ def _parse_aitk_log(log_path: str) -> dict:
         total_from_log: int | None = None
         save_steps:    list[int]  = []
         in_preprocess  = False
+        batch_size     = 1
+        grad_accum     = 1
 
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+            for line_num, line in enumerate(f):
+                # Batch config — JSON header in the first ~150 lines of log
+                if line_num < 150:
+                    m = _LOG_BATCH_RE.search(line)
+                    if m:
+                        batch_size = int(m.group(1))
+                    m = _LOG_ACCUM_RE.search(line)
+                    if m:
+                        grad_accum = int(m.group(1))
+
                 # Image count — from the progress bar right after "Preprocessing image"
                 if "Preprocessing image" in line:
                     in_preprocess = True
@@ -367,10 +380,16 @@ def _parse_aitk_log(log_path: str) -> dict:
         checkpoint_losses = {s: _window_avg(s) for s in all_ckpt_steps}
 
         total_steps = total_from_log or final_step
+        eff_batch   = batch_size * grad_accum
+        actual_tos  = (total_steps * eff_batch / image_count) if image_count else None
         return {
             "image_count":       image_count,
             "total_steps":       total_steps,
             "steps_per_image":   total_steps / image_count if image_count else None,
+            "batch_size":        batch_size,
+            "grad_accum":        grad_accum,
+            "eff_batch":         eff_batch,
+            "actual_tos":        actual_tos,
             "start_loss":        losses[0],
             "end_loss":          losses[-1],
             "q1_avg":            q1_avg,
@@ -1625,8 +1644,8 @@ class HealthPage(QWidget):
             best_ckpt_loss = _ckpt_loss(best_path)
             loss_part = f"  ·  Loss: {best_ckpt_loss:.4f}" if best_ckpt_loss is not None else ""
             spi_part  = ""
-            if folder_log_data.get("steps_per_image") is not None:
-                spi_part = f"  ·  {folder_log_data['steps_per_image']:.0f} steps/img"
+            if folder_log_data.get("actual_tos") is not None:
+                spi_part = f"  ·  TOS {folder_log_data['actual_tos']:.0f}"
             best_eff  = m.get("mean_efficiency")
             eff_part  = f"  ·  Rank eff: {best_eff:.0%}" if best_eff is not None else ""
             detail_row.addWidget(_lbl(
@@ -2169,11 +2188,14 @@ class HealthPage(QWidget):
              "When Trainer is set to AI Toolkit (or auto-detected as such) and a "
              "log.txt file is found alongside the LoRA file, the tool parses the "
              "training log and displays a summary card below the module analysis.\n\n"
-             "Dataset / Steps / Steps per image:\n"
+             "Dataset / Steps / TOS:\n"
              "  Image count is read from the latent preprocessing progress bar in the "
-             "log. Steps per image = total_steps / image_count. Healthy range is "
-             "roughly 80–400 steps per image for a character LoRA — below 80 may be "
-             "undertrained; above 400 risks memorisation.\n\n"
+             "log. TOS (Training Optimization Signal) = total_steps × batch_size × "
+             "gradient_accumulation / image_count — how many times each image is seen "
+             "during training. batch_size and gradient_accumulation are read from the "
+             "config header at the top of log.txt. Typical targets: character 150, "
+             "style 240, outfit 113, pose 130, concept 48. "
+             "Below 30 may be undertrained; above 600 risks memorisation.\n\n"
              "Loss trend  (Q1 avg vs Q4 avg):\n"
              "  The log contains a loss value at every training step. The tool computes "
              "the mean loss for the first and last quarters of training. If Q4 < Q1 by "
@@ -2561,19 +2583,23 @@ class HealthPage(QWidget):
 
             img_count   = log_data.get("image_count")
             total_steps = log_data.get("total_steps")
-            spi         = log_data.get("steps_per_image")
-            if spi is not None:
-                spi_flag = ("  — may be undertrained" if spi < 80 else
-                            "  — overfit risk"        if spi > 400 else "")
-                spi_str = f"{spi:.0f}{spi_flag}"
+            tos         = log_data.get("actual_tos")
+            eb          = log_data.get("eff_batch", 1)
+            if tos is not None:
+                tos_flag  = ("  — may be undertrained" if tos < 30 else
+                             "  — overfit risk"        if tos > 600 else "")
+                tos_color = AMB if tos_flag else SEC
+                tos_str   = f"{tos:.0f}{tos_flag}"
             else:
-                spi_str = "?"
+                tos_color = SEC
+                tos_str   = "?"
             row1 = QHBoxLayout()
             row1.addWidget(_lbl(
                 f"Dataset: {img_count or '?'} images     "
-                f"Steps: {total_steps or '?'}     "
-                f"Steps / image: {spi_str}",
+                f"Steps: {total_steps or '?'}  (eff. batch: {eb})     "
+                f"TOS: ",
                 SEC, FONT_SM))
+            row1.addWidget(_lbl(tos_str, tos_color, FONT_SM))
             row1.addStretch(1)
             ll.addLayout(row1)
 
