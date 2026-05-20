@@ -663,6 +663,40 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
                 log_data["this_checkpoint_loss"] = \
                     log_data.get("checkpoint_losses", {}).get(ckpt_step)
 
+    # ── 10. Rank saturation ───────────────────────────────────────────────────
+    mean_eff = rank_efficiency.get("mean_efficiency")
+    if mean_eff is not None and mean_eff >= 0.88:
+        plateaued = not log_data.get("converged", True)   # no log → assume unknown
+        has_log   = bool(log_data)
+
+        if has_log and plateaued:
+            q1 = log_data.get("q1_avg", 0)
+            q4 = log_data.get("q4_avg", 0)
+            sat_detail = (
+                f"Rank efficiency {mean_eff:.0%} with loss plateau confirmed "
+                f"(Q1 {q1:.4f} → Q4 {q4:.4f}) — declared rank is a bottleneck. "
+                f"Retrain at higher rank for better detail capture.")
+            sat_status = "warn"
+        elif mean_eff >= 0.93:
+            sat_detail = (
+                f"Rank efficiency {mean_eff:.0%} — nearly all rank dimensions in use. "
+                f"Likely bottleneck; loss log unavailable to confirm plateau.")
+            sat_status = "warn"
+        else:
+            sat_detail = (
+                f"Rank efficiency {mean_eff:.0%} — rank dimensions heavily utilized. "
+                f"Monitor loss trend; higher rank may improve detail capture.")
+            sat_status = "info"
+
+        checks.append({"id": "rank_saturation", "label": "Rank Saturation",
+                       "status": sat_status, "detail": sat_detail})
+
+        # Update overall to include the new check
+        all_statuses = ([c["status"] for c in checks] +
+                        [g["status"] for g in module_results.values()])
+        overall = ("fail" if "fail" in all_statuses else
+                   "warn" if "warn" in all_statuses else "pass")
+
     return {
         "overall":         overall,
         "checks":          checks,
@@ -2084,6 +2118,25 @@ class HealthPage(QWidget):
              "LoRA file (AI Toolkit leaves one there). If absent, it falls back to tensor "
              "key heuristics — conv LoRA keys with no kohya hash metadata → AI Toolkit. "
              "Override if the detection is incorrect."),
+            ("Rank Saturation",
+             "Rank saturation is the opposite problem to overbaking — the declared rank "
+             "was too small for the dataset, not too large.\n\n"
+             "Detected when rank efficiency (from SVD) reaches 88% or higher, meaning "
+             "nearly every rank dimension is carrying signal and the model had no spare "
+             "capacity. The optimizer cannot improve further no matter how many steps "
+             "are run — detail is lost because there is nowhere to store it.\n\n"
+             "Severity:\n"
+             "  Warn + loss plateau confirmed:  rank was definitely the bottleneck. "
+             "The loss stopped improving while rank dimensions were fully occupied.\n"
+             "  Warn (no log):  efficiency ≥ 93% — very likely saturated.\n"
+             "  Info:  efficiency 88–92% — possible saturation; worth monitoring.\n\n"
+             "Rank saturation does not affect Batch Compare rankings within a single "
+             "training run since all checkpoints share the same rank setting and will "
+             "all receive the same flag. It is a training configuration diagnostic, "
+             "not a checkpoint quality differentiator.\n\n"
+             "Resolution: retrain the subject at a higher rank (e.g. double it) and "
+             "compare rank efficiency of both runs. If the higher-rank run shows 55–75% "
+             "efficiency, the new rank is well-sized for your dataset."),
             ("Recommendation Profile",
              "The Profile selector changes how the Batch Compare ranking score is computed. "
              "Select the profile that matches what you trained.\n\n"
