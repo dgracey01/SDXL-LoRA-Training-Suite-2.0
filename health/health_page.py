@@ -20,6 +20,8 @@ Loads a .safetensors LoRA file and runs 8 checks grouped by architectural module
 from __future__ import annotations
 
 import os
+import re
+import statistics
 import threading
 
 from PySide6.QtCore    import Qt, QObject, Signal
@@ -178,10 +180,14 @@ THRESHOLD_PRESETS: dict[str, dict[str, dict[str, float]]] = {
 }
 
 DEFAULTS: dict = {
-    "sd15_preset":    "Standard",
-    "sdxl_preset":    "Standard",
-    "sd15_overrides": {k: "" for k in THRESHOLD_LABELS},
-    "sdxl_overrides": {k: "" for k in THRESHOLD_LABELS},
+    "sd15_preset":       "Standard",
+    "sdxl_preset":       "Standard",
+    "sd15_overrides":    {k: "" for k in THRESHOLD_LABELS},
+    "sdxl_overrides":    {k: "" for k in THRESHOLD_LABELS},
+    "model_type":        "Auto-detect",
+    "trainer":           "Auto-detect",
+    "batch_model_type":  "Auto-detect",
+    "batch_trainer":     "Auto-detect",
 }
 
 
@@ -230,15 +236,19 @@ class _AnalysisWorker(QObject):
     finished = Signal(dict)
     error    = Signal(str)
 
-    def __init__(self, path: str, get_threshold_fn, model_type_override: str | None = None):
+    def __init__(self, path: str, get_threshold_fn,
+                 model_type_override: str | None = None,
+                 trainer_override: str | None = None):
         super().__init__()
-        self._path          = path
-        self._get_fn        = get_threshold_fn
-        self._type_override = model_type_override
+        self._path             = path
+        self._get_fn           = get_threshold_fn
+        self._type_override    = model_type_override
+        self._trainer_override = trainer_override
 
     def run(self):
         try:
-            result = _analyse(self._path, self._get_fn, self._type_override)
+            result = _analyse(self._path, self._get_fn,
+                              self._type_override, self._trainer_override)
             self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -253,7 +263,128 @@ def _detect_model_type(keys: list[str]) -> str:
     return "sd15"
 
 
-def _analyse(path: str, get_threshold, model_type_override: str | None = None) -> dict:
+def _detect_trainer(path: str, keys: list[str], metadata: dict) -> str:
+    """Return 'aitoolkit' or 'kohya'. Checks config.yaml first, then tensor key heuristics."""
+    folder = os.path.dirname(path)
+    cfg_path = os.path.join(folder, "config.yaml")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                content = _f.read()
+            if "job: extension" in content or "diffusion_trainer" in content:
+                return "aitoolkit"
+        except Exception:
+            pass
+
+    # Heuristic: AI Toolkit produces conv LoRA keys, no kohya hash, no lora_te1_ prefix
+    has_conv    = any("_conv.lora_down" in k or "_conv.lora_up" in k for k in keys)
+    has_kohya_h = "sshs_model_hash" in metadata
+    has_te1     = any("lora_te1_" in k for k in keys)
+    if has_conv and not has_kohya_h and not has_te1:
+        return "aitoolkit"
+
+    return "kohya"
+
+
+_LOG_STEP_RE    = re.compile(r'\|\s*(\d+)/(\d+)\s*\[.*?loss:\s*([\d.e+\-]+)\]')
+_LOG_PREPROC_RE = re.compile(r'0/(\d+)\s*\[')
+_LOG_SAVE_RE    = re.compile(r'^Saving at step (\d+)')
+_CKPT_STEP_RE   = re.compile(r'_(\d{9})\.safetensors$')
+
+
+def _get_checkpoint_step(filename: str) -> int | None:
+    """Extract step number from AI Toolkit checkpoint filename, or None for the final file."""
+    m = _CKPT_STEP_RE.search(filename)
+    return int(m.group(1)) if m else None
+
+
+def _parse_aitk_log(log_path: str) -> dict:
+    """
+    Parse an AI Toolkit log.txt.  Returns a dict with:
+      image_count, total_steps, steps_per_image,
+      q1_avg, q4_avg, late_cv, converged,
+      checkpoint_losses {step: avg_loss},
+      final_step, start_loss, end_loss.
+    Returns {} on any failure.
+    """
+    try:
+        steps: dict[int, float] = {}
+        image_count:   int | None = None
+        total_from_log: int | None = None
+        save_steps:    list[int]  = []
+        in_preprocess  = False
+
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # Image count — from the progress bar right after "Preprocessing image"
+                if "Preprocessing image" in line:
+                    in_preprocess = True
+                if in_preprocess and image_count is None:
+                    m = _LOG_PREPROC_RE.search(line)
+                    if m and int(m.group(1)) > 10:   # filter 0/7 pipeline-load bars
+                        image_count = int(m.group(1))
+                        in_preprocess = False
+
+                # Loss curve — last value written for each step wins (tqdm duplication)
+                m = _LOG_STEP_RE.search(line)
+                if m:
+                    step  = int(m.group(1))
+                    total = int(m.group(2))
+                    loss  = float(m.group(3))
+                    steps[step] = loss
+                    if total_from_log is None:
+                        total_from_log = total
+
+                # Save events
+                m = _LOG_SAVE_RE.match(line.strip())
+                if m:
+                    save_steps.append(int(m.group(1)))
+
+        if not steps:
+            return {}
+
+        sorted_steps = sorted(steps.items())
+        losses       = [l for _, l in sorted_steps]
+        n            = len(losses)
+        q            = max(1, n // 4)
+        q4           = losses[3 * q:] or losses
+
+        q1_avg  = sum(losses[:q]) / q
+        q4_avg  = sum(q4) / len(q4)
+
+        last500 = [l for s, l in sorted_steps if s >= max(steps) - 500]
+        late_mean  = sum(last500) / len(last500) if last500 else 0.0
+        late_stdev = statistics.stdev(last500) if len(last500) > 1 else 0.0
+        late_cv    = late_stdev / late_mean if late_mean > 0 else 0.0
+
+        def _window_avg(step: int, w: int = 50) -> float | None:
+            nearby = [l for s, l in sorted_steps if abs(s - step) <= w]
+            return sum(nearby) / len(nearby) if nearby else None
+
+        final_step = max(steps)
+        all_ckpt_steps = set(save_steps) | {final_step}
+        checkpoint_losses = {s: _window_avg(s) for s in all_ckpt_steps}
+
+        total_steps = total_from_log or final_step
+        return {
+            "image_count":       image_count,
+            "total_steps":       total_steps,
+            "steps_per_image":   total_steps / image_count if image_count else None,
+            "start_loss":        losses[0],
+            "end_loss":          losses[-1],
+            "q1_avg":            q1_avg,
+            "q4_avg":            q4_avg,
+            "late_cv":           late_cv,
+            "converged":         q4_avg < q1_avg * 0.97,
+            "checkpoint_losses": checkpoint_losses,
+            "final_step":        final_step,
+        }
+    except Exception:
+        return {}
+
+
+def _analyse(path: str, get_threshold, model_type_override: str | None = None,
+             trainer_override: str | None = None) -> dict:
     """Load safetensors and run all checks. Returns result dict."""
     try:
         from safetensors import safe_open
@@ -269,7 +400,9 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
         for key in f.keys():
             tensors[key] = f.get_tensor(key).float()
 
-    model_type = model_type_override or _detect_model_type(list(tensors.keys()))
+    all_keys   = list(tensors.keys())
+    model_type = model_type_override or _detect_model_type(all_keys)
+    trainer    = trainer_override    or _detect_trainer(path, all_keys, metadata)
     checks: list[dict] = []
 
     # ── 1. File Integrity ─────────────────────────────────────────────────────
@@ -448,17 +581,23 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
             coldest = min(active_mags)
             balance_ratio = hottest / coldest if coldest > 0 else float("inf")
 
-            # Use per-module balance key; fall back to unet_self_attn for unet_other
-            base = mod if mod in MODULE_GROUPS else "unet_self_attn"
-            bal_w = get_threshold(model_type, f"{base}_bal_warn")
-            bal_f = get_threshold(model_type, f"{base}_bal_fail")
+            # AI Toolkit near-zeros to_k/to_v by design → cross-attn balance is a
+            # structural artifact, not a training defect. Display the value but
+            # do not flag it as warn/fail and do not count it toward the score.
+            if trainer == "aitoolkit" and mod == "unet_cross_attn":
+                issues.append(f"balance {balance_ratio:.1f}x (AI Toolkit — not scored)")
+            else:
+                # Use per-module balance key; fall back to unet_self_attn for unet_other
+                base = mod if mod in MODULE_GROUPS else "unet_self_attn"
+                bal_w = get_threshold(model_type, f"{base}_bal_warn")
+                bal_f = get_threshold(model_type, f"{base}_bal_fail")
 
-            if balance_ratio > bal_f:
-                status = _max_status(status, "fail")
-                issues.append(f"balance {balance_ratio:.1f}x (fail>{bal_f:.0f}x)")
-            elif balance_ratio > bal_w:
-                status = _max_status(status, "warn")
-                issues.append(f"balance {balance_ratio:.1f}x (warn>{bal_w:.0f}x)")
+                if balance_ratio > bal_f:
+                    status = _max_status(status, "fail")
+                    issues.append(f"balance {balance_ratio:.1f}x (fail>{bal_f:.0f}x)")
+                elif balance_ratio > bal_w:
+                    status = _max_status(status, "warn")
+                    issues.append(f"balance {balance_ratio:.1f}x (warn>{bal_w:.0f}x)")
 
         module_results[mod] = {
             "label":       MODULE_LABELS.get(mod, mod),
@@ -498,10 +637,27 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
 
     _global_mag = (sum(all_mags) / len(all_mags)) if all_mags else 0.0
     _total_dead = sum(g["dead_count"] for g in module_results.values())
+    # For AI Toolkit, exclude cross-attn balance from scoring — it's a structural artifact.
     _worst_bal  = max(
-        (g["balance"] for g in module_results.values() if g["balance"] is not None),
+        (g["balance"] for mod_k, g in module_results.items()
+         if g["balance"] is not None
+         and not (trainer == "aitoolkit" and mod_k == "unet_cross_attn")),
         default=1.0,
     )
+
+    # ── AI Toolkit log analysis ───────────────────────────────────────────────
+    log_data: dict = {}
+    if trainer == "aitoolkit":
+        log_path = os.path.join(os.path.dirname(path), "log.txt")
+        if os.path.isfile(log_path):
+            log_data = _parse_aitk_log(log_path)
+            if log_data:
+                ckpt_step = _get_checkpoint_step(os.path.basename(path))
+                if ckpt_step is None:
+                    ckpt_step = log_data.get("final_step")
+                log_data["this_checkpoint_step"] = ckpt_step
+                log_data["this_checkpoint_loss"] = \
+                    log_data.get("checkpoint_losses", {}).get(ckpt_step)
 
     return {
         "overall":       overall,
@@ -509,6 +665,8 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None) -
         "module_groups": module_results,
         "meta":          meta_summary,
         "model_type":    model_type,
+        "trainer":       trainer,
+        "log_data":      log_data,
         "metrics": {
             "mean_mag":      _global_mag,
             "total_dead":    _total_dead,
@@ -595,11 +753,12 @@ class _BatchWorker(QObject):
     progress = Signal(int, int, str)  # index (1-based), total, current filename
     finished = Signal(list)           # list of {path, result, error}
 
-    def __init__(self, paths: list, get_threshold_fn):
+    def __init__(self, paths: list, get_threshold_fn, trainer_override: str | None = None):
         super().__init__()
-        self._paths  = paths
-        self._get_fn = get_threshold_fn
-        self._stop   = False
+        self._paths            = paths
+        self._get_fn           = get_threshold_fn
+        self._trainer_override = trainer_override
+        self._stop             = False
 
     def stop(self):
         self._stop = True
@@ -612,7 +771,10 @@ class _BatchWorker(QObject):
                 break
             self.progress.emit(i + 1, total, os.path.basename(path))
             try:
-                out.append({"path": path, "result": _analyse(path, self._get_fn), "error": None})
+                out.append({"path": path,
+                            "result": _analyse(path, self._get_fn,
+                                               trainer_override=self._trainer_override),
+                            "error": None})
             except Exception as exc:
                 out.append({"path": path, "result": None, "error": str(exc)})
         self.finished.emit(out)
@@ -727,9 +889,22 @@ class HealthPage(QWidget):
         type_row.addWidget(_lbl("Model Type:"))
         self._type_combo = QComboBox()
         self._type_combo.addItems(["Auto-detect", "SD 1.5", "SDXL"])
+        self._type_combo.setCurrentText(self._cfg.get("model_type", "Auto-detect"))
         self._type_combo.setStyleSheet(_combo_style())
         self._type_combo.setFixedWidth(160)
+        self._type_combo.currentTextChanged.connect(
+            lambda v: self._save_combo("model_type", v))
         type_row.addWidget(self._type_combo)
+        type_row.addSpacing(16)
+        type_row.addWidget(_lbl("Trainer:"))
+        self._trainer_combo = QComboBox()
+        self._trainer_combo.addItems(["Auto-detect", "AI Toolkit", "Kohya / kohya-ss"])
+        self._trainer_combo.setCurrentText(self._cfg.get("trainer", "Auto-detect"))
+        self._trainer_combo.setStyleSheet(_combo_style())
+        self._trainer_combo.setFixedWidth(180)
+        self._trainer_combo.currentTextChanged.connect(
+            lambda v: self._save_combo("trainer", v))
+        type_row.addWidget(self._trainer_combo)
         type_row.addStretch(1)
 
         self._run_btn = QPushButton("▶  Analyze")
@@ -806,9 +981,22 @@ class HealthPage(QWidget):
         ctrl_row.addWidget(_lbl("Model Type:"))
         self._batch_type_combo = QComboBox()
         self._batch_type_combo.addItems(["Auto-detect", "SD 1.5", "SDXL"])
+        self._batch_type_combo.setCurrentText(self._cfg.get("batch_model_type", "Auto-detect"))
         self._batch_type_combo.setStyleSheet(_combo_style())
         self._batch_type_combo.setFixedWidth(160)
+        self._batch_type_combo.currentTextChanged.connect(
+            lambda v: self._save_combo("batch_model_type", v))
         ctrl_row.addWidget(self._batch_type_combo)
+        ctrl_row.addSpacing(16)
+        ctrl_row.addWidget(_lbl("Trainer:"))
+        self._batch_trainer_combo = QComboBox()
+        self._batch_trainer_combo.addItems(["Auto-detect", "AI Toolkit", "Kohya / kohya-ss"])
+        self._batch_trainer_combo.setCurrentText(self._cfg.get("batch_trainer", "Auto-detect"))
+        self._batch_trainer_combo.setStyleSheet(_combo_style())
+        self._batch_trainer_combo.setFixedWidth(180)
+        self._batch_trainer_combo.currentTextChanged.connect(
+            lambda v: self._save_combo("batch_trainer", v))
+        ctrl_row.addWidget(self._batch_trainer_combo)
         ctrl_row.addStretch(1)
 
         self._batch_run_btn = QPushButton("▶  Compare All")
@@ -908,7 +1096,11 @@ class HealthPage(QWidget):
         get_fn      = (lambda mt, k: self.get_threshold(forced_type, k)) \
                       if forced_type else self.get_threshold
 
-        self._batch_worker = _BatchWorker(files, get_fn)
+        trainer_sel    = self._batch_trainer_combo.currentText()
+        forced_trainer = {"AI Toolkit": "aitoolkit",
+                          "Kohya / kohya-ss": "kohya"}.get(trainer_sel)
+
+        self._batch_worker = _BatchWorker(files, get_fn, forced_trainer)
         self._batch_worker.progress.connect(self._on_batch_progress)
         self._batch_worker.finished.connect(self._on_batch_finished)
         self._batch_thread = threading.Thread(target=self._batch_worker.run, daemon=True)
@@ -951,6 +1143,22 @@ class HealthPage(QWidget):
     def _show_batch_results(self, results: list):
         STATUS_COLORS = {"pass": GRN, "warn": AMB, "fail": RED, "info": ACC}
         STATUS_ICONS  = {"pass": "✓", "warn": "⚠", "fail": "✗", "info": "ℹ"}
+
+        # Parse log.txt once for the folder (AI Toolkit training log)
+        folder_log_data: dict = {}
+        if results:
+            first_path = results[0]["path"]
+            log_path   = os.path.join(os.path.dirname(first_path), "log.txt")
+            if os.path.isfile(log_path):
+                folder_log_data = _parse_aitk_log(log_path)
+
+        def _ckpt_loss(path: str) -> float | None:
+            if not folder_log_data:
+                return None
+            step = _get_checkpoint_step(os.path.basename(path))
+            if step is None:
+                step = folder_log_data.get("final_step")
+            return folder_log_data.get("checkpoint_losses", {}).get(step)
 
         # Score and sort — errors go to the bottom
         scored = []
@@ -1004,11 +1212,17 @@ class HealthPage(QWidget):
             detail_row = QHBoxLayout()
             detail_row.setSpacing(20)
             m = best_result.get("metrics", {})
+            best_ckpt_loss = _ckpt_loss(best_path)
+            loss_part = f"  ·  Loss: {best_ckpt_loss:.4f}" if best_ckpt_loss is not None else ""
+            spi_part  = ""
+            if folder_log_data.get("steps_per_image") is not None:
+                spi_part = f"  ·  {folder_log_data['steps_per_image']:.0f} steps/img"
             detail_row.addWidget(_lbl(
                 f"Score: {best_score:.1f}  ·  "
                 f"Magnitude: {m.get('mean_mag', 0):.5f}  ·  "
                 f"Dead layers: {m.get('total_dead', 0)}  ·  "
-                f"{best_meta['model_type']}  rank {best_meta['rank']}",
+                f"{best_meta['model_type']}  rank {best_meta['rank']}"
+                f"{loss_part}{spi_part}",
                 SEC, FONT_SM))
             detail_row.addStretch(1)
 
@@ -1047,11 +1261,14 @@ class HealthPage(QWidget):
         hr = QHBoxLayout(header_row)
         hr.setContentsMargins(8, 4, 8, 4)
         hr.setSpacing(8)
+        show_loss_col = bool(folder_log_data)
         hr.addWidget(_lbl("#",          SEC, FONT_SM, bold=True), stretch=0)
         hr.addWidget(_lbl("File",       SEC, FONT_SM, bold=True), stretch=5)
         hr.addWidget(_lbl("Overall",    SEC, FONT_SM, bold=True), stretch=1)
         hr.addWidget(_lbl("Magnitude",  SEC, FONT_SM, bold=True), stretch=1)
         hr.addWidget(_lbl("Dead",       SEC, FONT_SM, bold=True), stretch=0)
+        if show_loss_col:
+            hr.addWidget(_lbl("Loss",   SEC, FONT_SM, bold=True), stretch=1)
         hr.addWidget(_lbl("Score ↓",    SEC, FONT_SM, bold=True), stretch=1)
         hr.addWidget(_lbl("",           SEC, FONT_SM),             stretch=1)
         tl.addWidget(header_row)
@@ -1116,6 +1333,20 @@ class HealthPage(QWidget):
                     f"color:{dead_color}; font-family:{FONT}; font-size:{FONT_SM}px;"
                     f" background:transparent; border:none;")
                 rl.addWidget(dead_lbl)
+
+                if show_loss_col:
+                    ckpt_lv = _ckpt_loss(entry["path"])
+                    all_losses = [_ckpt_loss(e["path"]) for e in results
+                                  if e["result"] is not None]
+                    all_losses = [v for v in all_losses if v is not None]
+                    best_lv = min(all_losses) if all_losses else None
+                    if ckpt_lv is not None:
+                        is_best_l = best_lv is not None and abs(ckpt_lv - best_lv) < 0.001
+                        loss_txt  = f"{ckpt_lv:.4f}{'  *' if is_best_l else ''}"
+                        lc        = GRN if is_best_l else SEC
+                    else:
+                        loss_txt, lc = "—", MUT
+                    rl.addWidget(_lbl(loss_txt, lc, FONT_SM), stretch=1)
 
                 score_txt = "∞ (disqualified)" if score == float("inf") else f"{score:.1f}"
                 rl.addWidget(_lbl(score_txt, MUT if score == float("inf") else SEC, FONT_SM), stretch=1)
@@ -1429,14 +1660,21 @@ class HealthPage(QWidget):
              "ranks them so you can pick the best checkpoint from a training run.\n\n"
              "How to use:\n"
              "  1. Click Browse and select your training output folder.\n"
-             "  2. The button shows how many .safetensors files were found.\n"
+             "  2. Set Model Type and Trainer (or leave both on Auto-detect).\n"
              "  3. Click Compare All. A progress bar tracks each file as it is analysed.\n"
              "  4. When complete, the Best Candidate banner shows the top-ranked file "
              "with a Copy Path button and an Open in Analyze button.\n"
-             "  5. The full ranking table below lists every file with its overall status, "
-             "magnitude, dead layer count, and score.\n"
+             "  5. The full ranking table lists every file with its overall status, "
+             "magnitude, dead layer count, checkpoint loss (if log.txt is present), "
+             "and score.\n"
              "  6. Click Open ↗ on any row to load that file into the Analyze tab for "
              "the full per-module breakdown.\n\n"
+             "Loss column (AI Toolkit):\n"
+             "  If a log.txt file is found in the folder, the tool parses the full loss "
+             "curve and shows a ±50-step window average for each checkpoint. The "
+             "checkpoint with the lowest average loss is highlighted green. This is a "
+             "separate signal from the tensor health score — a checkpoint can have a "
+             "healthy score but have been saved at a noisy spike in the loss curve.\n\n"
              "Scoring (lower is better):\n"
              "  · NaN / Inf present → score ∞, disqualified (never selected as best).\n"
              "  · Each fail check adds 100 pts; each warn adds 20 pts.\n"
@@ -1445,7 +1683,8 @@ class HealthPage(QWidget):
              "(magnitude × 500), so two files with the same check statuses are "
              "separated by how far into the warn/fail zone their magnitude sits.\n"
              "  · Dead layers add 10 pts each.\n"
-             "  · Extreme layer balance (above 50×) adds a small continuous penalty.\n\n"
+             "  · Extreme layer balance (above 50×) adds a small continuous penalty "
+             "(cross-attention balance is excluded for AI Toolkit LoRAs).\n\n"
              "The score is a relative ranking tool, not an absolute quality number. "
              "Two files both scoring 0 are equally healthy — use the Analyze tab to "
              "inspect the module details and make the final call."),
@@ -1459,6 +1698,43 @@ class HealthPage(QWidget):
              "Auto-detect checks for lora_te2_ keys (SDXL dual text encoder) and total "
              "lora_up layer count (>300 = SDXL). Use the Model Type dropdown if "
              "auto-detection is incorrect."),
+            ("Training Log  (AI Toolkit)",
+             "When Trainer is set to AI Toolkit (or auto-detected as such) and a "
+             "log.txt file is found alongside the LoRA file, the tool parses the "
+             "training log and displays a summary card below the module analysis.\n\n"
+             "Dataset / Steps / Steps per image:\n"
+             "  Image count is read from the latent preprocessing progress bar in the "
+             "log. Steps per image = total_steps / image_count. Healthy range is "
+             "roughly 80–400 steps per image for a character LoRA — below 80 may be "
+             "undertrained; above 400 risks memorisation.\n\n"
+             "Loss trend  (Q1 avg vs Q4 avg):\n"
+             "  The log contains a loss value at every training step. The tool computes "
+             "the mean loss for the first and last quarters of training. If Q4 < Q1 by "
+             "more than 3%, training is labelled 'still learning' (green) — the model "
+             "was actively improving at the end. If Q4 ≈ Q1, the run plateaued early "
+             "(amber). Late-stage noise is reported as a coefficient of variation % — "
+             "high CV (50–80%) is normal for this training setup and does not indicate "
+             "a problem.\n\n"
+             "Loss at this checkpoint:\n"
+             "  A ±50-step window average is computed around each checkpoint's save "
+             "step. This smooths out per-step noise and shows whether the checkpoint "
+             "was captured at a loss valley or a transient spike. The checkpoint with "
+             "the lowest window average is marked with * and shown in green. This is "
+             "visible in both the Analyze tab card and the Batch Compare loss column."),
+            ("Training Software",
+             "The Trainer selector adjusts the scoring rules to match how the training "
+             "tool structures its LoRA weights.\n\n"
+             "AI Toolkit:  Cross-attention balance is not scored. AI Toolkit intentionally "
+             "leaves to_k and to_v projections near-zero — this produces a mechanically "
+             "high hottest/coldest ratio in cross-attention that is not a defect. The "
+             "balance value is still shown for reference but does not contribute to the "
+             "score or the overall pass/warn/fail status. Dead layers and magnitude are "
+             "scored normally.\n\n"
+             "Kohya / kohya-ss:  All checks and balance thresholds apply as configured.\n\n"
+             "Auto-detect:  The tool checks for a config.yaml in the same folder as the "
+             "LoRA file (AI Toolkit leaves one there). If absent, it falls back to tensor "
+             "key heuristics — conv LoRA keys with no kohya hash metadata → AI Toolkit. "
+             "Override if the detection is incorrect."),
         ]
 
         for title, body in sections:
@@ -1514,10 +1790,18 @@ class HealthPage(QWidget):
         elif type_sel == "SDXL":
             forced_type = "sdxl"
 
+        trainer_sel = self._trainer_combo.currentText()
+        forced_trainer: str | None = None
+        if trainer_sel == "AI Toolkit":
+            forced_trainer = "aitoolkit"
+        elif trainer_sel == "Kohya / kohya-ss":
+            forced_trainer = "kohya"
+
         get_fn = (lambda mt, k: self.get_threshold(forced_type, k)) \
                  if forced_type else self.get_threshold
 
-        self._worker = _AnalysisWorker(self._current_file, get_fn, forced_type)
+        self._worker = _AnalysisWorker(self._current_file, get_fn,
+                                       forced_type, forced_trainer)
         self._worker.finished.connect(self._on_analysis_done)
         self._worker.error.connect(self._on_analysis_error)
         self._thread = threading.Thread(target=self._worker.run, daemon=True)
@@ -1565,6 +1849,7 @@ class HealthPage(QWidget):
         meta          = result["meta"]
         module_groups = result.get("module_groups", {})
         model_type    = result["model_type"]
+        trainer       = result.get("trainer", "kohya")
 
         STATUS_COLORS = {"pass": GRN, "warn": AMB, "fail": RED, "info": ACC}
         STATUS_ICONS  = {"pass": "✓", "warn": "⚠", "fail": "✗", "info": "ℹ"}
@@ -1580,8 +1865,11 @@ class HealthPage(QWidget):
             f"color:{PRI}; background:{badge_colors.get(overall, MUT)};"
             f" border-radius:6px; padding:6px 20px;"
             f" font-family:{FONT}; font-size:{FONT_LG}px; font-weight:bold;")
+        trainer_labels = {"aitoolkit": "AI Toolkit", "kohya": "Kohya"}
+        trainer_label  = trainer_labels.get(trainer, trainer)
         badge_row.addWidget(badge)
-        badge_row.addWidget(_lbl(f"Detected: {model_type.upper()}", SEC, FONT_MD))
+        badge_row.addWidget(_lbl(
+            f"Detected: {model_type.upper()}  ·  Trainer: {trainer_label}", SEC, FONT_MD))
         badge_row.addStretch(1)
         badge_w = QWidget()
         badge_w.setStyleSheet("background:transparent;")
@@ -1727,9 +2015,89 @@ class HealthPage(QWidget):
 
             self._results_layout.addWidget(mod_card)
 
+        # ── Training Log card (AI Toolkit only) ────────────────────────────
+        log_data = result.get("log_data", {})
+        if log_data:
+            log_card = QFrame()
+            log_card.setStyleSheet(_card_style())
+            ll = QVBoxLayout(log_card)
+            ll.setContentsMargins(16, 12, 16, 12)
+            ll.setSpacing(6)
+            ll.addWidget(_lbl("Training Log  (AI Toolkit)", PRI, FONT_MD, bold=True))
+
+            img_count   = log_data.get("image_count")
+            total_steps = log_data.get("total_steps")
+            spi         = log_data.get("steps_per_image")
+            if spi is not None:
+                spi_flag = ("  — may be undertrained" if spi < 80 else
+                            "  — overfit risk"        if spi > 400 else "")
+                spi_str = f"{spi:.0f}{spi_flag}"
+            else:
+                spi_str = "?"
+            row1 = QHBoxLayout()
+            row1.addWidget(_lbl(
+                f"Dataset: {img_count or '?'} images     "
+                f"Steps: {total_steps or '?'}     "
+                f"Steps / image: {spi_str}",
+                SEC, FONT_SM))
+            row1.addStretch(1)
+            ll.addLayout(row1)
+
+            q1 = log_data.get("q1_avg")
+            q4 = log_data.get("q4_avg")
+            cv = log_data.get("late_cv")
+            converged = log_data.get("converged", False)
+            if q1 is not None and q4 is not None:
+                trend_color = GRN if converged else AMB
+                cv_str = f"     Late noise: {cv * 100:.0f}% CV" if cv is not None else ""
+                trend_lbl = QLabel(
+                    f"Loss trend  Q1: {q1:.4f}  Q4: {q4:.4f}  "
+                    f"({'still learning' if converged else 'plateaued'})"
+                    + cv_str)
+                trend_lbl.setStyleSheet(
+                    f"color:{trend_color}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                    f" background:transparent;")
+                ll.addWidget(trend_lbl)
+
+            ckpt_loss = log_data.get("this_checkpoint_loss")
+            ckpt_step = log_data.get("this_checkpoint_step")
+            all_ckpt  = {s: v for s, v in log_data.get("checkpoint_losses", {}).items()
+                         if v is not None}
+            best_loss = min(all_ckpt.values()) if all_ckpt else None
+
+            if ckpt_loss is not None:
+                is_best   = best_loss is not None and abs(ckpt_loss - best_loss) < 0.001
+                note      = "  (lowest among checkpoints)" if is_best else ""
+                loss_lbl  = QLabel(
+                    f"Loss at step {ckpt_step} (50-step window avg): {ckpt_loss:.4f}{note}")
+                loss_lbl.setStyleSheet(
+                    f"color:{GRN if is_best else SEC}; font-family:{FONT};"
+                    f" font-size:{FONT_SM}px; background:transparent;")
+                ll.addWidget(loss_lbl)
+
+                if len(all_ckpt) > 1:
+                    ll.addWidget(_lbl("All checkpoints:", MUT, FONT_SM))
+                    tbl_row = QHBoxLayout()
+                    tbl_row.setSpacing(16)
+                    for s, lv in sorted(all_ckpt.items()):
+                        is_b = best_loss is not None and abs(lv - best_loss) < 0.001
+                        is_t = (s == ckpt_step)
+                        c    = GRN if is_b else (PRI if is_t else MUT)
+                        tbl_row.addWidget(_lbl(
+                            f"step {s}: {lv:.4f}{'  *' if is_b else ''}",
+                            c, FONT_SM))
+                    tbl_row.addStretch(1)
+                    ll.addLayout(tbl_row)
+
+            self._results_layout.addWidget(log_card)
+
     # ══════════════════════════════════════════════════════════════════════════
     # Threshold helpers
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _save_combo(self, key: str, value: str):
+        self._cfg[key] = value
+        save_json(HEALTH_CFG, self._cfg)
 
     def get_threshold(self, model_type: str, key: str) -> float:
         ov = str(self._cfg.get(f"{model_type}_overrides", {}).get(key, "")).strip()

@@ -61,12 +61,26 @@ Designed by **Zero** | Built by **Jarvis**
 - **Module Analysis** — breaks down Dead Layers and Layer Balance per architectural group:
   - UNet Cross-Attention (`attn2`) · UNet Self-Attention (`attn1`) · UNet Feedforward (`ff_net`) · Text Encoder (`lora_te*`)
   - Compares like-for-like layers within each group, so a near-zero `to_k`/`to_v` in cross-attention (normal for AI-Toolkit training) doesn't pollute the self-attention or feedforward result
+- **Training Software selector** — AI Toolkit / Kohya / Auto-detect:
+  - Auto-detect reads `config.yaml` in the same folder (AI Toolkit leaves one there), then falls back to tensor key heuristics
+  - **AI Toolkit mode:** cross-attention balance ratio is excluded from scoring — it is a structural artifact of how AI Toolkit initialises weights, not a defect. The value is still displayed for reference
+  - **Kohya mode:** all checks and balance thresholds apply as configured
+  - Selection is remembered between sessions
+- **Training Log analysis** (AI Toolkit) — when `log.txt` is present alongside the LoRA file:
+  - Dataset image count and steps/image (flags undertrained < 80 or overfit risk > 400)
+  - Loss trend: Q1 vs Q4 quarter averages — "still learning" or "plateaued"
+  - Loss at this specific checkpoint (±50-step window average)
+  - Late-stage noise as coefficient of variation %
+  - Full checkpoint loss table with the lowest-loss checkpoint marked
 - **Batch Compare** — point to a training output folder to rank all `.safetensors` candidates at once:
-  - Runs all 8 checks on every file in the background with a live progress bar
+  - Runs all checks on every file in the background with a live progress bar
   - Scores each candidate (lower = better): NaN/Inf → disqualified; penalty points for fail/warn checks, overbaked magnitude, dead layers, and layer imbalance
+  - **Loss column** — reads `log.txt` once for the folder and shows each checkpoint's window-averaged loss; lowest is highlighted green
+  - Winner banner shows steps/image and checkpoint loss alongside score and magnitude
   - Highlights the best candidate with a Copy Path button
   - **Open in Analyze ↗** on any row loads that file into the single-file tab for full module inspection
 - Auto-detects SD 1.5 vs SDXL; manual override via dropdown
+- Model Type and Trainer selections remembered between sessions
 - File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
 - Drag-and-drop file input
 - Configurable thresholds — Strict / Standard / Relaxed presets per model type, with per-threshold manual overrides (amber fields, same pattern as Calculator TOS)
