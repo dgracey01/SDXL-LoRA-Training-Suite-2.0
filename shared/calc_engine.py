@@ -82,7 +82,7 @@ WD = {"character": 0.01,  "concept": 0.01,  "style": 0.01,  "outfit": 0.01,  "po
 CD = {"character": 0.05,  "concept": 0.05,  "style": 0.10,  "outfit": 0.08,  "pose": 0.10}
 
 MAX_LOG         = 20
-IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.txt'}
+IMAGE_EXTS      = {'.jpg', '.jpeg', '.png', '.webp'}
 RANK_CAP_OPTIONS = ["auto", "min", "outfit", "default", "large", "xlarge", "max"]
 
 PRELOADED_AT = [
@@ -336,10 +336,9 @@ def build_kohya_toml(p: TrainingParams, est: TrainingEstimate) -> str:
 
 # ── V1 TOS-based math ─────────────────────────────────────────────────────────
 
-def get_images(files: str, tagged: bool) -> int:
+def get_images(files: str, tagged: bool = False) -> int:
     try:
-        n = int(files)
-        return n // 2 if tagged else n
+        return int(files)
     except Exception:
         return 0
 

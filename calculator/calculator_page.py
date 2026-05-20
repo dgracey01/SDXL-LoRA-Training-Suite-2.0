@@ -251,13 +251,6 @@ class CalculatorPage(QWidget):
         ds_row.addWidget(self._files_edit)
         layout.addLayout(_col("Dataset", ds_w))
 
-        # Tagged
-        self._tagged_cb = QCheckBox()
-        self._tagged_cb.setChecked(bool(self._cfg.get("tagged", False)))
-        self._tagged_cb.setStyleSheet(_check_style())
-        self._tagged_cb.stateChanged.connect(self._calc)
-        layout.addLayout(_col("Tagged", self._tagged_cb))
-
         # Total Images (ACC border)
         self._total_img_lbl = QLabel("0")
         self._total_img_lbl.setStyleSheet(
@@ -1402,7 +1395,7 @@ class CalculatorPage(QWidget):
         try:
             lt   = self._lt_combo.currentText()
             rc   = self._rc_combo.currentText()
-            imgs = get_images(self._files_edit.text(), self._tagged_cb.isChecked())
+            imgs = get_images(self._files_edit.text())
             try:
                 batch = max(1, int(self._batch_edit.text()))
             except Exception:
