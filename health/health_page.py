@@ -732,6 +732,7 @@ def _compute_rank_efficiency(tensors: dict, up_keys: list[str],
 
     layer_effs: list[float]             = []
     group_effs: dict[str, list[float]]  = {}
+    spectral_samples: list[tuple]       = []
 
     for uk in up_keys:
         dk = uk.replace("lora_up", "lora_down")
@@ -753,14 +754,31 @@ def _compute_rank_efficiency(tensors: dict, up_keys: list[str],
             mod = _classify_key(uk)
             group_effs.setdefault(mod, []).append(efficiency)
             layer_effs.append(efficiency)
+
+            # Spectral energy quartiles — cumulative variance at 25/50/75% of rank dims
+            energies = S.pow(2)
+            total_e  = energies.sum().item()
+            if total_e > 0:
+                cum = (energies.cumsum(0) / total_e)
+                q1i = max(0, r // 4 - 1)
+                q2i = max(0, r // 2 - 1)
+                q3i = max(0, (3 * r) // 4 - 1)
+                spectral_samples.append((cum[q1i].item(), cum[q2i].item(), cum[q3i].item()))
         except Exception:
             continue
 
     if not layer_effs:
         return {}
+
+    spectral = None
+    if spectral_samples:
+        def _avg(i): return sum(s[i] for s in spectral_samples) / len(spectral_samples)
+        spectral = {"q1": _avg(0), "q2": _avg(1), "q3": _avg(2)}
+
     return {
         "mean_efficiency": sum(layer_effs) / len(layer_effs),
         "groups": {mod: sum(e) / len(e) for mod, e in group_effs.items()},
+        "spectral": spectral,
     }
 
 
@@ -1614,6 +1632,30 @@ class HealthPage(QWidget):
             open_btn.clicked.connect(lambda _=False, p=best_path: self._open_in_analyze(p))
             detail_row.addWidget(open_btn)
             wl.addLayout(detail_row)
+
+            # Spectral energy breakdown — answers "how much data did rank constrain?"
+            spectral = best_result.get("rank_efficiency", {}).get("spectral")
+            if spectral:
+                q1, q2, q3 = spectral["q1"], spectral["q2"], spectral["q3"]
+                if q2 >= 0.90:
+                    spec_color = GRN
+                    spec_hint  = "steep spectrum — concept fits naturally in fewer dims"
+                elif q2 >= 0.70:
+                    spec_color = AMB
+                    spec_hint  = "moderate spread — rank was a partial constraint"
+                else:
+                    spec_color = RED
+                    spec_hint  = "flat spectrum — rank was a limiting factor"
+                spec_row = QHBoxLayout()
+                spec_row.setSpacing(8)
+                spec_row.addWidget(_lbl(
+                    f"Spectral energy:  top ¼ of dims → {q1:.0%}  ·  "
+                    f"top ½ → {q2:.0%}  ·  top ¾ → {q3:.0%}",
+                    SEC, FONT_SM))
+                spec_row.addWidget(_lbl(f"({spec_hint})", spec_color, FONT_SM))
+                spec_row.addStretch(1)
+                wl.addLayout(spec_row)
+
             self._batch_results_layout.addWidget(winner_card)
 
         # ── Results table ──────────────────────────────────────────────────
