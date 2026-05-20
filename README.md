@@ -74,13 +74,15 @@ Designed by **Zero** | Built by **Jarvis**
   - Full checkpoint loss table with the lowest-loss checkpoint marked
 - **Batch Compare** — point to a training output folder to rank all `.safetensors` candidates at once:
   - Runs all checks on every file in the background with a live progress bar
-  - Scores each candidate (lower = better): NaN/Inf → disqualified; penalty points for fail/warn checks, overbaked magnitude, dead layers, and layer imbalance
+  - **Recommendation Profile** selector chooses the scoring strategy:
+    - **Balanced** (default): penalizes fail/warn checks, overbaked magnitude, dead layers, and layer imbalance — general-purpose ranking
+    - **Character / Identity**: optimised for character LoRAs; disqualifies overbaked files (they break other LoRAs), then ranks by step count (later = better) and magnitude (higher within safe range = stronger identity capture)
   - **Loss column** — reads `log.txt` once for the folder and shows each checkpoint's window-averaged loss; lowest is highlighted green
   - Winner banner shows steps/image and checkpoint loss alongside score and magnitude
   - Highlights the best candidate with a Copy Path button
   - **Open in Analyze ↗** on any row loads that file into the single-file tab for full module inspection
 - Auto-detects SD 1.5 vs SDXL; manual override via dropdown
-- Model Type and Trainer selections remembered between sessions
+- Model Type, Trainer, and Profile selections remembered between sessions
 - File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
 - Drag-and-drop file input
 - Configurable thresholds — Strict / Standard / Relaxed presets per model type, with per-threshold manual overrides (amber fields, same pattern as Calculator TOS)

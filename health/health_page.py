@@ -188,6 +188,7 @@ DEFAULTS: dict = {
     "trainer":           "Auto-detect",
     "batch_model_type":  "Auto-detect",
     "batch_trainer":     "Auto-detect",
+    "batch_profile":     "Balanced",
 }
 
 
@@ -676,14 +677,39 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
 
 
 # ── Batch candidate scoring ────────────────────────────────────────────────────
-def _score_result(result: dict) -> float:
+def _score_result(result: dict, profile: str = "balanced",
+                  mag_warn: float = 0.06, mag_fail: float = 0.12,
+                  checkpoint_step: int | None = None,
+                  total_steps: int | None = None) -> float:
     """Penalty score for batch ranking — lower is better.
-    Returns infinity for NaN/Inf failures (disqualified, do not pick as best)."""
+    Returns infinity for NaN/Inf failures or identity-profile overbaked LoRAs."""
     for check in result["checks"]:
         if check["id"] == "nan_inf" and check["status"] == "fail":
             return float("inf")
 
-    score = 0.0
+    m        = result.get("metrics", {})
+    mean_mag = m.get("mean_mag", 0.0)
+
+    if profile == "identity":
+        # Overbaked LoRA will bleed into other LoRAs — hard disqualify
+        if mean_mag >= mag_fail:
+            return float("inf")
+        # step_ratio: 0.0 = very first checkpoint, 1.0 = final checkpoint
+        step_ratio = 0.5
+        if checkpoint_step is not None and total_steps and total_steps > 0:
+            step_ratio = min(1.0, checkpoint_step / total_steps)
+        # Lower score = better candidate.
+        # step penalty:  0 pts for latest checkpoint → 100 pts for first checkpoint
+        # mag penalty:   0 pts at warn threshold (well-trained) → 40 pts if near zero
+        # dead penalty:  15 pts per dead layer
+        mag_frac   = min(1.0, mean_mag / mag_warn) if mag_warn > 0 else 0.0
+        step_score = (1.0 - step_ratio) * 100
+        mag_score  = (1.0 - mag_frac) * 40
+        dead_score = m.get("total_dead", 0) * 15
+        return step_score + mag_score + dead_score
+
+    # ── Balanced (default) ────────────────────────────────────────────────────
+    score   = 0.0
     penalty = {"fail": 100, "warn": 20}
     boost   = {"overbaked": 2.0, "rank_consistency": 3.0}
     for check in result["checks"]:
@@ -691,9 +717,8 @@ def _score_result(result: dict) -> float:
             continue
         score += penalty.get(check["status"], 0) * boost.get(check["id"], 1.0)
 
-    m = result.get("metrics", {})
-    score += m.get("mean_mag",      0.0) * 500   # 0.06 warn ≈ +30 pts
-    score += m.get("total_dead",    0)   * 10
+    score += mean_mag * 500   # 0.06 warn ≈ +30 pts
+    score += m.get("total_dead", 0) * 10
     worst  = m.get("worst_balance", 1.0) or 1.0
     if worst != float("inf"):
         score += max(0.0, worst - 50.0) * 0.3
@@ -997,6 +1022,16 @@ class HealthPage(QWidget):
         self._batch_trainer_combo.currentTextChanged.connect(
             lambda v: self._save_combo("batch_trainer", v))
         ctrl_row.addWidget(self._batch_trainer_combo)
+        ctrl_row.addSpacing(16)
+        ctrl_row.addWidget(_lbl("Profile:"))
+        self._batch_profile_combo = QComboBox()
+        self._batch_profile_combo.addItems(["Balanced", "Character / Identity"])
+        self._batch_profile_combo.setCurrentText(self._cfg.get("batch_profile", "Balanced"))
+        self._batch_profile_combo.setStyleSheet(_combo_style())
+        self._batch_profile_combo.setFixedWidth(200)
+        self._batch_profile_combo.currentTextChanged.connect(
+            lambda v: self._save_combo("batch_profile", v))
+        ctrl_row.addWidget(self._batch_profile_combo)
         ctrl_row.addStretch(1)
 
         self._batch_run_btn = QPushButton("▶  Compare All")
@@ -1161,10 +1196,20 @@ class HealthPage(QWidget):
             return folder_log_data.get("checkpoint_losses", {}).get(step)
 
         # Score and sort — errors go to the bottom
+        profile_sel = self._batch_profile_combo.currentText()
+        profile_key = "identity" if "Identity" in profile_sel else "balanced"
+        log_total   = folder_log_data.get("total_steps") if folder_log_data else None
+
         scored = []
         for entry in results:
             if entry["result"] is not None:
-                s = _score_result(entry["result"])
+                r  = entry["result"]
+                mt = r.get("model_type", "sdxl")
+                mw = self.get_threshold(mt, "mag_warn")
+                mf = self.get_threshold(mt, "mag_fail")
+                ck = _get_checkpoint_step(os.path.basename(entry["path"]))
+                s  = _score_result(r, profile=profile_key, mag_warn=mw, mag_fail=mf,
+                                   checkpoint_step=ck, total_steps=log_total)
                 scored.append((s, entry))
             else:
                 scored.append((float("inf"), entry))
@@ -1735,6 +1780,23 @@ class HealthPage(QWidget):
              "LoRA file (AI Toolkit leaves one there). If absent, it falls back to tensor "
              "key heuristics — conv LoRA keys with no kohya hash metadata → AI Toolkit. "
              "Override if the detection is incorrect."),
+            ("Recommendation Profile",
+             "The Profile selector changes how the Batch Compare ranking score is computed.\n\n"
+             "Balanced (default):  Treats all penalty types equally. Penalizes higher magnitude "
+             "continuously (higher mag = higher score = worse rank). Good for general-purpose "
+             "LoRAs where over-training is the primary risk.\n\n"
+             "Character / Identity:  Optimised for character LoRAs where the goal is to capture "
+             "a specific face and appearance while remaining compatible with other LoRAs such as "
+             "outfit or style overlays.\n"
+             "  • Overbaked LoRAs (magnitude ≥ fail threshold) are hard-disqualified — they "
+             "tend to overpower other LoRAs and are not compatible.\n"
+             "  • Among safe candidates, later checkpoints (more steps) rank higher. This "
+             "directly addresses the common failure of recommending an early low-step "
+             "checkpoint that only vaguely resembles the character.\n"
+             "  • Higher magnitude (within the safe range) also scores better, since a more "
+             "trained character LoRA will reproduce identity features more reliably.\n"
+             "  • Dead layers are still penalised.\n\n"
+             "The selection is saved between sessions."),
         ]
 
         for title, body in sections:
