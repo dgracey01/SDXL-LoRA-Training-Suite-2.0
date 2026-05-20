@@ -782,6 +782,32 @@ def _compute_rank_efficiency(tensors: dict, up_keys: list[str],
     }
 
 
+# ── Plain-language rank verdict ───────────────────────────────────────────────
+
+def _rank_verdict(rank_efficiency: dict, log_data: dict | None = None) -> tuple:
+    """Return (verdict_text, color) or (None, None) if data unavailable.
+
+    Decision tree:
+      - Saturated (≥88%) + steep spectrum (Q2 ≥ 90%) → Balanced rank (concept
+        fits naturally; saturation is expected, not a constraint)
+      - Saturated (≥88%) + flat/unknown spectrum      → May benefit from higher rank
+      - Mid-range (45–87%)                            → Balanced rank
+      - Low utilization (<45%)                        → May benefit from lower rank
+    """
+    mean_eff = rank_efficiency.get("mean_efficiency")
+    if mean_eff is None:
+        return None, None
+    spectral = rank_efficiency.get("spectral") or {}
+    q2 = spectral.get("q2")
+    if mean_eff >= 0.88:
+        if q2 is not None and q2 >= 0.90:
+            return "Balanced rank", GRN
+        return "May benefit from higher rank", AMB
+    if mean_eff >= 0.45:
+        return "Balanced rank", GRN
+    return "May benefit from lower rank", MUT
+
+
 # ── Batch candidate scoring ────────────────────────────────────────────────────
 def _score_result(result: dict, profile: str = "concept",
                   mag_warn: float = 0.06, mag_fail: float = 0.12,
@@ -1656,6 +1682,18 @@ class HealthPage(QWidget):
                 spec_row.addStretch(1)
                 wl.addLayout(spec_row)
 
+            verdict_text, verdict_color = _rank_verdict(
+                best_result.get("rank_efficiency", {}),
+                best_result.get("log_data"),
+            )
+            if verdict_text:
+                vrow = QHBoxLayout()
+                vrow.setSpacing(8)
+                vrow.addWidget(_lbl("Rank assessment:", SEC, FONT_SM))
+                vrow.addWidget(_lbl(verdict_text, verdict_color, FONT_SM, bold=True))
+                vrow.addStretch(1)
+                wl.addLayout(vrow)
+
             self._batch_results_layout.addWidget(winner_card)
 
         # ── Results table ──────────────────────────────────────────────────
@@ -2372,6 +2410,19 @@ class HealthPage(QWidget):
             grid.addWidget(_lbl(f"{lk}:", SEC, FONT_SM), row, col_base)
             grid.addWidget(_lbl(lv, PRI, FONT_SM), row, col_base + 1)
         ml.addLayout(grid)
+
+        verdict_text, verdict_color = _rank_verdict(
+            result.get("rank_efficiency", {}),
+            result.get("log_data"),
+        )
+        if verdict_text:
+            vrow = QHBoxLayout()
+            vrow.setSpacing(8)
+            vrow.addWidget(_lbl("Rank assessment:", SEC, FONT_SM))
+            vrow.addWidget(_lbl(verdict_text, verdict_color, FONT_SM, bold=True))
+            vrow.addStretch(1)
+            ml.addLayout(vrow)
+
         self._results_layout.addWidget(meta_card)
 
         # ── Structural checks card (file-level) ────────────────────────────
