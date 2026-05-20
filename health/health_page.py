@@ -2151,13 +2151,18 @@ class HealthPage(QWidget):
         if meta.get("ss_base_model_version"):
             fields.append(("Base", meta["ss_base_model_version"]))
 
+        # Layout: col 0=left-label, col 1=left-value, col 2=spacer, col 3=right-label, col 4=right-value
         grid = QGridLayout()
-        grid.setSpacing(6)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 2)   # left value — expands to fill left half
+        grid.setColumnStretch(2, 3)   # spacer between pairs
+        grid.setColumnStretch(4, 2)   # right value
         for i, (lk, lv) in enumerate(fields):
-            col = (i % 2) * 2
+            col_base = (i % 2) * 3   # 0 for left pair, 3 for right pair
             row = i // 2
-            grid.addWidget(_lbl(f"{lk}:", SEC, FONT_SM), row, col)
-            grid.addWidget(_lbl(lv, PRI, FONT_SM), row, col + 1)
+            grid.addWidget(_lbl(f"{lk}:", SEC, FONT_SM), row, col_base)
+            grid.addWidget(_lbl(lv, PRI, FONT_SM), row, col_base + 1)
         ml.addLayout(grid)
         self._results_layout.addWidget(meta_card)
 
