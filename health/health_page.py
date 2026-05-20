@@ -25,7 +25,7 @@ import statistics
 import threading
 
 from PySide6.QtCore    import Qt, QObject, Signal
-from PySide6.QtGui     import QDragEnterEvent, QDropEvent
+from PySide6.QtGui     import QDragEnterEvent, QDropEvent, QWheelEvent, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QComboBox,
@@ -741,6 +741,151 @@ def _score_result(result: dict, profile: str = "concept",
     return score
 
 
+# ── Sample image strip ────────────────────────────────────────────────────────
+
+class _SampleThumb(QFrame):
+    """One thumbnail cell in the samples strip — click opens full image."""
+
+    def __init__(self, path: str, size: int, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"QFrame {{ background:{CAR}; border-radius:6px; border:1px solid {MUT}; }}"
+            f"QFrame:hover {{ border-color:{ACC}; }}")
+        self.setFixedSize(size + 10, size + 10)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(5, 5, 5, 5)
+        v.setSpacing(0)
+
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setFixedSize(size, size)
+        lbl.setStyleSheet("background:transparent; border:none;")
+        px = QPixmap(path)
+        if not px.isNull():
+            px = px.scaled(size, size,
+                           Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        lbl.setPixmap(px)
+        v.addWidget(lbl)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            os.startfile(self._path)
+        super().mousePressEvent(e)
+
+
+class _SampleStrip(QFrame):
+    """Horizontally scrollable row of checkpoint sample images.
+    Scroll wheel over the strip zooms all thumbnails uniformly."""
+
+    _MIN = 80
+    _MAX = 400
+    _DEF = 160
+
+    def __init__(self, samples_dir: str | None, parent=None):
+        super().__init__(parent)
+        self._samples_dir = samples_dir
+        self._size        = self._DEF
+
+        self.setStyleSheet(
+            f"QFrame {{ background:{BG}; border-top:1px solid {MUT}; }}")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 8, 16, 8)
+        outer.setSpacing(4)
+
+        self._header = _lbl("Samples", MUT, FONT_SM)
+        outer.addWidget(self._header)
+
+        self._scroll = QScrollArea()
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet("QScrollArea { border:none; background:transparent; }")
+        self._scroll.setFixedHeight(self._DEF + 22)
+
+        self._inner = QWidget()
+        self._inner.setStyleSheet("background:transparent;")
+        self._row = QHBoxLayout(self._inner)
+        self._row.setContentsMargins(0, 0, 0, 0)
+        self._row.setSpacing(8)
+        self._row.addStretch(1)
+        self._scroll.setWidget(self._inner)
+        outer.addWidget(self._scroll)
+
+    def load_for_step(self, step: int | None, label: str = ""):
+        while self._row.count() > 1:
+            item = self._row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        hdr = f"Samples  —  {label}" if label else "Samples"
+        if not self._samples_dir:
+            self._header.setText(f"{hdr}  (no samples folder)")
+            return
+
+        paths = self._images_for_step(step)[:10]   # AI Toolkit max ~10 prompts
+        if not paths:
+            self._header.setText(f"{hdr}  (no images for this checkpoint)")
+            return
+
+        self._header.setText(hdr)
+        for path in paths:
+            self._row.insertWidget(self._row.count() - 1,
+                                   _SampleThumb(path, self._size))
+
+    def _images_for_step(self, step: int | None) -> list[str]:
+        if step is not None:
+            pattern = f"__{step:09d}_"
+        else:
+            # Final LoRA — find the highest step present in the samples folder
+            import re as _re
+            best, pat = None, _re.compile(r"__(\d{9})_")
+            for f in os.listdir(self._samples_dir):
+                m = pat.search(f)
+                if m:
+                    n = int(m.group(1))
+                    if best is None or n > best:
+                        best = n
+            if best is None:
+                return []
+            pattern = f"__{best:09d}_"
+
+        return sorted(
+            os.path.join(self._samples_dir, f)
+            for f in os.listdir(self._samples_dir)
+            if pattern in f and f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+        )
+
+    def _resize_thumbs(self):
+        paths = [
+            self._row.itemAt(i).widget()._path
+            for i in range(self._row.count() - 1)
+            if self._row.itemAt(i).widget() and
+               isinstance(self._row.itemAt(i).widget(), _SampleThumb)
+        ]
+        while self._row.count() > 1:
+            item = self._row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._scroll.setFixedHeight(self._size + 22)
+        for path in paths:
+            self._row.insertWidget(self._row.count() - 1,
+                                   _SampleThumb(path, self._size))
+
+    def wheelEvent(self, e: QWheelEvent):
+        step = 16
+        if e.angleDelta().y() > 0:
+            self._size = min(self._MAX, self._size + step)
+        else:
+            self._size = max(self._MIN, self._size - step)
+        self._resize_thumbs()
+        e.accept()
+
+
 # ── Drop zone ─────────────────────────────────────────────────────────────────
 class _DropZone(QFrame):
     file_dropped = Signal(str)
@@ -834,6 +979,7 @@ class HealthPage(QWidget):
         self._thread:       threading.Thread | None = None
         self._batch_worker: _BatchWorker | None     = None
         self._batch_thread: threading.Thread | None = None
+        self._sample_strip: _SampleStrip | None     = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1239,6 +1385,14 @@ class HealthPage(QWidget):
         valid = [(s, e) for s, e in scored if e["result"] is not None and s < float("inf")]
         best  = valid[0] if valid else None
 
+        # ── Sample strip ───────────────────────────────────────────────────
+        folder      = self._batch_folder_edit.text() if results else ""
+        samples_dir = os.path.join(folder, "samples") if folder else None
+        if samples_dir and not os.path.isdir(samples_dir):
+            samples_dir = None
+        strip = _SampleStrip(samples_dir)
+        self._sample_strip = strip
+
         # ── Winner banner ──────────────────────────────────────────────────
         if best:
             best_score, best_entry = best
@@ -1362,11 +1516,18 @@ class HealthPage(QWidget):
             rl.addWidget(rank_lbl)
 
             fname = os.path.basename(entry["path"])
-            fname_lbl = QLabel(fname)
-            fname_lbl.setStyleSheet(
-                f"color:{PRI}; font-family:{FONT}; font-size:{FONT_SM}px;"
-                f" background:transparent; border:none;")
-            rl.addWidget(fname_lbl, stretch=5)
+            fname_btn = QPushButton(fname)
+            fname_btn.setFlat(True)
+            fname_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            fname_btn.setStyleSheet(
+                f"QPushButton {{ color:{PRI}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none; text-align:left; padding:0; }}"
+                f"QPushButton:hover {{ color:{ACC}; }}")
+            _ck = _get_checkpoint_step(fname)
+            _lbl_txt = os.path.splitext(fname)[0]
+            fname_btn.clicked.connect(
+                lambda _=False, s=_ck, lbl=_lbl_txt: strip.load_for_step(s, lbl))
+            rl.addWidget(fname_btn, stretch=5)
 
             if is_error:
                 err_lbl = _lbl(f"Error: {entry['error']}", RED, FONT_SM)
@@ -1433,6 +1594,15 @@ class HealthPage(QWidget):
         note_lbl = _lbl("Score: lower is better  ·  ∞ = NaN/Inf detected (file unusable)", MUT, FONT_SM)
         tl.addWidget(note_lbl)
         self._batch_results_layout.addWidget(table_card)
+
+        # ── Sample image strip ─────────────────────────────────────────────
+        self._batch_results_layout.addWidget(strip)
+        if best:
+            best_ck  = _get_checkpoint_step(os.path.basename(best[1]["path"]))
+            best_lbl = os.path.splitext(os.path.basename(best[1]["path"]))[0]
+            strip.load_for_step(best_ck, best_lbl)
+        else:
+            strip.load_for_step(None)
 
     def _open_in_analyze(self, path: str):
         """Load a file into the Analyze tab and switch to it."""
