@@ -29,7 +29,7 @@ from PySide6.QtGui     import QDragEnterEvent, QDropEvent, QWheelEvent, QPixmap
 from PySide6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QComboBox,
-    QScrollArea, QTabWidget, QFileDialog,
+    QScrollArea, QTabWidget, QFileDialog, QMenu, QApplication,
 )
 
 from shared.theme import (
@@ -743,17 +743,45 @@ def _score_result(result: dict, profile: str = "concept",
 
 # ── Sample image strip ────────────────────────────────────────────────────────
 
-class _SampleThumb(QFrame):
-    """One thumbnail cell in the samples strip — click opens full image."""
+def _read_sample_prompts(lora_folder: str) -> list[str]:
+    """Return the ordered prompt list from AI Toolkit config.yaml, or [] if unavailable."""
+    cfg_path = os.path.join(lora_folder, "config.yaml")
+    if not os.path.isfile(cfg_path):
+        return []
+    try:
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        samples = (cfg.get("config", {})
+                      .get("process", [{}])[0]
+                      .get("sample", {})
+                      .get("samples", []))
+        return [str(s.get("prompt", "")) for s in samples if isinstance(s, dict)]
+    except Exception:
+        return []
 
-    def __init__(self, path: str, size: int, parent=None):
+
+def _sample_index(filename: str) -> int | None:
+    """Extract the prompt index from an AI Toolkit sample filename (_N before ext)."""
+    m = re.search(r"_(\d+)\.[^.]+$", filename)
+    return int(m.group(1)) if m else None
+
+
+class _SampleThumb(QFrame):
+    """One thumbnail cell in the samples strip.
+    Left-click opens full image; right-click shows the sample prompt."""
+
+    def __init__(self, path: str, size: int, prompt: str = "", parent=None):
         super().__init__(parent)
-        self._path = path
+        self._path   = path
+        self._prompt = prompt
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(
             f"QFrame {{ background:{CAR}; border-radius:6px; border:1px solid {MUT}; }}"
             f"QFrame:hover {{ border-color:{ACC}; }}")
         self.setFixedSize(size + 10, size + 10)
+        if prompt:
+            self.setToolTip(prompt)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(5, 5, 5, 5)
@@ -776,6 +804,23 @@ class _SampleThumb(QFrame):
             os.startfile(self._path)
         super().mousePressEvent(e)
 
+    def contextMenuEvent(self, e):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background:{CAR}; color:{PRI}; border:1px solid {MUT};"
+            f" font-family:{FONT}; font-size:{FONT_SM}px; }}"
+            f"QMenu::item:selected {{ background:{ACC}; color:{BG}; }}")
+        if self._prompt:
+            prompt_action = menu.addAction(self._prompt)
+            prompt_action.setEnabled(False)
+            menu.addSeparator()
+            copy_action = menu.addAction("Copy Prompt")
+            copy_action.triggered.connect(
+                lambda: QApplication.clipboard().setText(self._prompt))
+        else:
+            menu.addAction("No prompt metadata available").setEnabled(False)
+        menu.exec(e.globalPos())
+
 
 class _SampleStrip(QFrame):
     """Horizontally scrollable row of checkpoint sample images.
@@ -789,6 +834,9 @@ class _SampleStrip(QFrame):
         super().__init__(parent)
         self._samples_dir = samples_dir
         self._size        = self._DEF
+        # Prompts indexed by position: loaded from config.yaml in the parent folder
+        lora_folder = os.path.dirname(samples_dir) if samples_dir else None
+        self._prompts: list[str] = _read_sample_prompts(lora_folder) if lora_folder else []
 
         self.setStyleSheet(
             f"QFrame {{ background:{BG}; border-top:1px solid {MUT}; }}")
@@ -834,8 +882,10 @@ class _SampleStrip(QFrame):
 
         self._header.setText(hdr)
         for path in paths:
+            idx    = _sample_index(os.path.basename(path))
+            prompt = self._prompts[idx] if idx is not None and idx < len(self._prompts) else ""
             self._row.insertWidget(self._row.count() - 1,
-                                   _SampleThumb(path, self._size))
+                                   _SampleThumb(path, self._size, prompt))
 
     def _images_for_step(self, step: int | None) -> list[str]:
         if step is not None:
@@ -873,8 +923,10 @@ class _SampleStrip(QFrame):
                 item.widget().deleteLater()
         self._scroll.setFixedHeight(self._size + 22)
         for path in paths:
+            idx    = _sample_index(os.path.basename(path))
+            prompt = self._prompts[idx] if idx is not None and idx < len(self._prompts) else ""
             self._row.insertWidget(self._row.count() - 1,
-                                   _SampleThumb(path, self._size))
+                                   _SampleThumb(path, self._size, prompt))
 
     def wheelEvent(self, e: QWheelEvent):
         step = 16
