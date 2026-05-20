@@ -188,7 +188,7 @@ DEFAULTS: dict = {
     "trainer":           "Auto-detect",
     "batch_model_type":  "Auto-detect",
     "batch_trainer":     "Auto-detect",
-    "batch_profile":     "Balanced",
+    "batch_profile":     "Concept / Pose",
 }
 
 
@@ -677,38 +677,55 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
 
 
 # ── Batch candidate scoring ────────────────────────────────────────────────────
-def _score_result(result: dict, profile: str = "balanced",
+def _score_result(result: dict, profile: str = "concept",
                   mag_warn: float = 0.06, mag_fail: float = 0.12,
                   checkpoint_step: int | None = None,
                   total_steps: int | None = None) -> float:
     """Penalty score for batch ranking — lower is better.
-    Returns infinity for NaN/Inf failures or identity-profile overbaked LoRAs."""
+    Returns infinity for NaN/Inf failures or overbaked LoRAs in non-concept profiles."""
     for check in result["checks"]:
         if check["id"] == "nan_inf" and check["status"] == "fail":
             return float("inf")
 
     m        = result.get("metrics", {})
     mean_mag = m.get("mean_mag", 0.0)
+    dead     = m.get("total_dead", 0)
+
+    # step_ratio shared by identity / outfit / style
+    step_ratio = 0.5
+    if checkpoint_step is not None and total_steps and total_steps > 0:
+        step_ratio = min(1.0, checkpoint_step / total_steps)
+
+    mag_frac = min(1.0, mean_mag / mag_warn) if mag_warn > 0 else 0.0
 
     if profile == "identity":
-        # Overbaked LoRA will bleed into other LoRAs — hard disqualify
+        # Hard disqualify: overbaked LoRA overpowers other LoRAs
         if mean_mag >= mag_fail:
             return float("inf")
-        # step_ratio: 0.0 = very first checkpoint, 1.0 = final checkpoint
-        step_ratio = 0.5
-        if checkpoint_step is not None and total_steps and total_steps > 0:
-            step_ratio = min(1.0, checkpoint_step / total_steps)
-        # Lower score = better candidate.
-        # step penalty:  0 pts for latest checkpoint → 100 pts for first checkpoint
-        # mag penalty:   0 pts at warn threshold (well-trained) → 40 pts if near zero
-        # dead penalty:  15 pts per dead layer
-        mag_frac   = min(1.0, mean_mag / mag_warn) if mag_warn > 0 else 0.0
-        step_score = (1.0 - step_ratio) * 100
-        mag_score  = (1.0 - mag_frac) * 40
-        dead_score = m.get("total_dead", 0) * 15
-        return step_score + mag_score + dead_score
+        # Prefer: latest checkpoint (strong step weight), highest safe magnitude
+        # step 0→100 pts  ·  mag 0 (at warn) → 40 pts (near zero)  ·  dead 15 pts each
+        return (1.0 - step_ratio) * 100 + (1.0 - mag_frac) * 40 + dead * 15
 
-    # ── Balanced (default) ────────────────────────────────────────────────────
+    if profile == "outfit":
+        # Hard disqualify: overbaked outfit bleeds into skin/hair/character
+        if mean_mag >= mag_fail:
+            return float("inf")
+        # Prefer: moderate-to-late steps, magnitude sweet spot ~65% of warn
+        # Deviation from sweet spot is penalised from both sides
+        sweet    = 0.65 * mag_warn
+        mag_dev  = abs(mean_mag - sweet) / mag_warn if mag_warn > 0 else 0.0
+        return (1.0 - step_ratio) * 60 + mag_dev * 50 + dead * 12
+
+    if profile == "style":
+        # Hard disqualify: overbaked style flattens all outputs
+        if mean_mag >= mag_fail:
+            return float("inf")
+        # Prefer: lower magnitude (subtle influence), mild step preference
+        return (1.0 - step_ratio) * 25 + mag_frac * 60 + dead * 10
+
+    # ── Concept / Pose (default) ──────────────────────────────────────────────
+    # Concepts and poses are learned quickly; step count is not decisive.
+    # Penalise fail/warn checks and magnitude continuously.
     score   = 0.0
     penalty = {"fail": 100, "warn": 20}
     boost   = {"overbaked": 2.0, "rank_consistency": 3.0}
@@ -716,13 +733,11 @@ def _score_result(result: dict, profile: str = "balanced",
         if check["id"] == "nan_inf":
             continue
         score += penalty.get(check["status"], 0) * boost.get(check["id"], 1.0)
-
     score += mean_mag * 500   # 0.06 warn ≈ +30 pts
-    score += m.get("total_dead", 0) * 10
+    score += dead * 10
     worst  = m.get("worst_balance", 1.0) or 1.0
     if worst != float("inf"):
         score += max(0.0, worst - 50.0) * 0.3
-
     return score
 
 
@@ -1025,8 +1040,9 @@ class HealthPage(QWidget):
         ctrl_row.addSpacing(16)
         ctrl_row.addWidget(_lbl("Profile:"))
         self._batch_profile_combo = QComboBox()
-        self._batch_profile_combo.addItems(["Balanced", "Character / Identity"])
-        self._batch_profile_combo.setCurrentText(self._cfg.get("batch_profile", "Balanced"))
+        self._batch_profile_combo.addItems([
+            "Concept / Pose", "Character / Identity", "Outfit / Costume", "Style / Art Direction"])
+        self._batch_profile_combo.setCurrentText(self._cfg.get("batch_profile", "Concept / Pose"))
         self._batch_profile_combo.setStyleSheet(_combo_style())
         self._batch_profile_combo.setFixedWidth(200)
         self._batch_profile_combo.currentTextChanged.connect(
@@ -1197,7 +1213,12 @@ class HealthPage(QWidget):
 
         # Score and sort — errors go to the bottom
         profile_sel = self._batch_profile_combo.currentText()
-        profile_key = "identity" if "Identity" in profile_sel else "balanced"
+        _profile_map = {
+            "Character / Identity":  "identity",
+            "Outfit / Costume":      "outfit",
+            "Style / Art Direction": "style",
+        }
+        profile_key = _profile_map.get(profile_sel, "concept")
         log_total   = folder_log_data.get("total_steps") if folder_log_data else None
 
         scored = []
@@ -1781,22 +1802,24 @@ class HealthPage(QWidget):
              "key heuristics — conv LoRA keys with no kohya hash metadata → AI Toolkit. "
              "Override if the detection is incorrect."),
             ("Recommendation Profile",
-             "The Profile selector changes how the Batch Compare ranking score is computed.\n\n"
-             "Balanced (default):  Treats all penalty types equally. Penalizes higher magnitude "
-             "continuously (higher mag = higher score = worse rank). Good for general-purpose "
-             "LoRAs where over-training is the primary risk.\n\n"
-             "Character / Identity:  Optimised for character LoRAs where the goal is to capture "
-             "a specific face and appearance while remaining compatible with other LoRAs such as "
-             "outfit or style overlays.\n"
-             "  • Overbaked LoRAs (magnitude ≥ fail threshold) are hard-disqualified — they "
-             "tend to overpower other LoRAs and are not compatible.\n"
-             "  • Among safe candidates, later checkpoints (more steps) rank higher. This "
-             "directly addresses the common failure of recommending an early low-step "
-             "checkpoint that only vaguely resembles the character.\n"
-             "  • Higher magnitude (within the safe range) also scores better, since a more "
-             "trained character LoRA will reproduce identity features more reliably.\n"
-             "  • Dead layers are still penalised.\n\n"
-             "The selection is saved between sessions."),
+             "The Profile selector changes how the Batch Compare ranking score is computed. "
+             "Select the profile that matches what you trained.\n\n"
+             "Concept / Pose (default):  General-purpose. Penalises fail/warn checks and "
+             "magnitude continuously. Step count is not decisive — concepts and poses are "
+             "learned quickly and an earlier checkpoint is often just as good.\n\n"
+             "Character / Identity:  For character LoRAs where face and appearance must be "
+             "captured. Overbaked files are hard-disqualified (they overpower other LoRAs). "
+             "Among safe candidates, later checkpoints rank higher (more training = stronger "
+             "identity), with a secondary bonus for higher magnitude within the safe range.\n\n"
+             "Outfit / Costume:  For clothing or accessory LoRAs that will be layered over a "
+             "character. Overbaked files are disqualified (outfit LoRA bleeding into skin/hair "
+             "is a common problem). Magnitude is scored against a sweet spot of ~65% of the "
+             "warn threshold — just enough to capture detail without overpowering.\n\n"
+             "Style / Art Direction:  For artistic style or medium LoRAs. Lower magnitude "
+             "is preferred so the style influences rather than dominates. Overbaked files "
+             "are disqualified. Step count has only a minor effect — style tends to stabilise "
+             "at moderate training levels.\n\n"
+             "All profile selections are saved between sessions."),
         ]
 
         for title, body in sections:

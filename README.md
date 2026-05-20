@@ -75,8 +75,10 @@ Designed by **Zero** | Built by **Jarvis**
 - **Batch Compare** — point to a training output folder to rank all `.safetensors` candidates at once:
   - Runs all checks on every file in the background with a live progress bar
   - **Recommendation Profile** selector chooses the scoring strategy:
-    - **Balanced** (default): penalizes fail/warn checks, overbaked magnitude, dead layers, and layer imbalance — general-purpose ranking
-    - **Character / Identity**: optimised for character LoRAs; disqualifies overbaked files (they break other LoRAs), then ranks by step count (later = better) and magnitude (higher within safe range = stronger identity capture)
+    - **Concept / Pose** (default): penalizes fail/warn checks, magnitude, dead layers, and balance — general-purpose; step count is not decisive
+    - **Character / Identity**: disqualifies overbaked files, then ranks by step count (later = better) and magnitude (higher within safe range = stronger identity)
+    - **Outfit / Costume**: disqualifies overbaked files, scores magnitude against a ~65% sweet spot to capture detail without bleeding into skin/hair
+    - **Style / Art Direction**: disqualifies overbaked files, prefers lower magnitude (subtle influence over dominance) with a mild step preference
   - **Loss column** — reads `log.txt` once for the folder and shows each checkpoint's window-averaged loss; lowest is highlighted green
   - Winner banner shows steps/image and checkpoint loss alongside score and magnitude
   - Highlights the best candidate with a Copy Path button
