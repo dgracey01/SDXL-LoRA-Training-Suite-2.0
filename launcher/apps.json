@@ -1,8 +1,8 @@
 [
   {
     "name": "SD.next",
-    "url": "http://localhost:7000",
-    "cmd": "E:\\automatic\\webui.bat --use-rocm --update --backend diffusers --port 7000",
+    "url": "http://localhost:3680",
+    "cmd": "E:\\automatic\\webui.bat --use-rocm --update --backend diffusers --port 3680",
     "image": "F:/VC Projects/Lora Training Suite 2.0/assets/SDnext.png"
   },
   {
@@ -24,5 +24,10 @@
     "name": "Ktiseos Nyx",
     "url": "http://192.168.1.64:3000/",
     "image": "F:/VC Projects/Lora Training Suite 2.0/assets/Ktiseos.png"
+  },
+  {
+    "name": "Kohnya RoCM",
+    "url": "http://127.0.0.1:7861/",
+    "cmd": "F:\\VC Projects\\kohya_rocm\\LAUNCH.bat"
   }
 ]

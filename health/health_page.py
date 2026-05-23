@@ -293,6 +293,8 @@ _LOG_SAVE_RE    = re.compile(r'^Saving at step (\d+)')
 _CKPT_STEP_RE   = re.compile(r'_(\d{9})\.safetensors$')
 _LOG_BATCH_RE   = re.compile(r'"batch_size"\s*:\s*(\d+)')
 _LOG_ACCUM_RE   = re.compile(r'"gradient_accumulation"\s*:\s*(\d+)')
+_LOG_RANK_RE    = re.compile(r'"linear"\s*:\s*(\d+)')
+_LOG_ALPHA_RE   = re.compile(r'"linear_alpha"\s*:\s*([\d.]+)')
 
 
 def _get_checkpoint_step(filename: str) -> int | None:
@@ -312,12 +314,14 @@ def _parse_aitk_log(log_path: str) -> dict:
     """
     try:
         steps: dict[int, float] = {}
-        image_count:   int | None = None
-        total_from_log: int | None = None
-        save_steps:    list[int]  = []
-        in_preprocess  = False
-        batch_size     = 1
-        grad_accum     = 1
+        image_count:    int   | None = None
+        total_from_log: int   | None = None
+        save_steps:     list[int]   = []
+        in_preprocess   = False
+        batch_size      = 1
+        grad_accum      = 1
+        network_rank:   int   | None = None
+        network_alpha:  float | None = None
 
         with open(log_path, encoding="utf-8", errors="replace") as f:
             for line_num, line in enumerate(f):
@@ -329,6 +333,12 @@ def _parse_aitk_log(log_path: str) -> dict:
                     m = _LOG_ACCUM_RE.search(line)
                     if m:
                         grad_accum = int(m.group(1))
+                    m = _LOG_RANK_RE.search(line)
+                    if m and network_rank is None:
+                        network_rank = int(m.group(1))
+                    m = _LOG_ALPHA_RE.search(line)
+                    if m and network_alpha is None:
+                        network_alpha = float(m.group(1))
 
                 # Image count — from the progress bar right after "Preprocessing image"
                 if "Preprocessing image" in line:
@@ -398,6 +408,8 @@ def _parse_aitk_log(log_path: str) -> dict:
             "converged":         q4_avg < q1_avg * 0.97,
             "checkpoint_losses": checkpoint_losses,
             "final_step":        final_step,
+            "network_rank":      network_rank,
+            "network_alpha":     network_alpha,
         }
     except Exception:
         return {}
@@ -435,7 +447,8 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         hash_parts = ["No hash metadata — file may not have been saved by kohya/sd-scripts."]
     checks.append({
         "id": "integrity", "label": "File Integrity",
-        "status": "pass" if (has_hash or has_legacy) else "warn",
+        "status": "pass" if (has_hash or has_legacy) else (
+            "info" if trainer == "aitoolkit" else "warn"),
         "detail": "  ".join(hash_parts),
     })
 
@@ -483,12 +496,18 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
             if r != meta_rank:
                 rank_errors.append(f"metadata rank={meta_rank} ≠ tensor rank={r}")
 
-    actual_rank = next(iter(actual_ranks), None)
+    # Use the highest rank present — linear layers define the dominant rank.
+    # Mixed-rank LoRAs (e.g. linear=128 + conv=32 from AI Toolkit) would otherwise
+    # pick whichever the set iterator returns, masking the linear rank from ceiling checks.
+    actual_rank = max(actual_ranks) if actual_ranks else None
     if rank_errors:
         checks.append({"id": "rank_consistency", "label": "Rank Consistency",
                         "status": "fail", "detail": "; ".join(rank_errors[:3])})
     else:
-        rank_str = f"rank={actual_rank}"
+        if len(actual_ranks) > 1:
+            rank_str = f"linear={max(actual_ranks)}, conv={min(actual_ranks)}"
+        else:
+            rank_str = f"rank={actual_rank}"
         if meta_rank:
             rank_str += f" (metadata confirms {meta_rank})"
         checks.append({"id": "rank_consistency", "label": "Rank Consistency",
@@ -512,7 +531,11 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
     if declared_alpha is not None and actual_rank:
         ratio     = declared_alpha / actual_rank
         ratio_str = f"alpha={declared_alpha:.4g} / rank={actual_rank} = {ratio:.4f}"
-        if ratio < ratio_min:
+        # AI Toolkit uses alpha=1 by convention regardless of rank — ratios of 0.007–0.06
+        # are expected and not a defect. Skip bounds check, just display the value.
+        if trainer == "aitoolkit":
+            status, detail = "info", f"{ratio_str} (AI Toolkit convention — not scored)"
+        elif ratio < ratio_min:
             status, detail = "warn", f"{ratio_str} (below min {ratio_min})"
         elif ratio > ratio_max:
             status, detail = "warn", f"{ratio_str} (above max {ratio_max})"
@@ -648,7 +671,9 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         "filename":              os.path.basename(path),
         "size_mb":               f"{os.path.getsize(path) / (1024 * 1024):.1f} MB",
         "model_type":            model_type.upper(),
-        "rank":                  str(actual_rank) if actual_rank else "?",
+        "rank":         str(actual_rank) if actual_rank else "?",
+        "rank_display": (f"{max(actual_ranks)} (conv:{min(actual_ranks)})"
+                         if len(actual_ranks) > 1 else str(actual_rank)) if actual_ranks else "?",
         "alpha":                 f"{declared_alpha:.4g}" if declared_alpha is not None else "?",
         "ratio":                 ratio_display,
         "layers":                str(len(up_keys)),
@@ -682,13 +707,28 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
                 log_data["this_checkpoint_loss"] = \
                     log_data.get("checkpoint_losses", {}).get(ckpt_step)
 
+                # Fill in rank/alpha from log when metadata doesn't have them
+                if log_data.get("network_rank") and actual_rank is None:
+                    actual_rank = log_data["network_rank"]
+                if log_data.get("network_alpha") is not None and declared_alpha is None:
+                    declared_alpha = log_data["network_alpha"]
+
     # ── 10. Rank saturation ───────────────────────────────────────────────────
     mean_eff = rank_efficiency.get("mean_efficiency")
     if mean_eff is not None and mean_eff >= 0.88:
         plateaued = not log_data.get("converged", True)   # no log → assume unknown
         has_log   = bool(log_data)
+        at_ceiling = (actual_rank is not None and actual_rank >= 128)
 
-        if has_log and plateaued:
+        if at_ceiling:
+            # Rank ≥ 128 is the practical ceiling — full utilization is expected,
+            # not a deficiency. Raising the rank further gives diminishing returns.
+            sat_detail = (
+                f"Rank efficiency {mean_eff:.0%} — all rank dimensions fully utilized "
+                f"at rank {actual_rank} (maximum practical rank). "
+                f"This is expected behavior, not a deficiency.")
+            sat_status = "info"
+        elif has_log and plateaued:
             q1 = log_data.get("q1_avg", 0)
             q4 = log_data.get("q4_avg", 0)
             sat_detail = (
@@ -889,13 +929,68 @@ def _score_result(result: dict, profile: str = "concept",
         if check["id"] == "nan_inf":
             continue
         score += penalty.get(check["status"], 0) * boost.get(check["id"], 1.0)
-    score += mean_mag * 500   # 0.06 warn ≈ +30 pts
+
+    undercooked_thresh = 0.05 * mag_warn if mag_warn > 0 else 0.0
+    if 0.0 < mean_mag < undercooked_thresh:
+        # Concept hasn't formed yet — heavily penalise underbaked checkpoints so
+        # they rank below any candidate with a viable training signal.
+        score += 200.0 + (undercooked_thresh - mean_mag) / undercooked_thresh * 100.0
+    else:
+        score += mean_mag * 500   # 0.06 warn ≈ +30 pts
     score += dead * 10
     worst  = m.get("worst_balance", 1.0) or 1.0
     if worst != float("inf"):
         score += max(0.0, worst - 50.0) * 0.3
     score += (1.0 - eff) * 25 if eff is not None else 0.0   # rank efficiency penalty
     return score
+
+
+# ── Batch descriptive label ───────────────────────────────────────────────────
+
+def _batch_label(result: dict, mag_warn: float, mag_fail: float) -> tuple[str, str]:
+    """Return (label_text, badge_color) for the batch-tab Overall column.
+
+    Priority (high → low): Corrupted > Burnt > Dead Layers > Overcooked >
+    Slightly Overcooked > Layer Unbalanced > Rank Saturated > Rank Mismatch >
+    Undercooked > Pass
+    """
+    overall       = result["overall"]
+    checks        = result.get("checks", [])
+    metrics       = result.get("metrics", {})
+    mean_mag      = metrics.get("mean_mag", 0.0)
+    total_dead    = metrics.get("total_dead", 0)
+    module_groups = result.get("module_groups", {})
+    check_map     = {c["id"]: c["status"] for c in checks}
+
+    if overall == "fail":
+        if check_map.get("nan_inf") == "fail":
+            return "Corrupted", RED
+        if check_map.get("overbaked") == "fail":
+            return "Burnt", RED
+        if any(g.get("status") == "fail" for g in module_groups.values()):
+            return "Layer Unbalanced", RED
+        if total_dead > 0:
+            return "Dead Layers", RED
+        return "FAIL", RED
+
+    if overall == "warn":
+        if total_dead > 0:
+            return "Dead Layers", AMB
+        if check_map.get("overbaked") == "warn":
+            return "Overcooked", AMB
+        if any(g.get("status") == "warn" for g in module_groups.values()):
+            return "Layer Unbalanced", AMB
+        if check_map.get("rank_saturation") == "warn":
+            return "Rank Saturated", AMB
+        if check_map.get("rank_range") == "warn" or check_map.get("alpha_ratio") == "warn":
+            return "Rank Mismatch", AMB
+        return "⚠ Warn", AMB
+
+    # Pass — check for undercooked (mean mag well below sweet spot)
+    undercooked_threshold = 0.05 * mag_warn if mag_warn > 0 else 0.0
+    if 0.0 < mean_mag < undercooked_threshold:
+        return "Undercooked", AMB
+    return "Pass", GRN
 
 
 # ── Sample image strip ────────────────────────────────────────────────────────
@@ -1625,11 +1720,13 @@ class HealthPage(QWidget):
             title_row.addStretch(1)
 
             overall = best_result["overall"]
-            badge_colors = {"pass": GRN, "warn": AMB, "fail": RED}
-            badge_texts  = {"pass": "✓  PASS", "warn": "⚠  WARN", "fail": "✗  FAIL"}
-            badge = QLabel(badge_texts.get(overall, overall.upper()))
+            _mt_b = best_result.get("model_type", "sdxl")
+            _mw_b = self.get_threshold(_mt_b, "mag_warn")
+            _mf_b = self.get_threshold(_mt_b, "mag_fail")
+            _lbl_b, _col_b = _batch_label(best_result, _mw_b, _mf_b)
+            badge = QLabel(_lbl_b)
             badge.setStyleSheet(
-                f"color:{PRI}; background:{badge_colors.get(overall, MUT)};"
+                f"color:{PRI}; background:{_col_b};"
                 f" border-radius:4px; padding:4px 12px;"
                 f" font-family:{FONT}; font-size:{FONT_SM}px; font-weight:bold;")
             title_row.addWidget(badge)
@@ -1653,7 +1750,7 @@ class HealthPage(QWidget):
                 f"Magnitude: {m.get('mean_mag', 0):.5f}  ·  "
                 f"Dead layers: {m.get('total_dead', 0)}"
                 f"{eff_part}  ·  "
-                f"{best_meta['model_type']}  rank {best_meta['rank']}"
+                f"{best_meta['model_type']}  rank {best_meta.get('rank_display') or best_meta['rank']}"
                 f"{loss_part}{spi_part}",
                 SEC, FONT_SM))
             detail_row.addStretch(1)
@@ -1734,7 +1831,7 @@ class HealthPage(QWidget):
         show_loss_col = bool(folder_log_data)
         hr.addWidget(_lbl("#",          SEC, FONT_SM, bold=True), stretch=0)
         hr.addWidget(_lbl("File",       SEC, FONT_SM, bold=True), stretch=5)
-        hr.addWidget(_lbl("Overall",    SEC, FONT_SM, bold=True), stretch=1)
+        hr.addWidget(_lbl("Overall",    SEC, FONT_SM, bold=True), stretch=2)
         hr.addWidget(_lbl("Magnitude",  SEC, FONT_SM, bold=True), stretch=1)
         hr.addWidget(_lbl("Dead",       SEC, FONT_SM, bold=True), stretch=0)
         if show_loss_col:
@@ -1788,14 +1885,16 @@ class HealthPage(QWidget):
                 overall = result["overall"]
                 m       = result.get("metrics", {})
 
-                badge_colors = {"pass": GRN, "warn": AMB, "fail": RED}
-                badge_texts  = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}
-                ov_lbl = QLabel(badge_texts.get(overall, overall.upper()))
+                _mt_r = result.get("model_type", "sdxl")
+                _mw_r = self.get_threshold(_mt_r, "mag_warn")
+                _mf_r = self.get_threshold(_mt_r, "mag_fail")
+                _lbl_r, _col_r = _batch_label(result, _mw_r, _mf_r)
+                ov_lbl = QLabel(_lbl_r)
                 ov_lbl.setStyleSheet(
-                    f"color:{PRI}; background:{badge_colors.get(overall, MUT)};"
+                    f"color:{PRI}; background:{_col_r};"
                     f" border-radius:3px; padding:2px 6px; font-family:{FONT};"
                     f" font-size:{FONT_SM}px; font-weight:bold; border:none;")
-                rl.addWidget(ov_lbl, stretch=1)
+                rl.addWidget(ov_lbl, stretch=2)
 
                 mag_val = m.get("mean_mag", 0.0)
                 mag_color = RED if overall == "fail" else (AMB if overall == "warn" else GRN)
@@ -2415,7 +2514,7 @@ class HealthPage(QWidget):
             ("File",      meta["filename"]),
             ("Size",      meta["size_mb"]),
             ("Model",     meta["model_type"]),
-            ("Rank",      meta["rank"]),
+            ("Rank",      meta.get("rank_display") or meta["rank"]),
             ("Alpha",     meta["alpha"]),
             ("α/r Ratio", meta["ratio"]),
             ("Layers",    meta["layers"]),

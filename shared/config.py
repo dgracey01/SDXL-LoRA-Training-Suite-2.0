@@ -16,6 +16,7 @@ HF_CFG     = os.path.join(SUITE_ROOT, "launcher", "hf_config.json")
 TAGS_CFG   = os.path.join(SUITE_ROOT, "tags", "tagger_config.json")
 CALC_CFG   = os.path.join(SUITE_ROOT, "calculator", "calc_config.json")
 HEALTH_CFG = os.path.join(SUITE_ROOT, "health",     "health_config.json")
+MERGE_CFG  = os.path.join(SUITE_ROOT, "merge",      "merge_config.json")
 
 # ── Default web apps ──────────────────────────────────────────────────────────
 DEFAULT_APPS: list[dict] = [

@@ -5,12 +5,12 @@
   "last_kohya_prompts_dir": "",
   "aitoolkit_path": "X:/AI-Toolkit",
   "base_model_path": "X:/model/sdXL_v10VAEFix.safetensors",
-  "default_caption": "Created by Zero",
+  "default_caption": "",
   "version": "1.0",
   "sample_prompts": [
-    "xposed\nPhotograph of a fair-skinned woman with red hair in pigtails, wearing a purple tank top with pink straps, performing oral sex on a circumcised, erect penis. She gazes upward with slightly parted lips around the penis.",
-    "xposed, doggy_style, doggystyle, all fours, hanging breasts, sex from behind, short hair, breasts, nipples, brown hair, large breasts, pubic hair, brown eyes",
-    "xposed, duck_face, oral, penis, :>=, black hair, lips, short hair, breasts, nipples, brown hair, large breasts, pubic hair, black eyes"
+    "bangs, black hair, ff7tifa, lips, long hair, red eyes, swept bangs, tifa lockhart, white tank top",
+    "ff7tifa, armpits, black gloves, black hair, black skirt, black thighhighs, breasts, crop top, elbow gloves, gloves, large breasts, lips, long hair, midriff, red eyes, skirt, suspender skirt, suspenders, taut clothes, taut shirt, thighhighs, tifa lockhart, white tank top",
+    "A CGI-rendered image of a Tifa Lockhart, a character from the \"Final Fantasy\" series, in a dynamic pose. She has long black hair, fair skin, and a slender, athletic build. She wears a white crop top, black shorts, thigh-high stockings, and red boots. Her expression is neutral."
   ],
   "kohya_sample_prompts": [
     "",
@@ -25,7 +25,6 @@
   "cache_latents": true,
   "lora_type": "character",
   "dataset_files": "0",
-  "tagged": false,
   "rank_cap": "auto",
   "batch_size": "2",
   "at_factor": "1",
@@ -39,10 +38,11 @@
     "pose": "Recommended"
   },
   "tos_overrides": {
-    "character": "160",
-    "concept": "58",
-    "style": "250",
-    "outfit": "123",
-    "pose": "140"
-  }
+    "character": "",
+    "concept": "",
+    "style": "",
+    "outfit": "",
+    "pose": ""
+  },
+  "tagged": false
 }

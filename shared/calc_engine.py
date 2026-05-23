@@ -8,10 +8,8 @@ unit-tested independently of the UI.
 
 import math
 import os
-import re
 import json
 import yaml
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -20,44 +18,6 @@ from typing import Optional
 _HERE      = os.path.dirname(os.path.abspath(__file__))
 SUITE_ROOT = os.path.dirname(_HERE)
 LOG_FILE   = os.path.join(SUITE_ROOT, "calculator", "training_log.json")
-
-
-# ── SDXL resolution map ───────────────────────────────────────────────────────
-# (display_label, width, height, ratio_label)
-RESOLUTIONS: list[tuple[str, int, int, str]] = [
-    ("1024 × 1024", 1024, 1024, "1:1"),
-    ("1152 × 896",  1152,  896, "4:3"),
-    ("1216 × 832",  1216,  832, "3:2"),
-    ("1344 × 768",  1344,  768, "16:9"),
-    ("1536 × 640",  1536,  640, "12:5"),
-    ("896 × 1152",   896, 1152, "3:4"),
-    ("768 × 1344",   768, 1344, "9:16"),
-    ("768 × 768",    768,  768, "SD HD"),
-    ("512 × 512",    512,  512, "SD 1.5"),
-]
-
-RES_LABELS = [r[0] for r in RESOLUTIONS]
-
-# ── Network architectures ─────────────────────────────────────────────────────
-NETWORK_TYPES  = ["LoRA", "LyCORIS / LoKr", "LyCORIS / LoHa", "DoRA"]
-OPTIMIZERS     = ["AdamW8bit", "AdamW", "Prodigy", "DAdaptAdam", "Lion8bit", "SGDNesterov"]
-SCHEDULERS     = ["cosine_with_restarts", "cosine", "linear", "constant", "polynomial"]
-PRECISIONS     = ["bf16", "fp16", "fp32"]
-SAVE_FORMATS   = ["safetensors", "ckpt"]
-
-# ── VRAM estimates per optimizer (GB, rough rule-of-thumb for SDXL) ───────────
-_VRAM_BASE: dict[str, float] = {
-    "AdamW8bit":   10.0,
-    "AdamW":       14.0,
-    "Prodigy":     12.0,
-    "DAdaptAdam":  12.0,
-    "Lion8bit":    10.0,
-    "SGDNesterov":  9.0,
-}
-
-# ── Steps/time per batch for common batch sizes (seconds, A100 rough estimate) ─
-_SEC_PER_STEP_PER_BS: float = 1.8   # seconds per step at batch=1, resolution=1024
-_BS_SCALE_FACTOR:     float = 0.85  # each doubling of BS saves this fraction of time
 
 
 # ── V1 TOS-based constants ────────────────────────────────────────────────────
@@ -111,8 +71,7 @@ PRELOADED_AT = [
 SHARED_HELP = [
     ("Batch Size",    "Maximum number of images to be loaded at once. Highly dependent on your GPU's VRAM."),
     ("Dataset Files", "The total number of files in the training folder. Only .jpg, .jpeg, .png and .txt files are counted. Other formats (.webp, .bmp, .tiff, etc.) are not supported by AI-Toolkit and are excluded."),
-    ("Tagged",        "Check if Dataset is already tagged. When ON, Total Images = Dataset Files ÷ 2."),
-    ("Rank Cap",      "Controls Linear Rank calculation. Auto = type-aware (recommended). Presets: min=16, outfit=20, default=32, large=64, xlarge=128, max=256."),
+    ("Rank Cap",      "Controls Linear Rank calculation. Auto = type-aware sqrt curve (recommended). Presets: min=32, outfit=40, default=56, large=88, xlarge=128, max=256. Values raised from prior defaults — SVD analysis confirmed all previous preset values were rank-saturated."),
 ]
 
 HELP_CONTENT = {
@@ -124,7 +83,7 @@ HELP_CONTENT = {
         ("Caption Dropout",    "Rate at which captions are randomly dropped during training: Character/Concept=0.05, Outfit=0.08, Style/Pose=0.10."),
         ("Grad Accum",         "Gradient accumulation. Inverted curve — smaller datasets get lower accum for more frequent updates: ≤100=1, ≤300=2, ≤700=3, >700=4."),
         ("Eff Batch",          "Effective batch = Batch Size × Grad Accum. This is the actual gradient update frequency."),
-        ("Linear Rank",        "LoRA network dimension. Auto scales with dataset size: character=32/64/128 (≤50/≤150/>150 imgs); concept=32/64 (≤100/>100 imgs); style=32/64 (≤200/>200 imgs); outfit=16/32 (≤50/>50 imgs); pose=16 flat."),
+        ("Linear Rank",        "LoRA network dimension. Auto uses a sqrt curve calibrated from SVD analysis of 12 real LoRAs — all manual ranks showed 100% efficiency (rank-limited). Curve: rank = floor + (ceiling−floor) × √(imgs/ref), rounded to nearest 8. Ranges: character 32→128 (ref 900), concept 24→96 (ref 500), style 24→96 (ref 600), outfit 32→64 (ref 200), pose 24→48 (ref 300)."),
         ("Conv Rank",          "Convolutional rank. Derived from Linear Rank: Character/Concept/Style=50%, Outfit=40%, Pose=35%. Clamped 2–32."),
         ("ETS Signal",         "Effective Training Signal. Compares actual TOS/image against target with 5% tolerance. Good/Underfit/Overfit."),
         ("Suggested Factor",   "The R2 factor value needed to bring ETS back to Good. Copy into Manual Factor field."),
@@ -174,93 +133,6 @@ HELP_CONTENT = {
 }
 
 
-# ── Dataclass representing all user-editable training parameters ───────────────
-@dataclass
-class TrainingParams:
-    # Dataset
-    dataset_folder:   str   = ""
-    image_count:      int   = 0
-    repeats:          int   = 10
-
-    # Model
-    model_name:       str   = "stabilityai/stable-diffusion-xl-base-1.0"
-    resolution_label: str   = "1024 × 1024"
-
-    # Training
-    batch_size:       int   = 1
-    epochs:           int   = 10
-    learning_rate:    str   = "4e-4"
-    network_type:     str   = "LoRA"
-    network_dim:      int   = 32
-    network_alpha:    int   = 16
-    optimizer:        str   = "AdamW8bit"
-    scheduler:        str   = "cosine_with_restarts"
-    warmup_ratio:     float = 0.05
-    mixed_precision:  str   = "bf16"
-    save_precision:   str   = "bf16"
-    gradient_checkpointing: bool = True
-    shuffle_caption:  bool  = True
-
-    # Export
-    output_name:      str   = "my_lora"
-    output_dir:       str   = ""
-    save_every_n_epochs: int = 1
-    bucket_512:       bool  = False
-    bucket_256:       bool  = False
-    cache_latents:    bool  = True
-
-    # Caption / trigger
-    caption_extension:  str  = ".txt"
-    trigger_word:       str  = ""
-    keep_tokens:        int  = 1
-
-    # AI-Toolkit specific
-    aitk_project_name:   str       = ""
-    aitk_sample_prompts: list[str] = field(default_factory=list)
-
-
-# ── Results dataclass ─────────────────────────────────────────────────────────
-@dataclass
-class TrainingEstimate:
-    images_total:     int   = 0
-    steps_per_epoch:  int   = 0
-    total_steps:      int   = 0
-    warmup_steps:     int   = 0
-    estimated_vram:   float = 0.0
-    estimated_sec:    float = 0.0
-    estimated_days:   int   = 0
-    estimated_hours:  int   = 0
-    estimated_mins:   int   = 0
-    latent_cache_gb:  float = 0.0
-
-
-# ── Core calculation (epoch-based, for legacy use) ────────────────────────────
-def calculate(p: TrainingParams) -> TrainingEstimate:
-    r = TrainingEstimate()
-    r.images_total    = p.image_count * p.repeats
-    if r.images_total == 0 or p.batch_size == 0:
-        return r
-    r.steps_per_epoch = math.ceil(r.images_total / p.batch_size)
-    r.total_steps     = r.steps_per_epoch * p.epochs
-    r.warmup_steps    = max(1, round(r.total_steps * p.warmup_ratio))
-    base_vram         = _VRAM_BASE.get(p.optimizer, 12.0)
-    dim_factor        = 1.0 + (p.network_dim / 128) * 0.5
-    r.estimated_vram  = round(base_vram * dim_factor, 1)
-    bs_speedup        = _BS_SCALE_FACTOR ** math.log2(max(1, p.batch_size))
-    sec_per_step      = _SEC_PER_STEP_PER_BS * bs_speedup
-    total_sec         = r.total_steps * sec_per_step
-    r.estimated_sec   = total_sec
-    r.estimated_days  = int(total_sec // 86400)
-    r.estimated_hours = int((total_sec % 86400) // 3600)
-    r.estimated_mins  = int((total_sec % 3600)  // 60)
-    res_entry = next((rv for rv in RESOLUTIONS if rv[0] == p.resolution_label), None)
-    if res_entry:
-        w, h = res_entry[1], res_entry[2]
-        latent_mb_per_image = (w // 8) * (h // 8) * 4 * 2 / (1024 * 1024)
-        r.latent_cache_gb = round(p.image_count * latent_mb_per_image / 1024, 2)
-    return r
-
-
 # ── Bucket resolution list ────────────────────────────────────────────────────
 def get_bucket_resolutions(bucket_512: bool, bucket_256: bool) -> list[int]:
     lower = []
@@ -271,72 +143,9 @@ def get_bucket_resolutions(bucket_512: bool, bucket_256: bool) -> list[int]:
     return lower + [1280]
 
 
-# ── Simple YAML export (sd_trainer style) ────────────────────────────────────
-def build_aitk_yaml(p: TrainingParams, est: TrainingEstimate) -> str:
-    job_name = p.aitk_project_name or p.output_name or "my_lora"
-    config = {
-        "job": "extension",
-        "config": {
-            "name": job_name,
-            "process": [{
-                "type": "sd_trainer",
-                "training_folder": p.output_dir or "./output",
-                "device": "cuda:0",
-                "network": {"type": "lora", "linear": p.network_dim, "linear_alpha": p.network_alpha},
-                "save": {"dtype": p.save_precision, "save_every": p.save_every_n_epochs, "max_step_saves_to_keep": 4},
-                "datasets": [{
-                    "folder_path": p.dataset_folder,
-                    "caption_ext": p.caption_extension,
-                    "caption_dropout_rate": 0.05,
-                    "shuffle_tokens": p.shuffle_caption,
-                    "cache_latents_to_disk": p.cache_latents,
-                    "resolution": get_bucket_resolutions(p.bucket_512, p.bucket_256),
-                }],
-                "train": {
-                    "batch_size": p.batch_size, "steps": est.total_steps,
-                    "gradient_accumulation_steps": 1,
-                    "train_unet": True, "train_text_encoder": False,
-                    "gradient_checkpointing": p.gradient_checkpointing,
-                    "noise_scheduler": "flowmatch",
-                    "optimizer": p.optimizer.lower().replace("8bit", "_8bit"),
-                    "lr": p.learning_rate,
-                    "ema_config": {"use_ema": True, "ema_decay": 0.99},
-                    "dtype": p.mixed_precision,
-                },
-                "model": {"name_or_path": p.model_name, "is_flux": False, "quantize": False},
-                "sample": {
-                    "sampler": "flowmatch", "sample_every": p.save_every_n_epochs,
-                    "width": 1024, "height": 1024,
-                    "prompts": p.aitk_sample_prompts or [f"{p.trigger_word} test sample" if p.trigger_word else "test sample"],
-                    "neg": "", "seed": 42, "walk_seed": True,
-                    "guidance_scale": 4.0, "sample_steps": 20,
-                },
-            }],
-        },
-        "meta": {"name": "[file prefix]", "version": "1.0"},
-    }
-    return yaml.dump(config, allow_unicode=True, sort_keys=False, default_flow_style=False)
-
-
-# ── Kohya TOML export ─────────────────────────────────────────────────────────
-def build_kohya_toml(p: TrainingParams, est: TrainingEstimate) -> str:
-    lines = [
-        "[general]", "enable_bucket = true", "",
-        "[[datasets]]",
-        f"resolution = {max(next((rv[1] for rv in RESOLUTIONS if rv[0] == p.resolution_label), 1024), next((rv[2] for rv in RESOLUTIONS if rv[0] == p.resolution_label), 1024))}",
-        f"batch_size = {p.batch_size}", "",
-        "  [[datasets.subsets]]",
-        f'  image_dir = "{p.dataset_folder}"',
-        f'  caption_extension = "{p.caption_extension}"',
-        f"  num_repeats = {p.repeats}",
-        f"  keep_n_tokens = {p.keep_tokens}",
-    ]
-    return "\n".join(lines)
-
-
 # ── V1 TOS-based math ─────────────────────────────────────────────────────────
 
-def get_images(files: str, tagged: bool = False) -> int:
+def get_images(files: str) -> int:
     try:
         return int(files)
     except Exception:
@@ -367,28 +176,25 @@ def grad_ko(lt: str, imgs: int, batch: int = 2) -> int:
 
 
 def lin_rank(imgs: int, rc: str = "auto", lt: str = "character") -> int:
-    presets = {"min": 16, "outfit": 20, "default": 32, "large": 64, "xlarge": 128, "max": 256}
+    presets = {"min": 32, "outfit": 40, "default": 56, "large": 88, "xlarge": 128, "max": 256}
     if rc.lower() in presets:
         return presets[rc.lower()]
-    if lt == "character":
-        # Photos/character datasets are information-dense and fill rank slots at scale.
-        # SVD analysis confirms flat spectral spread — rank is the limiting factor for
-        # large datasets with outfit/expression/background variation.
-        if imgs <= 50:   return 32
-        if imgs <= 150:  return 64
-        return 128
-    elif lt == "concept":
-        # Concepts are simpler (object/idea, less variation than a full character).
-        if imgs <= 100:  return 32
-        return 64
-    elif lt == "style":
-        return 32 if imgs <= 200 else 64   # existing — style benefits from rank at scale
-    elif lt == "outfit":
-        # Garment details at scale need more rank to capture texture and cut variation.
-        if imgs <= 50:   return 16
-        return 32
-    else:                                  # pose
-        return 16                          # geometric patterns are naturally low-dimensional
+    # Sqrt curve: rank = floor + (ceiling - floor) * sqrt(imgs / reference), rounded to nearest 8.
+    # Calibrated from SVD batch analysis of 12 real LoRAs (2026-05-21): every manually-set
+    # rank showed 100% efficiency and flat spectra (Q2 0.55-0.64) regardless of type or size.
+    # Floors raised above historical manual choices — all previous defaults were rank-limited.
+    # (floor, ceiling, reference_images_at_ceiling)
+    _CURVE = {
+        "character": (32, 128, 900),
+        "concept":   (24,  96, 500),
+        "style":     (24,  96, 600),
+        "outfit":    (32,  64, 200),
+        "pose":      (24,  48, 300),
+    }
+    floor, ceiling, ref = _CURVE.get(lt, (32, 128, 900))
+    ratio = min(1.0, imgs / ref)
+    raw   = floor + (ceiling - floor) * math.sqrt(ratio)
+    return max(floor, min(ceiling, round(raw / 8) * 8))
 
 
 def conv_rank(lt: str, lr: int) -> int:

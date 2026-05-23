@@ -1,0 +1,43 @@
+{
+  "sd15_preset": "Standard",
+  "sdxl_preset": "Standard",
+  "sd15_overrides": {
+    "rank_min": "",
+    "rank_max": "",
+    "mag_dead": "",
+    "mag_warn": "",
+    "mag_fail": "",
+    "ratio_min": "",
+    "ratio_max": "",
+    "unet_cross_attn_bal_warn": "",
+    "unet_cross_attn_bal_fail": "",
+    "unet_self_attn_bal_warn": "",
+    "unet_self_attn_bal_fail": "",
+    "unet_ff_bal_warn": "",
+    "unet_ff_bal_fail": "",
+    "te_bal_warn": "",
+    "te_bal_fail": ""
+  },
+  "sdxl_overrides": {
+    "rank_min": "",
+    "rank_max": "",
+    "mag_dead": "",
+    "mag_warn": "",
+    "mag_fail": "",
+    "ratio_min": "",
+    "ratio_max": "",
+    "unet_cross_attn_bal_warn": "",
+    "unet_cross_attn_bal_fail": "",
+    "unet_self_attn_bal_warn": "",
+    "unet_self_attn_bal_fail": "",
+    "unet_ff_bal_warn": "",
+    "unet_ff_bal_fail": "",
+    "te_bal_warn": "",
+    "te_bal_fail": ""
+  },
+  "model_type": "SDXL",
+  "trainer": "AI Toolkit",
+  "batch_model_type": "SDXL",
+  "batch_trainer": "AI Toolkit",
+  "batch_profile": "Concept / Pose"
+}

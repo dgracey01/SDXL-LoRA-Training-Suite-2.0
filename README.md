@@ -54,7 +54,7 @@ Designed by **Zero** | Built by **Jarvis**
 - Load any `.safetensors` LoRA file and run structural checks without inference
 - **File Integrity** — verifies kohya hash metadata is present
 - **NaN / Inf** — scans every tensor for corrupted values
-- **Rank Consistency** — shape agreement between lora_down / lora_up and metadata
+- **Rank Consistency** — shape agreement between lora_down / lora_up and metadata; mixed-rank LoRAs (e.g. AI Toolkit: linear=128, conv=32) display both ranks and correctly use the dominant rank for ceiling detection
 - **Alpha/Rank Ratio** — checks declared alpha relative to rank against community bounds
 - **Rank Range** — validates rank is within recommended range per model type (SD1.5 / SDXL)
 - **Overbaked** — detects overtrained LoRAs via elevated global lora_up mean magnitude
@@ -75,7 +75,7 @@ Designed by **Zero** | Built by **Jarvis**
 - **Batch Compare** — point to a training output folder to rank all `.safetensors` candidates at once:
   - Runs all checks on every file in the background with a live progress bar
   - **Recommendation Profile** selector chooses the scoring strategy:
-    - **Concept / Pose** (default): penalizes fail/warn checks, magnitude, dead layers, and balance — general-purpose; step count is not decisive
+    - **Concept / Pose** (default): penalizes fail/warn checks, magnitude, dead layers, and balance — general-purpose; step count is not decisive; near-zero magnitude files are penalized as undercooked regardless of other scores
     - **Character / Identity**: disqualifies overbaked files, then ranks by step count (later = better) and magnitude (higher within safe range = stronger identity)
     - **Outfit / Costume**: disqualifies overbaked files, scores magnitude against a ~65% sweet spot to capture detail without bleeding into skin/hair
     - **Style / Art Direction**: disqualifies overbaked files, prefers lower magnitude (subtle influence over dominance) with a mild step preference
@@ -88,6 +88,41 @@ Designed by **Zero** | Built by **Jarvis**
 - File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
 - Drag-and-drop file input
 - Configurable thresholds — Strict / Standard / Relaxed presets per model type, with per-threshold manual overrides (amber fields, same pattern as Calculator TOS)
+
+### Model Merge
+Four-tab workspace for checkpoint and LoRA operations — all processing runs GPU-streamed (low VRAM: 2–3 tensors live at once regardless of model size).
+
+#### Checkpoint Merge
+- Merge two checkpoints (A + B) with optional third model (C) as a shared base
+- **Six methods** — each with a built-in explanation panel:
+  - **Weighted Sum** — linear blend `(1−α)·A + α·B`; simplest and most predictable
+  - **Slerp** — spherical interpolation; smoother transitions for stylistically close models
+  - **Add Difference** — delta injection `A + α·(B−C)`; graft a concept or style without retraining
+  - **TIES** — Trim · Elect Sign · Disjoint Merge; reduces interference when both fine-tunes share a base
+  - **DARE** — Drop And Rescale; random delta pruning to decorrelate conflicting parameters
+  - **DARE+TIES** — DARE preprocessing followed by TIES sign election; strongest option for divergent fine-tunes
+- **Selective Merge** — per-group alpha overrides for Text Encoders, Cross-Attention, Self-Attention, Feedforward, and Other layers
+- Built-in and custom named presets (save/load)
+- Optional VAE override — swap the VAE from any third file at merge time
+- Output precision: fp16 / bf16 / fp32
+- Health check runs automatically on every output
+
+#### LoRA Merge
+- Combine up to 4 LoRAs into a single file with independent weight and type controls per slot
+- Per-slot LoRA Type selector (Character / Pose / Detail / Style / Concept) auto-fills recommended weights
+- Combined-weight caution and warn thresholds displayed live
+- Output precision selector
+
+#### Bake LoRA
+- Permanently bake up to 4 LoRAs into a checkpoint in a single pass
+- Per-slot LoRA Type selector auto-fills recommended bake ratios (Character 0.85, Concept 0.70, etc.)
+- All slots processed in one read/write cycle — no intermediate files, no VRAM spike
+- Health check runs automatically on every output
+
+#### Extract LoRA
+- Extract a LoRA by SVD-decomposing the weight delta between a tuned model and its base
+- Rank and optional conv rank controls
+- Useful for packaging fine-tune diffs as reusable LoRAs
 
 ### Launcher
 - Embedded Chromium browser (no Chrome/Edge dependency)
@@ -164,7 +199,8 @@ Lora Training Suite 2.0/
 ├── randomizer/              # Randomizer / background removal page
 ├── faces/                   # Face Swap page
 ├── enhancer/                # Enhancer / upscaling page
-└── health/                  # LoRA Health analyzer
+├── health/                  # LoRA Health analyzer
+└── merge/                   # Model Merge (checkpoint merge, LoRA merge/bake/extract)
 ```
 
 ---

@@ -1272,12 +1272,13 @@ class ManagePage(QWidget):
     apps_changed = Signal(list) # webui list changed — notify Launcher/poller
 
     _BUILTIN_APPS = [
-        ("Tags",        "tags.png"),
-        ("Calculator",  "calculator.png"),
-        ("Enhancer",    "Enhancer.png"),
-        ("Face Swap",   "Face Swap.png"),
-        ("Randomizer",  "Randomizer.png"),
-        ("LoRA Health", "health.png"),
+        ("Tags",         "tags.png"),
+        ("Calculator",   "calculator.png"),
+        ("Enhancer",     "Enhancer.png"),
+        ("Face Swap",    "Face Swap.png"),
+        ("Randomizer",   "Randomizer.png"),
+        ("LoRA Health",  "health.png"),
+        ("Model Merge",  "merge.png"),
     ]
 
     _SECTION_LABEL = (
@@ -1565,6 +1566,8 @@ class Launcher(QMainWindow):
         self._face_index:   int | None = None
         self._enh_index:    int | None = None
         self._health_index: int | None = None
+        self._merge_page:   None                = None
+        self._merge_index:  int | None = None
         self._poll_timer:   QTimer | None = None
 
         self._build_ui()
@@ -1661,6 +1664,8 @@ class Launcher(QMainWindow):
             "Enhancer", self._show_enhancer, closeable=True)
         self._health_tab = self._make_nav_tab(
             "LoRA Health", self._show_health, closeable=True)
+        self._merge_tab  = self._make_nav_tab(
+            "Model Merge", self._show_merge, closeable=True)
 
         self._tags_tab.close_requested.connect(self._close_tags)
         self._calc_tab.close_requested.connect(self._close_calculator)
@@ -1668,9 +1673,11 @@ class Launcher(QMainWindow):
         self._face_tab.close_requested.connect(self._close_faceswap)
         self._enh_tab.close_requested.connect(self._close_enhancer)
         self._health_tab.close_requested.connect(self._close_health)
+        self._merge_tab.close_requested.connect(self._close_merge)
 
         for btn in (self._tags_tab, self._calc_tab, self._rand_tab,
-                    self._face_tab, self._enh_tab, self._health_tab):
+                    self._face_tab, self._enh_tab, self._health_tab,
+                    self._merge_tab):
             hrow.addWidget(btn)
             hrow.addSpacing(4)
             btn.setVisible(False)   # hidden until app is opened
@@ -1761,6 +1768,7 @@ class Launcher(QMainWindow):
         self._face_tab.set_active(False)
         self._enh_tab.set_active(False)
         self._health_tab.set_active(False)
+        self._merge_tab.set_active(False)
         for entry in self._tab_data.values():
             entry["tab_btn"].set_active(False)
 
@@ -1780,7 +1788,8 @@ class Launcher(QMainWindow):
             "Enhancer":    self._show_enhancer,
             "Face Swap":   self._show_faceswap,
             "Randomizer":  self._show_randomizer,
-            "LoRA Health": self._show_health,
+            "LoRA Health":  self._show_health,
+            "Model Merge":  self._show_merge,
         }
         fn = dispatch.get(name)
         if fn:
@@ -2028,6 +2037,37 @@ class Launcher(QMainWindow):
         self._rebuild_stack_index()
         self._show_manage()
 
+    def _show_merge(self):
+        self._merge_tab.setVisible(True)
+        if self._merge_page is None:
+            from merge.merge_page import MergePage
+            self._merge_page  = MergePage()
+            self._merge_index = self._stack.addWidget(self._merge_page)
+            self._merge_tab.set_dot_online(True)
+        self._deactivate_all()
+        self._merge_tab.set_active(True)
+        self._active_url = None
+        self._stack.setCurrentIndex(self._merge_index)
+        self._set_zoom_display(1.0)
+
+    def _close_merge(self):
+        if self._merge_page is None:
+            return
+        self._merge_page.cleanup()
+        self._stack.removeWidget(self._merge_page)
+        self._merge_page.deleteLater()
+        self._merge_page  = None
+        self._merge_index = None
+        self._merge_tab.set_active(False)
+        self._merge_tab.set_dot_online(False)
+        self._merge_tab.setVisible(False)
+        import sys
+        for key in list(sys.modules.keys()):
+            if key.startswith("merge"):
+                del sys.modules[key]
+        self._rebuild_stack_index()
+        self._show_manage()
+
     def _rebuild_stack_index(self):
         self._stack_index.clear()
         for url, entry in self._tab_data.items():
@@ -2046,6 +2086,8 @@ class Launcher(QMainWindow):
             self._enh_index = self._stack.indexOf(self._enh_page)
         if self._health_page:
             self._health_index = self._stack.indexOf(self._health_page)
+        if self._merge_page:
+            self._merge_index = self._stack.indexOf(self._merge_page)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Settings

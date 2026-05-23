@@ -50,7 +50,6 @@ DEFAULTS: dict = {
     "cache_latents":          True,
     "lora_type":              "character",
     "dataset_files":          "0",
-    "tagged":                 False,
     "rank_cap":               "auto",
     "batch_size":             "2",
     "at_factor":              "1",
