@@ -483,13 +483,17 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
 
     for dk in down_keys:
         t = tensors[dk]
+        if t.ndim < 2:
+            continue  # bias vectors in extracted LoRAs — not weight matrices
         r = t.shape[0]
         actual_ranks.add(r)
         uk = dk.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
         if uk in tensors:
-            up_r = tensors[uk].shape[1]
-            if r != up_r:
-                rank_errors.append(f"{dk}: down={r} ≠ up={up_r}")
+            up_t = tensors[uk]
+            if up_t.ndim >= 2:
+                up_r = up_t.shape[1]
+                if r != up_r:
+                    rank_errors.append(f"{dk}: down={r} ≠ up={up_r}")
 
     if meta_rank is not None:
         for r in actual_ranks:
@@ -1253,20 +1257,39 @@ class _BatchWorker(QObject):
         self._stop = True
 
     def run(self):
-        out   = []
-        total = len(self._paths)
-        for i, path in enumerate(self._paths):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        paths  = self._paths
+        total  = len(paths)
+        out    = {}
+        _lock  = threading.Lock()
+        _done  = [0]
+
+        def _task(idx: int, path: str):
             if self._stop:
-                break
-            self.progress.emit(i + 1, total, os.path.basename(path))
+                return
             try:
-                out.append({"path": path,
-                            "result": _analyse(path, self._get_fn,
-                                               trainer_override=self._trainer_override),
-                            "error": None})
+                result = _analyse(path, self._get_fn,
+                                  trainer_override=self._trainer_override)
+                entry  = {"path": path, "result": result, "error": None}
             except Exception as exc:
-                out.append({"path": path, "result": None, "error": str(exc)})
-        self.finished.emit(out)
+                entry  = {"path": path, "result": None, "error": str(exc)}
+            with _lock:
+                _done[0] += 1
+                n = _done[0]
+                out[idx] = entry
+            self.progress.emit(n, total, os.path.basename(path))
+
+        workers = min(4, max(1, total))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_task, i, p) for i, p in enumerate(paths)]
+            for fut in as_completed(futs):
+                if self._stop:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+
+        self.finished.emit([out[i] for i in sorted(out)])
 
 
 # ── HealthPage ────────────────────────────────────────────────────────────────
