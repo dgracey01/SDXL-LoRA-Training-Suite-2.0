@@ -4620,7 +4620,9 @@ class _TaggerThread(QThread):
                     f"Error: {os.path.basename(img_path)}: {e}")
 
         try:
-            import torch
+            import torch, gc as _gc
+            del model, proc
+            _gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
@@ -4800,7 +4802,9 @@ class _TaggerThread(QThread):
                     f"Error: {os.path.basename(img_path)}: {e}")
 
         try:
-            import torch
+            import torch, gc as _gc
+            del model, tokenizer
+            _gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
