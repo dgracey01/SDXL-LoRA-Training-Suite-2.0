@@ -42,9 +42,11 @@ def slerp(a: Tensor, b: Tensor, alpha: float = 0.5, **kwargs) -> Tensor:
     """Spherical linear interpolation between two parameter tensors."""
     a_f = a.float().flatten()
     b_f = b.float().flatten()
-    an  = a_f / (a_f.norm() + 1e-8)
-    bn  = b_f / (b_f.norm() + 1e-8)
-    cos_theta = (an * bn).sum().clamp(-1.0, 1.0)
+    # Compute cosine via dot product — avoids allocating two full-size
+    # normalised copies (an, bn) that would double peak memory usage.
+    na  = a_f.norm().item()
+    nb  = b_f.norm().item()
+    cos_theta = (torch.dot(a_f, b_f) / ((na + 1e-8) * (nb + 1e-8))).clamp(-1.0, 1.0)
     theta = torch.acos(cos_theta)
     if theta.abs() < 1e-6:
         return weighted_sum(a, b, alpha)

@@ -110,10 +110,32 @@ def _maybe_open(path: str | None, device: str):
 
 
 def _save(tensors: dict, path: str, metadata: dict | None = None):
+    import tempfile
     from safetensors.torch import save_file
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    save_file({k: v.contiguous() for k, v in tensors.items()},
-              path, metadata=metadata or {})
+    abs_path = os.path.abspath(path)
+    out_dir   = os.path.dirname(abs_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    # Write to a temp file first, then atomically replace the destination.
+    # This means the destination is never deleted unless the write succeeds,
+    # and save_file never touches a file that may have a Windows user-mapped
+    # section open (ERROR_USER_MAPPED_FILE) — the temp file is always new.
+    fd, tmp = tempfile.mkstemp(dir=out_dir, suffix=".tmp")
+    os.close(fd)
+    try:
+        save_file({k: v.contiguous() for k, v in tensors.items()},
+                  tmp, metadata=metadata or {})
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    # Remove destination first so os.replace succeeds even if it is mapped.
+    try:
+        os.remove(abs_path)
+    except OSError:
+        pass
+    os.replace(tmp, abs_path)
 
 
 # ── Checkpoint merge ──────────────────────────────────────────────────────────
@@ -458,16 +480,58 @@ def _lora_delta_from_handles(f, dk: str) -> torch.Tensor | None:
     return d * scale
 
 
+def _lora_delta_from_dict(tensors: dict, dk: str, dev: str) -> torch.Tensor | None:
+    """Compute delta for one layer from a preloaded tensor dict.
+    Moves only the tensors needed for this key to dev — CPU dict stays intact.
+    """
+    uk = dk.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
+    if uk not in tensors:
+        return None
+
+    down = tensors[dk].float().to(dev)
+    up   = tensors[uk].float().to(dev)
+
+    alpha_key = dk.rsplit(".", 1)[0] + ".alpha"
+    alpha = float(tensors[alpha_key].item()) if alpha_key in tensors else float(down.shape[0])
+    dim   = down.shape[0]
+    scale = alpha / dim
+
+    if down.dim() == 4:
+        d = (up.view(up.shape[0], -1) @ down.view(down.shape[0], -1)).view(
+            up.shape[0], down.shape[1], down.shape[2], down.shape[3])
+    else:
+        d = up @ down
+
+    del down, up
+    return d * scale
+
+
 def _svd_decompose(delta: torch.Tensor, rank: int, ref_dtype: torch.dtype,
                    is_conv4d: bool, conv_shape: tuple | None
-                   ) -> tuple[torch.Tensor, torch.Tensor]:
+                   ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """
     SVD-decompose a delta matrix into (down, up) pair.
     For conv layers: operates on the 2D view, reshapes down back to 4D.
+    Returns None if the matrix is too ill-conditioned to decompose.
     """
     d_2d = delta.view(delta.shape[0], -1) if is_conv4d else delta
 
-    U, S, Vh = torch.linalg.svd(d_2d, full_matrices=False)
+    # Stage 1: standard SVD (GPU or CPU, whichever the tensor is on).
+    try:
+        U, S, Vh = torch.linalg.svd(d_2d, full_matrices=False)
+    except Exception:
+        # Stage 2: move to CPU float32 — LAPACK's gesdd is more numerically
+        # stable than CUDA's SVD for ill-conditioned or near-singular matrices.
+        try:
+            d_cpu = d_2d.cpu().float()
+            U, S, Vh = torch.linalg.svd(d_cpu, full_matrices=False)
+            U  = U.to(delta.device)
+            S  = S.to(delta.device)
+            Vh = Vh.to(delta.device)
+        except Exception:
+            # Stage 3: give up — skip this layer rather than crash the merge.
+            return None
+
     rank_used = min(rank, len(S))
     U   = U[:, :rank_used]
     S   = S[:rank_used]
@@ -502,17 +566,22 @@ def merge_loras(
     """
     dev = resolve_device(device)
 
-    # Build key universe and collect rank/shape info (header reads only)
+    # Preload all tensors from every LoRA into CPU dicts once.
+    # Previously the inner loop re-opened each file for every key (~400-800
+    # open/close cycles per LoRA), making a 2-LoRA merge take hours.
+    # Now each file is read exactly once; per-key processing works from RAM.
+    if progress_fn:
+        progress_fn(0, 1, "Loading LoRA files…")
+    lora_data: list[tuple[dict, float]] = []
     all_down_keys: set[str] = set()
-    file_handles = []
-
-    # We'll process with streaming — open all handles at once
-    # First pass: collect all lora_down keys from each file header
-    for p in lora_paths:
-        with _open(p, "cpu") as f:   # CPU for header scan — no tensor data
+    for p, w in zip(lora_paths, weights):
+        tensors: dict = {}
+        with _open(p, "cpu") as f:
             for k in f.keys():
+                tensors[k] = f.get_tensor(k).clone()
                 if "lora_down" in k or "lora_A" in k:
                     all_down_keys.add(k)
+        lora_data.append((tensors, w))
 
     total        = len(all_down_keys)
     merged       = {}
@@ -523,45 +592,94 @@ def merge_loras(
         if progress_fn:
             progress_fn(i, total, dk)
 
-        delta:    torch.Tensor | None = None
-        max_rank: int                 = 4
+        uk         = dk.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
+        alpha_stem = dk.rsplit(".", 1)[0] + ".alpha"
+
+        # Collect per-LoRA (up, down) pairs with sqrt(|w|·scale) applied to both sides.
+        # Mathematically: up_eff @ down_eff = sign(w)·|w|·scale · up @ down = w·scale·(up@down)
+        # Concatenating across LoRAs gives M·N = delta without ever forming the full [out,in] matrix.
+        ups:   list[torch.Tensor] = []
+        downs: list[torch.Tensor] = []
         ref_dtype  = torch.float16
         is_conv4d  = False
-        conv_shape = None
+        conv_shape: tuple | None  = None
+        max_rank   = 4
 
-        for p, w in zip(lora_paths, weights):
-            with _open(p, dev) as f:
-                fkeys = set(f.keys())
-                if dk not in fkeys:
-                    continue
-                ref_dtype  = f.get_tensor(dk).dtype
-                ref_down   = f.get_tensor(dk).float()
-                is_conv4d  = ref_down.dim() == 4
-                conv_shape = ref_down.shape if is_conv4d else None
-                max_rank   = max(max_rank, ref_down.shape[0])
-                del ref_down
+        for tensors, w in lora_data:
+            if dk not in tensors or uk not in tensors:
+                continue
+            down_t = tensors[dk]
+            up_t   = tensors[uk]
+            ref_dtype  = down_t.dtype
+            r          = down_t.shape[0]
+            max_rank   = max(max_rank, r)
+            is_conv4d  = down_t.dim() == 4
+            conv_shape = down_t.shape if is_conv4d else None
 
-                d = _lora_delta_from_handles(f, dk)
-                if d is None:
-                    continue
-                delta = (d * w) if delta is None else (delta + d * w)
-                del d
+            alpha = float(tensors[alpha_stem].item()) if alpha_stem in tensors else float(r)
+            half  = (abs(w) * alpha / r) ** 0.5   # sqrt(|w|·scale)
+            sign  = 1.0 if w >= 0.0 else -1.0
 
-        if delta is None:
+            down_2d = down_t.float().to(dev)
+            if is_conv4d:
+                down_2d = down_2d.view(r, -1)          # [r, in·kH·kW]
+            up_2d = up_t.float().to(dev)
+            if up_2d.dim() == 4:
+                up_2d = up_2d.view(up_2d.shape[0], r)  # [out, r]
+
+            ups.append(up_2d   * (half * sign))
+            downs.append(down_2d * half)
+
+        if not ups:
             skipped += 1
             continue
 
-        rank     = output_rank if output_rank > 0 else max_rank
-        new_down, new_up = _svd_decompose(
-            delta, rank, ref_dtype, is_conv4d, conv_shape)
+        # M: [out, N·r]   N_mat: [N·r, in_flat]   delta = M @ N_mat
+        # Never materialise the full [out, in_flat] matrix.
+        M     = torch.cat(ups,   dim=1)
+        N_mat = torch.cat(downs, dim=0)
+        del ups, downs
 
-        uk = dk.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
-        merged[dk] = new_down.cpu()
-        merged[uk] = new_up.cpu()
-        merged[dk.rsplit(".", 1)[0] + ".alpha"] = torch.tensor(float(new_down.shape[0]))
+        # Two-stage economy SVD — operates on [out, N·r] and [N·r, in_flat].
+        # For r=96, N=2: [out, 192] and [192, in] instead of [out, in].
+        # FLOPs reduction: ~35× for typical SDXL attention/ff sizes.
+        rank_out = output_rank if output_rank > 0 else max_rank
+        try:
+            U_m, S_m, Vh_m = torch.linalg.svd(M, full_matrices=False)
+            A = (S_m.unsqueeze(1) * Vh_m) @ N_mat      # [N·r, in_flat]
+            U_a, S_a, Vh_a = torch.linalg.svd(A, full_matrices=False)
+        except Exception:
+            try:
+                M_c = M.cpu(); N_c = N_mat.cpu()
+                U_m, S_m, Vh_m = torch.linalg.svd(M_c, full_matrices=False)
+                A = (S_m.unsqueeze(1) * Vh_m) @ N_c
+                U_a, S_a, Vh_a = torch.linalg.svd(A, full_matrices=False)
+                U_m = U_m.to(dev); U_a = U_a.to(dev)
+                S_a = S_a.to(dev); Vh_a = Vh_a.to(dev)
+            except Exception:
+                skipped += 1
+                del M, N_mat
+                continue
+
+        del M, N_mat, A, S_m, Vh_m
+
+        rank_actual = min(rank_out, U_m.shape[1], S_a.shape[0])
+        U_full  = U_m @ U_a
+        sqrt_s  = S_a[:rank_actual].clamp(min=0).sqrt()
+        new_up  = (U_full[:, :rank_actual] * sqrt_s).to(ref_dtype).cpu()
+        new_dn  = (sqrt_s.unsqueeze(1) * Vh_a[:rank_actual]).to(ref_dtype).cpu()
+        del U_m, U_a, S_a, Vh_a, U_full, sqrt_s
+
+        if is_conv4d and conv_shape is not None:
+            new_dn = new_dn.view(rank_actual, *conv_shape[1:])
+            new_up = new_up.view(new_up.shape[0], rank_actual, 1, 1)
+
+        merged[dk]         = new_dn
+        merged[uk]         = new_up
+        merged[alpha_stem] = torch.tensor(float(rank_actual))
         merged_count += 1
+        del new_up, new_dn
 
-        del delta, new_down, new_up
         if "cuda" in dev and i % 50 == 49:
             _gc(dev)
 
@@ -766,13 +884,17 @@ def bake_loras(
 
     dev = resolve_device(device)
 
-    # Load checkpoint to CPU — it stays in RAM as the accumulation target
+    # Load checkpoint to CPU — it stays in RAM as the accumulation target.
+    # .clone() is critical on Windows: safe_open returns mmap-backed tensors on
+    # device="cpu" (zero-copy). Without clone() the mmap stays alive after the
+    # `with` block exits because tensors still reference it, and save_file later
+    # fails with ERROR_USER_MAPPED_FILE when writing to any output on that volume.
     ckpt:      dict = {}
     ckpt_meta: dict = {}
     with _open(checkpoint_path, "cpu") as f:
         ckpt_meta = f.metadata() or {}
         for k in f.keys():
-            ckpt[k] = f.get_tensor(k)
+            ckpt[k] = f.get_tensor(k).clone()
 
     # Forward map: lora_stem → ckpt_key  (unambiguous — derived from ckpt keys)
     lora_map = _build_lora_map(set(ckpt.keys()))
@@ -864,6 +986,115 @@ def bake_loras(
     return {"merged": total_mapped, "skipped": total_skipped}
 
 
+def bake_loras_sequential(
+    checkpoint_path: str,
+    steps:           list[tuple[str, float, str]],
+    precision:       str  = "fp16",
+    device:          str  = "auto",
+    save_each_step:  bool = False,
+    progress_fn:     Callable[[int, int, str], None] | None = None,
+) -> list[dict]:
+    """
+    Bake LoRAs into a checkpoint sequentially, loading the checkpoint once.
+
+    Each step uses the previous result as the base — avoids re-reading the
+    6+ GB checkpoint from disk for every step.  The in-memory dict is mutated
+    across all steps; only the final result (or each intermediate when
+    save_each_step=True) is written to disk.
+
+    steps: list of (lora_path, multiplier, output_path) tuples.
+    Returns a list of {merged, skipped} stats, one per step.
+    """
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+    out_dtype = dtype_map.get(precision, torch.float16)
+    dev       = resolve_device(device)
+
+    ckpt:      dict = {}
+    ckpt_meta: dict = {}
+    with _open(checkpoint_path, "cpu") as f:
+        ckpt_meta = f.metadata() or {}
+        for k in f.keys():
+            ckpt[k] = f.get_tensor(k).clone()
+
+    lora_map = _build_lora_map(set(ckpt.keys()))
+
+    def _resolve(dk: str) -> str | None:
+        stem = dk
+        for sfx in (".lora_down.weight", ".lora_A.weight", ".lora_down", ".lora_A"):
+            if stem.endswith(sfx):
+                stem = stem[: -len(sfx)]
+                break
+        if stem in lora_map:
+            return lora_map[stem]
+        if stem.startswith("lora_unet_"):
+            inner = stem[len("lora_unet_"):]
+            cv = _diffusers_stem_to_compvis(inner)
+            if cv and cv in ckpt:
+                return cv
+            if cv:
+                base = cv[:-7] if cv.endswith(".weight") else cv
+                if base in ckpt:
+                    return base
+                if base + ".weight" in ckpt:
+                    return base + ".weight"
+        return None
+
+    total_keys = 0
+    for lora_path, _, _ in steps:
+        with _open(lora_path, "cpu") as fl:
+            total_keys += sum(1 for k in fl.keys()
+                              if "lora_down" in k or "lora_A" in k)
+
+    all_stats = []
+    done      = 0
+    n_steps   = len(steps)
+
+    for step_idx, (lora_path, multiplier, step_out) in enumerate(steps):
+        lora_name = os.path.basename(lora_path)
+        mapped  = 0
+        skipped = 0
+
+        with _open(lora_path, dev) as fl:
+            down_keys = [k for k in fl.keys() if "lora_down" in k or "lora_A" in k]
+            for dk in down_keys:
+                if progress_fn:
+                    progress_fn(done, total_keys,
+                                f"[{step_idx+1}/{n_steps}] {lora_name}  {dk[:50]}")
+                delta = _lora_delta_from_handles(fl, dk)
+                if delta is None:
+                    skipped += 1
+                    done    += 1
+                    continue
+                ckpt_key = _resolve(dk)
+                if ckpt_key is None:
+                    del delta
+                    skipped += 1
+                    done    += 1
+                    continue
+                base           = ckpt[ckpt_key].float().to(dev)
+                ckpt[ckpt_key] = (base + delta * multiplier).cpu().to(out_dtype)
+                del base, delta
+                mapped += 1
+                done   += 1
+                if "cuda" in dev and done % 100 == 0:
+                    _gc(dev)
+
+        if progress_fn:
+            progress_fn(done, total_keys,
+                        f"{lora_name}: {mapped} layers baked, {skipped} skipped")
+
+        all_stats.append({"merged": mapped, "skipped": skipped})
+
+        is_last = (step_idx == n_steps - 1)
+        if save_each_step or is_last:
+            if progress_fn and is_last:
+                progress_fn(total_keys, total_keys, "Saving…")
+            _gc(dev)
+            _save(ckpt, step_out, ckpt_meta)
+
+    return all_stats
+
+
 # ── LoRA extraction from checkpoint delta ─────────────────────────────────────
 
 def _ckpt_to_lora_key(key: str) -> str | None:
@@ -953,10 +1184,12 @@ def extract_lora(
                 continue
 
             conv_shape = delta.shape if is_conv else None
-            new_down, new_up = _svd_decompose(
-                delta, rank, torch.float16, is_conv, conv_shape)
+            result     = _svd_decompose(delta, rank, torch.float16, is_conv, conv_shape)
             del delta
+            if result is None:
+                continue
 
+            new_down, new_up = result
             out[lora_key + ".lora_down.weight"] = new_down.cpu()
             out[lora_key + ".lora_up.weight"]   = new_up.cpu()
             out[lora_key + ".alpha"]             = torch.tensor(float(rank))
@@ -982,3 +1215,91 @@ def extract_lora(
         "rank": str(rank),
         "conv_layers": str(conv_layers),
     })
+
+
+# ── Sequential bake pre-flight analysis ──────────────────────────────────────
+
+def analyse_bake_preflight(
+    checkpoint_path: str,
+    lora_entries:    list[tuple[str, float]],
+) -> list[str]:
+    """
+    Fast pre-flight compatibility check for sequential bake mode.
+    Reads only safetensors header metadata — no full tensor loads.
+    Returns list of warning/info strings prefixed with ✓ / ℹ / ⚠ / ✗.
+    """
+    results: list[str] = []
+
+    # Checkpoint keys only — safetensors lazy-loads, this reads only the header
+    with _open(checkpoint_path, "cpu") as f:
+        ckpt_keys = set(f.keys())
+    lora_map = _build_lora_map(ckpt_keys)
+
+    lora_info: list[dict] = []
+    for idx, (path, ratio) in enumerate(lora_entries, 1):
+        with _open(path, "cpu") as f:
+            lora_keys = list(f.keys())
+
+        has_te  = any("lora_te_"  in k for k in lora_keys)
+        has_te2 = any("lora_te2_" in k for k in lora_keys)
+
+        stems: set[str] = set()
+        for k in lora_keys:
+            for sfx in (".lora_down.weight", ".lora_A.weight",
+                        ".lora_up.weight",   ".lora_B.weight",
+                        ".lora_down", ".lora_up", ".lora_A", ".lora_B", ".alpha"):
+                if k.endswith(sfx):
+                    stems.add(k[: -len(sfx)])
+                    break
+
+        total   = len(stems)
+        mapped  = sum(1 for s in stems if s in lora_map)
+        map_pct = (100 * mapped // total) if total else 0
+
+        lora_info.append({
+            "idx": idx, "ratio": ratio, "stems": stems,
+            "has_te": has_te, "has_te2": has_te2,
+            "mapped": mapped, "total": total, "map_pct": map_pct,
+        })
+
+        if total > 0 and map_pct < 10:
+            results.append(
+                f"✗  LoRA {idx}: Incompatible — only {mapped}/{total} layers "
+                f"match checkpoint architecture")
+        elif total > 0 and map_pct < 50:
+            results.append(
+                f"⚠  LoRA {idx}: Partial match — {mapped}/{total} layers "
+                f"mapped ({map_pct}%); remainder will be skipped")
+
+        if has_te2:
+            results.append(
+                f"⚠  LoRA {idx}: SDXL dual text encoder (te1/te2) detected — "
+                f"verify checkpoint is SDXL")
+        elif has_te:
+            results.append(
+                f"ℹ  LoRA {idx}: Includes text encoder layers — "
+                f"sequential stacking increases prompt conditioning drift")
+
+    n = len(lora_info)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = lora_info[i]["stems"], lora_info[j]["stems"]
+            if not a:
+                continue
+            pct = 100 * len(a & b) // len(a)
+            li, lj = lora_info[i]["idx"], lora_info[j]["idx"]
+            if pct >= 75:
+                results.append(
+                    f"⚠  LoRA {li} × LoRA {lj}: {pct}% shared layers — "
+                    f"contested weights accumulate pressure across both steps")
+            elif pct >= 40:
+                results.append(
+                    f"ℹ  LoRA {li} × LoRA {lj}: {pct}% shared layers — "
+                    f"moderate overlap")
+
+    if not results:
+        results.append(
+            f"✓  No compatibility issues detected across "
+            f"{n} LoRA{'s' if n > 1 else ''}")
+
+    return results

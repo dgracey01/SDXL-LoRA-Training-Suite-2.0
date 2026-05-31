@@ -4,10 +4,11 @@ Tabs: Checkpoint Merge | LoRA Merge | Bake LoRA | Help
 """
 from __future__ import annotations
 
+import gc
 import os
 import threading
 
-from PySide6.QtCore    import Qt, Signal, QObject
+from PySide6.QtCore    import Qt, Signal, QObject, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QLineEdit, QPushButton, QComboBox, QSlider, QDoubleSpinBox,
@@ -67,6 +68,9 @@ _CFG_DEFAULTS = {
     "bake_lora_2":    "", "bake_type_2": "Character", "bake_ratio_2": 0.85,
     "bake_lora_3":    "", "bake_type_3": "Character", "bake_ratio_3": 0.85,
     "bake_lora_4":    "", "bake_type_4": "Character", "bake_ratio_4": 0.85,
+    "bake_sequential":         False,
+    "bake_keep_intermediates": False,
+    "bake_overwrite":          True,
 }
 
 # ── LoRA type presets (ported from kohya_rocm/gui.py) ─────────────────────────
@@ -76,12 +80,99 @@ _LORA_TYPES = ["Character", "Pose", "Detail", "Style", "Concept"]
 _BAKE_PRESET  = {"Character": 0.85, "Pose": 0.88, "Detail": 0.75, "Style": 0.75, "Concept": 0.70}
 _MERGE_PRESET = {"Character": 0.75, "Pose": 0.78, "Detail": 0.65, "Style": 0.60, "Concept": 0.50}
 
+
+def _read_lora_rank(path: str) -> str:
+    """Read rank from safetensors header only (no tensor data). Returns display string."""
+    try:
+        import struct, json as _json
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            header = _json.loads(f.read(n))
+        linear, conv = set(), set()
+        for k, v in header.items():
+            if k == "__metadata__":
+                continue
+            shape = v.get("shape", [])
+            if ("lora_down" in k or "lora_A" in k) and len(shape) >= 2:
+                (conv if len(shape) == 4 else linear).add(shape[0])
+        if not linear and not conv:
+            return "rank: ?"
+        parts = []
+        if linear:
+            parts.append(f"linear {max(linear)}")
+        if conv and conv != linear:
+            parts.append(f"conv {max(conv)}")
+        return "rank: " + " / ".join(parts)
+    except Exception:
+        return ""
+
+
+def _read_lora_rank_int(path: str) -> int:
+    """Return max linear rank as integer, or 0 on any failure."""
+    try:
+        import struct, json as _json
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            header = _json.loads(f.read(n))
+        linear = set()
+        for k, v in header.items():
+            if k == "__metadata__":
+                continue
+            shape = v.get("shape", [])
+            if ("lora_down" in k or "lora_A" in k) and len(shape) == 2:
+                linear.add(shape[0])
+        return max(linear) if linear else 0
+    except Exception:
+        return 0
+
 _BAKE_MAX   = {"Character": 1.00, "Pose": 0.95, "Detail": 0.85, "Style": 0.85, "Concept": 0.80}
 _MERGE_MAX  = {"Character": 0.90, "Pose": 0.92, "Detail": 0.80, "Style": 0.80, "Concept": 0.70}
 
 # Combined-total thresholds
 _CAUTION_AT = 1.5
 _WARN_AT    = 2.0
+
+
+def _encode_ratio(r: float) -> str:
+    """Encode a bake ratio as a compact integer string.
+
+    0.25 → '25', 0.30 → '3', 0.80 → '8', 1.0 → '100'
+    Rule: int(r*100), strip trailing zeros, but keep '100' whole.
+    """
+    v = int(round(r * 100))
+    s = str(v)
+    if s != "100":
+        s = s.rstrip("0") or "0"
+    return s
+
+
+def _build_seq_names(
+    ckpt_path: str,
+    slot_ratios: list[float],       # 4-element: ratio per UI slot (0.0 if empty)
+    active_slot_indices: list[int], # which slots are occupied, in UI order
+    out_dir: str,
+) -> list[str]:
+    """Return one output path per sequential bake step using actual slot positions.
+
+    Example: slots 0 and 2 at 0.70 →
+      ['PixarMix-v01-7-0-0-0.safetensors', 'PixarMix-v01-7-0-7-0.safetensors']
+    LoRA 1+3 and LoRA 1+2 produce different but correct names — no ordering requirement.
+    """
+    stem = os.path.splitext(os.path.basename(ckpt_path))[0]
+    n_slots = 4
+    paths = []
+    baked: set[int] = set()
+    for slot_idx in active_slot_indices:
+        baked.add(slot_idx)
+        slots = []
+        for i in range(n_slots):
+            if i in baked:
+                slots.append(_encode_ratio(slot_ratios[i]))
+            else:
+                slots.append("0")
+        fname = f"{stem}-{'-'.join(slots)}.safetensors"
+        paths.append(os.path.normpath(os.path.join(out_dir, fname)))
+    return paths
 
 # ── Checkpoint method detailed help ──────────────────────────────────────────
 
@@ -377,11 +468,12 @@ def _vram_info_text() -> str:
 # ── Worker signal carrier ──────────────────────────────────────────────────────
 
 class _Worker(QObject):
-    progress     = Signal(int, int, str)
-    finished     = Signal()
-    error        = Signal(str)
-    health_done  = Signal(dict)   # checkpoint health: 4 indicator results
-    lora_health  = Signal(dict)   # full LoRA analysis result (extract tab)
+    progress       = Signal(int, int, str)
+    finished       = Signal()
+    error          = Signal(str)
+    health_done    = Signal(dict)    # checkpoint health: 4 indicator results
+    lora_health    = Signal(dict)    # full LoRA analysis result (extract tab)
+    preflight_done = Signal(object)  # list[str] — pre-flight analysis lines
 
 
 # ── MergePage ─────────────────────────────────────────────────────────────────
@@ -1141,6 +1233,18 @@ class MergePage(QWidget):
             path_row.addWidget(btn)
             fl.addLayout(path_row)
 
+            rank_lbl = QLabel("")
+            rank_lbl.setStyleSheet(
+                f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
+            fl.addWidget(rank_lbl)
+
+            def _refresh_rank(text, lbl=rank_lbl):
+                p = text.strip()
+                lbl.setText(_read_lora_rank(p) if p and os.path.isfile(p) else "")
+            path_edit.textChanged.connect(_refresh_rank)
+            _refresh_rank(path_edit.text())
+
             tw_row = QHBoxLayout()
             tw_row.setSpacing(6)
             type_combo = QComboBox()
@@ -1232,7 +1336,42 @@ class MergePage(QWidget):
         btn_lo.setFixedWidth(90)
         btn_lo.clicked.connect(lambda: self._save_as(self._lo_out, "lora_output"))
         ol.addLayout(_file_row("Output File", self._lo_out, btn_lo))
+
+        # Output rank
+        rank_row = QHBoxLayout()
+        rank_row.setSpacing(8)
+        rank_row.addWidget(_lbl("Output Rank", SEC, FONT_SM))
+        self._lo_rank = QSpinBox()
+        self._lo_rank.setRange(0, 512)
+        self._lo_rank.setSingleStep(8)
+        self._lo_rank.setValue(self._cfg.get("lora_rank", 0))
+        self._lo_rank.setSpecialValueText("0 = auto")
+        self._lo_rank.setFixedWidth(80)
+        self._lo_rank.setStyleSheet(_field_style())
+        self._lo_rank.valueChanged.connect(
+            lambda v: self._cfg.update({"lora_rank": v}))
+        rank_row.addWidget(self._lo_rank)
+        self._lo_max_rank_lbl = QLabel("(max rank: —)")
+        self._lo_max_rank_lbl.setStyleSheet(
+            f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; border:none;")
+        rank_row.addWidget(self._lo_max_rank_lbl)
+        rank_row.addStretch(1)
+        ol.addLayout(rank_row)
         layout.addWidget(out_card)
+
+        # Wire max-rank counter to all 4 slot path inputs
+        def _update_max_rank():
+            total = sum(
+                _read_lora_rank_int(e.text().strip())
+                for e in (self._lo_a, self._lo_b, self._lo_c, self._lo_d)
+                if e.text().strip() and os.path.isfile(e.text().strip())
+            )
+            self._lo_max_rank_lbl.setText(
+                f"(max rank: {total})" if total else "(max rank: —)")
+        for _e in (self._lo_a, self._lo_b, self._lo_c, self._lo_d):
+            _e.textChanged.connect(lambda _: _update_max_rank())
+        _update_max_rank()
 
         # ── Run ───────────────────────────────────────────────────────────
         run_card = _card()
@@ -1337,6 +1476,18 @@ class MergePage(QWidget):
             path_row.addWidget(btn)
             fl.addLayout(path_row)
 
+            rank_lbl = QLabel("")
+            rank_lbl.setStyleSheet(
+                f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
+            fl.addWidget(rank_lbl)
+
+            def _refresh_rank(text, lbl=rank_lbl):
+                p = text.strip()
+                lbl.setText(_read_lora_rank(p) if p and os.path.isfile(p) else "")
+            path_edit.textChanged.connect(_refresh_rank)
+            _refresh_rank(path_edit.text())
+
             tw_row = QHBoxLayout()
             tw_row.setSpacing(6)
             type_combo = QComboBox()
@@ -1410,6 +1561,89 @@ class MergePage(QWidget):
         btn_bo.clicked.connect(lambda: self._save_as(self._bk_out, "bake_output"))
         ol.addLayout(_file_row("Output File", self._bk_out, btn_bo))
         layout.addWidget(out_card)
+
+        # ── Sequential Mode ──────────────────────────────────────────────────
+        seq_card = _card()
+        sl = QVBoxLayout(seq_card)
+        sl.setContentsMargins(16, 14, 16, 14)
+        sl.setSpacing(8)
+        sl.addWidget(_lbl("Sequential Mode", PRI, FONT_MD, bold=True))
+
+        chk_style = (
+            f"QCheckBox {{ color:{PRI}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; }}"
+            f"QCheckBox::indicator {{ width:14px; height:14px; }}")
+
+        self._bk_sequential = QCheckBox("Bake LoRAs one at a time  (each step uses the previous result as base)")
+        self._bk_sequential.setStyleSheet(chk_style)
+        self._bk_sequential.setChecked(self._cfg.get("bake_sequential", False))
+        sl.addWidget(self._bk_sequential)
+
+        self._bk_keep_ints = QCheckBox("Keep intermediate checkpoints")
+        self._bk_keep_ints.setStyleSheet(
+            f"QCheckBox {{ color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; }}"
+            f"QCheckBox::indicator {{ width:14px; height:14px; }}")
+        self._bk_keep_ints.setChecked(self._cfg.get("bake_keep_intermediates", False))
+        self._bk_keep_ints.setEnabled(self._cfg.get("bake_sequential", False))
+        sl.addWidget(self._bk_keep_ints)
+
+        self._bk_overwrite = QCheckBox("Overwrite existing files")
+        self._bk_overwrite.setStyleSheet(chk_style)
+        self._bk_overwrite.setChecked(self._cfg.get("bake_overwrite", True))
+        sl.addWidget(self._bk_overwrite)
+
+        seq_hint = _lbl(
+            "Intermediate files are named by accumulated ratios "
+            "(e.g. PixarMix-v01-25-0-0-0.safetensors, PixarMix-v01-25-3-0-0.safetensors). "
+            "Uncheck 'Keep' to delete them automatically when done.",
+            MUT, FONT_SM)
+        seq_hint.setWordWrap(True)
+        sl.addWidget(seq_hint)
+        layout.addWidget(seq_card)
+
+        # ── Pre-flight Analysis ──────────────────────────────────────────────
+        pf_card = _card()
+        pfl = QVBoxLayout(pf_card)
+        pfl.setContentsMargins(16, 14, 16, 14)
+        pfl.setSpacing(8)
+
+        pf_hdr = QHBoxLayout()
+        pf_hdr.addWidget(_lbl("Pre-flight Analysis", PRI, FONT_MD, bold=True))
+        pf_hdr.addStretch()
+        self._bk_pf_btn = QPushButton("↻ Analyse")
+        self._bk_pf_btn.setStyleSheet(
+            f"QPushButton {{ background:{MUT}; color:{PRI}; border:none;"
+            f" border-radius:4px; padding:3px 10px;"
+            f" font-family:{FONT}; font-size:{FONT_SM}px; }}"
+            f"QPushButton:hover {{ background:{ACC}; }}")
+        self._bk_pf_btn.clicked.connect(self._run_preflight)
+        pf_hdr.addWidget(self._bk_pf_btn)
+        pfl.addLayout(pf_hdr)
+
+        self._bk_pf_label = QLabel("Not yet analysed.")
+        self._bk_pf_label.setWordWrap(True)
+        self._bk_pf_label.setStyleSheet(
+            f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; border:none;")
+        pfl.addWidget(self._bk_pf_label)
+        layout.addWidget(pf_card)
+
+        # ── Wire sequential + pre-flight ─────────────────────────────────────
+        self._pf_timer = QTimer(self)
+        self._pf_timer.setSingleShot(True)
+        self._pf_timer.timeout.connect(self._run_preflight)
+        self._pf_worker: _Worker | None = None
+
+        self._bk_sequential.toggled.connect(self._on_bk_sequential_toggled)
+
+        self._bk_ckpt.textChanged.connect(lambda _: self._on_bk_inputs_changed())
+        for path_edit, _, ratio_spin in self._bk_loras:
+            path_edit.textChanged.connect(lambda _: self._on_bk_inputs_changed())
+            ratio_spin.valueChanged.connect(lambda _: self._on_bk_inputs_changed())
+
+        # Kick off pre-flight once after the tab finishes loading saved settings.
+        QTimer.singleShot(1200, self._schedule_preflight)
 
         # ── Run ─────────────────────────────────────────────────────────────
         run_card = _card()
@@ -1969,7 +2203,7 @@ class MergePage(QWidget):
         def _run():
             try:
                 merge_loras(
-                    paths, weights, out, output_rank=0, device=dev,
+                    paths, weights, out, output_rank=self._lo_rank.value(), device=dev,
                     progress_fn=lambda i, t, k: worker.progress.emit(i, t, k),
                 )
                 worker.finished.emit()
@@ -1984,29 +2218,59 @@ class MergePage(QWidget):
             QMessageBox.warning(self, "Busy", "A merge operation is already running.")
             return
 
-        ckpt = self._bk_ckpt.text().strip()
+        ckpt = os.path.normpath(self._bk_ckpt.text().strip())
         out  = self._bk_out.text().strip()
 
         if not ckpt or not os.path.isfile(ckpt):
             QMessageBox.warning(self, "Missing", "Checkpoint not found.")
             return
-        if not out:
-            QMessageBox.warning(self, "Missing", "Output path is required.")
-            return
 
-        # Collect active LoRA slots
-        entries: list[tuple[str, float]] = []
-        for path_edit, _combo, ratio_spin in self._bk_loras:
+        # Collect active LoRA slots — track UI slot index alongside path/ratio
+        entries:          list[tuple[str, float]] = []
+        slot_ratios:      list[float]             = [0.0] * 4
+        active_slot_idxs: list[int]               = []
+        for i, (path_edit, _combo, ratio_spin) in enumerate(self._bk_loras):
             p = path_edit.text().strip()
+            r = ratio_spin.value()
             if p:
                 if not os.path.isfile(p):
                     QMessageBox.warning(self, "Missing", f"LoRA not found:\n{p}")
                     return
-                entries.append((p, ratio_spin.value()))
+                if r == 0.0:
+                    continue  # zero-multiplier slot — no effect, skip entirely
+                entries.append((p, r))
+                slot_ratios[i]      = r
+                active_slot_idxs.append(i)
 
         if not entries:
             QMessageBox.warning(self, "Missing", "Add at least one LoRA file.")
             return
+
+        sequential = self._bk_sequential.isChecked()
+        keep_ints  = self._bk_keep_ints.isChecked()
+        overwrite  = self._bk_overwrite.isChecked()
+
+        # Resolve output path — sequential mode auto-derives it from slot positions.
+        # Use 'or' fallback so a bare filename (no directory) still writes next to ckpt.
+        if sequential:
+            out_dir = os.path.dirname(out) or os.path.dirname(ckpt)
+            seq_names = _build_seq_names(ckpt, slot_ratios, active_slot_idxs, out_dir)
+            out = seq_names[-1]
+            self._bk_out.setText(out)
+        elif not out:
+            QMessageBox.warning(self, "Missing", "Output path is required.")
+            return
+
+        # Overwrite guard — check before touching anything on disk.
+        if not overwrite:
+            targets = seq_names if sequential else [out]
+            existing = [p for p in targets if os.path.isfile(p)]
+            if existing:
+                names = "\n".join(os.path.basename(p) for p in existing)
+                QMessageBox.warning(
+                    self, "File exists",
+                    f"Overwrite is disabled.  The following file(s) already exist:\n\n{names}")
+                return
 
         self._save_bake_cfg()
 
@@ -2037,23 +2301,136 @@ class MergePage(QWidget):
         worker.health_done.connect(self._on_bk_health_done)
         self._worker = worker
 
-        def _run():
-            try:
-                stats = bake_loras(
-                    ckpt, entries, out, prec, dev,
-                    progress_fn=lambda i, t, k: worker.progress.emit(i, t, k),
-                )
+        if sequential:
+            _seq_names = seq_names  # capture for thread
+
+            def _run():
                 try:
-                    health = check_checkpoint_health(out, ckpt, merge_stats=stats)
-                    worker.health_done.emit(health)
-                except Exception:
-                    pass
-                worker.finished.emit()
-            except Exception as exc:
-                worker.error.emit(str(exc))
+                    from .merge_engine import bake_loras_sequential
+                    _steps = [(lp, r, so)
+                              for (lp, r), so in zip(entries, _seq_names)]
+                    all_stats = bake_loras_sequential(
+                        ckpt, _steps, prec, dev,
+                        save_each_step=keep_ints,
+                        progress_fn=lambda i, t, k: worker.progress.emit(i, t, k),
+                    )
+                    stats = all_stats[-1] if all_stats else None
+                    try:
+                        health = check_checkpoint_health(out, ckpt, merge_stats=stats)
+                        worker.health_done.emit(health)
+                    except Exception:
+                        pass
+                    worker.finished.emit()
+                except Exception as exc:
+                    worker.error.emit(str(exc))
+        else:
+            def _run():
+                try:
+                    stats = bake_loras(
+                        ckpt, entries, out, prec, dev,
+                        progress_fn=lambda i, t, k: worker.progress.emit(i, t, k),
+                    )
+                    try:
+                        health = check_checkpoint_health(out, ckpt, merge_stats=stats)
+                        worker.health_done.emit(health)
+                    except Exception:
+                        pass
+                    worker.finished.emit()
+                except Exception as exc:
+                    worker.error.emit(str(exc))
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
+
+    # ── Sequential Mode helpers ───────────────────────────────────────────────
+
+    def _on_bk_sequential_toggled(self, checked: bool):
+        self._bk_keep_ints.setEnabled(checked)
+        if checked:
+            self._update_seq_output()
+        self._schedule_preflight()
+
+    def _on_bk_inputs_changed(self):
+        if self._bk_sequential.isChecked():
+            self._update_seq_output()
+        self._schedule_preflight()
+
+    def _update_seq_output(self):
+        ckpt = self._bk_ckpt.text().strip()
+        if not ckpt:
+            return
+        slot_ratios = [0.0] * 4
+        active_slots: list[int] = []
+        for i, (path_edit, _, ratio_spin) in enumerate(self._bk_loras):
+            if path_edit.text().strip():
+                slot_ratios[i] = ratio_spin.value()
+                active_slots.append(i)
+        if not active_slots:
+            return
+        out_field = self._bk_out.text().strip()
+        if out_field:
+            out_dir = os.path.dirname(out_field) or os.path.dirname(ckpt)
+        else:
+            out_dir = os.path.dirname(ckpt)
+        names = _build_seq_names(ckpt, slot_ratios, active_slots, out_dir)
+        if names:
+            self._bk_out.setText(names[-1])
+
+    def _schedule_preflight(self):
+        self._pf_timer.start(600)
+
+    def _run_preflight(self):
+        self._pf_timer.stop()
+        from .merge_engine import analyse_bake_preflight
+        ckpt = self._bk_ckpt.text().strip()
+        entries: list[tuple[str, float]] = []
+        for path_edit, _, ratio_spin in self._bk_loras:
+            p = path_edit.text().strip()
+            r = ratio_spin.value()
+            if p and r != 0.0:
+                entries.append((p, r))
+        if not ckpt or not entries:
+            self._bk_pf_label.setText("Select a checkpoint and at least one LoRA to analyse.")
+            self._bk_pf_label.setStyleSheet(
+                f"color:{MUT}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
+            return
+
+        self._bk_pf_label.setText("Analysing headers…")
+        self._bk_pf_label.setStyleSheet(
+            f"color:{SEC}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; border:none;")
+        self._bk_pf_btn.setEnabled(False)
+
+        worker = _Worker()
+        worker.preflight_done.connect(self._on_preflight_done)
+        self._pf_worker = worker
+
+        def _run():
+            try:
+                results = analyse_bake_preflight(ckpt, entries)
+                worker.preflight_done.emit(results)
+            except Exception as exc:
+                worker.preflight_done.emit([f"✗ Analysis error: {exc}"])
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_preflight_done(self, results: object):
+        self._bk_pf_btn.setEnabled(True)
+        lines: list[str] = results  # type: ignore[assignment]
+        if not lines:
+            self._bk_pf_label.setText("✓ All LoRAs look compatible.")
+            self._bk_pf_label.setStyleSheet(
+                f"color:{GRN}; font-family:{FONT}; font-size:{FONT_SM}px;"
+                f" background:transparent; border:none;")
+            return
+        has_err  = any(l.startswith("✗") for l in lines)
+        has_warn = any(l.startswith("⚠") for l in lines)
+        color = RED if has_err else AMB if has_warn else SEC
+        self._bk_pf_label.setText("\n".join(lines))
+        self._bk_pf_label.setStyleSheet(
+            f"color:{color}; font-family:{FONT}; font-size:{FONT_SM}px;"
+            f" background:transparent; border:none;")
 
     # ── Progress / finish / error callbacks ───────────────────────────────────
 
@@ -2122,9 +2499,12 @@ class MergePage(QWidget):
 
     def _save_bake_cfg(self):
         data: dict = {
-            "bake_ckpt":      self._bk_ckpt.text().strip(),
-            "bake_precision": self._bk_prec.currentText(),
-            "bake_output":    self._bk_out.text().strip(),
+            "bake_ckpt":               self._bk_ckpt.text().strip(),
+            "bake_precision":          self._bk_prec.currentText(),
+            "bake_output":             self._bk_out.text().strip(),
+            "bake_sequential":         self._bk_sequential.isChecked(),
+            "bake_keep_intermediates": self._bk_keep_ints.isChecked(),
+            "bake_overwrite":          self._bk_overwrite.isChecked(),
         }
         for i, (path_edit, type_combo, ratio_spin) in enumerate(self._bk_loras, start=1):
             data[f"bake_lora_{i}"]  = path_edit.text().strip()
