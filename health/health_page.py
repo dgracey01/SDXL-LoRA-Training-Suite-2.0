@@ -2020,15 +2020,19 @@ class HealthPage(QWidget):
             copy_btn = QPushButton("Copy Path")
             copy_btn.setFixedHeight(30)
             copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            def _do_copy(p=best_path, btn=copy_btn):
+            def _do_copy(*_a, p=best_path, btn=copy_btn):   # *_a swallows clicked's bool
+                ok = False
                 try:
-                    import pyperclip as _pc
-                    _pc.copy(p)
-                    btn.setText("Copied ✓")
-                except Exception:
                     from PySide6.QtWidgets import QApplication
                     QApplication.clipboard().setText(p)
-                    btn.setText("Copied ✓")
+                    ok = True
+                except Exception:
+                    try:
+                        import pyperclip as _pc
+                        _pc.copy(p); ok = True
+                    except Exception:
+                        ok = False
+                btn.setText("Copied ✓" if ok else "Copy failed")
             copy_btn.clicked.connect(_do_copy)
             detail_row.addWidget(copy_btn)
 
@@ -2832,14 +2836,19 @@ class HealthPage(QWidget):
             _tp_text = "Training Parameters — " + meta.get("filename", "") + "\n" + \
                 "\n".join(f"{k}: {v}" for k, v in training)
 
-            def _copy_tp(txt=_tp_text, btn=tp_copy):
+            def _copy_tp(*_a, txt=_tp_text, btn=tp_copy):   # *_a swallows clicked's bool
+                ok = False
                 try:
-                    import pyperclip as _pc
-                    _pc.copy(txt)
-                except Exception:
                     from PySide6.QtWidgets import QApplication
-                    QApplication.clipboard().setText(txt)
-                btn.setText("Copied ✓")
+                    QApplication.clipboard().setText(txt)    # reliable in-app clipboard
+                    ok = True
+                except Exception:
+                    try:
+                        import pyperclip as _pc
+                        _pc.copy(txt); ok = True
+                    except Exception:
+                        ok = False
+                btn.setText("Copied ✓" if ok else "Copy failed")
             tp_copy.clicked.connect(_copy_tp)
             hdr.addWidget(tp_copy)
             tl.addLayout(hdr)
