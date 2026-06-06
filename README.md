@@ -54,19 +54,21 @@ Designed by **Zero** | Built by **Jarvis**
 - Load any `.safetensors` LoRA file and run structural checks without inference
 - **File Integrity** — verifies kohya hash metadata is present
 - **NaN / Inf** — scans every tensor for corrupted values
-- **Rank Consistency** — shape agreement between lora_down / lora_up and metadata; mixed-rank LoRAs (e.g. AI Toolkit: linear=128, conv=32) display both ranks and correctly use the dominant rank for ceiling detection
+- **Rank Consistency** — shape agreement between lora_down / lora_up and metadata. Mixed-rank LoCon/LoHa LoRAs (linear + a smaller conv rank, e.g. linear=96, conv=32) display both ranks. `ss_network_dim` is the **linear** rank, so the metadata is matched only against the dominant (linear) tensor rank — a smaller conv rank is expected and no longer triggers a false "metadata ≠ tensor rank" failure (affected both kohya and AI Toolkit LoCon LoRAs)
 - **Alpha/Rank Ratio** — checks declared alpha relative to rank against community bounds
 - **Rank Range** — validates rank is within recommended range per model type (SD1.5 / SDXL)
 - **Overbaked** — detects overtrained LoRAs via elevated global lora_up mean magnitude
 - **Module Analysis** — breaks down Dead Layers and Layer Balance per architectural group:
   - UNet Cross-Attention (`attn2`) · UNet Self-Attention (`attn1`) · UNet Feedforward (`ff_net`) · Text Encoder (`lora_te*`)
   - Compares like-for-like layers within each group, so a near-zero `to_k`/`to_v` in cross-attention (normal for AI-Toolkit training) doesn't pollute the self-attention or feedforward result
+- **Structural Zeros** — SDXL conditions on TE1's *penultimate* hidden state, so kohya's LoRA modules on TE1's final layer (`te1…layers_11`) never receive gradient and stay at their zero init. These are reported as an info note and **excluded from the Dead Layers count** — they are a kohya packaging artifact (AI Toolkit doesn't emit them), not a training defect
 - **Training Software selector** — AI Toolkit / Kohya / Auto-detect:
   - Auto-detect reads `config.yaml` in the same folder (AI Toolkit leaves one there), then falls back to tensor key heuristics
   - **AI Toolkit mode:** cross-attention balance ratio is excluded from scoring — it is a structural artifact of how AI Toolkit initialises weights, not a defect. The value is still displayed for reference
   - **Kohya mode:** all checks and balance thresholds apply as configured
   - Selection is remembered between sessions
-- **Training Log analysis** (AI Toolkit) — when `log.txt` is present alongside the LoRA file:
+- **Training Log analysis** (AI Toolkit **and** kohya / TrainerXL) — when `log.txt` is present alongside the LoRA file:
+  - kohya logs are parsed too: `batch_size` and `gradient_accumulation_steps` are read from the log's "running training" block (kohya leaves them out of the `ss_arguments` metadata), so the effective batch and TOS/steps-per-image are computed correctly instead of being under-reported
   - Dataset image count and steps/image (flags undertrained < 80 or overfit risk > 400)
   - Loss trend: Q1 vs Q4 quarter averages — "still learning" or "plateaued"
   - Loss at this specific checkpoint (±50-step window average)
@@ -83,6 +85,10 @@ Designed by **Zero** | Built by **Jarvis**
   - Winner banner shows steps/image and checkpoint loss alongside score and magnitude
   - Highlights the best candidate with a Copy Path button
   - **Open in Analyze ↗** on any row loads that file into the single-file tab for full module inspection
+- **Headless batch CLI** (`health/batch_cli.py`) — runs the exact same analysis from the command line, no GUI:
+  - `python health/batch_cli.py <output-folder> --profile identity|concept|outfit|style`
+  - Imports the GUI's own `_analyse` / `_batch_label` / `_score_result` (no duplicated logic), so results match the app
+  - Prints a ranked checkpoint table with the kohya/AI-Toolkit log's training context (TOS, loss curve, convergence) and marks the recommended checkpoint; `--json` dumps the raw rows
 - Auto-detects SD 1.5 vs SDXL; manual override via dropdown
 - Model Type, Trainer, and Profile selections remembered between sessions
 - File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
@@ -199,7 +205,7 @@ Lora Training Suite 2.0/
 ├── randomizer/              # Randomizer / background removal page
 ├── faces/                   # Face Swap page
 ├── enhancer/                # Enhancer / upscaling page
-├── health/                  # LoRA Health analyzer
+├── health/                  # LoRA Health analyzer (health_page.py + batch_cli.py headless CLI)
 └── merge/                   # Model Merge (checkpoint merge, LoRA merge/bake/extract)
 ```
 

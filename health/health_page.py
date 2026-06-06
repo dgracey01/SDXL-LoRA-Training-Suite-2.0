@@ -75,6 +75,19 @@ def _classify_key(key: str) -> str:
     return "te"                   # lora_te_, lora_te1_, lora_te2_
 
 
+# kohya attaches a LoRA to EVERY text-encoder layer, but SDXL's conditioning uses the
+# PENULTIMATE hidden state of TE1 (CLIP ViT-L, 12 layers 0-11), so TE1's final layer
+# (index 11) never receives gradient — its zero-init lora_up stays exactly 0. These are a
+# structural artifact of SDXL + kohya, NOT dead/broken training. AI-Toolkit doesn't emit
+# these modules, which is why only kohya SDXL LoRAs showed phantom "N dead layers".
+_SDXL_UNUSED_TE_RE = re.compile(r"te1_text_model_encoder_layers_11_", re.IGNORECASE)
+
+
+def _is_structural_zero(key: str, model_type: str) -> bool:
+    """True for LoRA modules that are zero by SDXL design (not a training defect)."""
+    return model_type == "sdxl" and bool(_SDXL_UNUSED_TE_RE.search(key))
+
+
 # ── Threshold presets ─────────────────────────────────────────────────────────
 # Global thresholds: rank range, magnitude (overbaked), alpha/rank ratio.
 # Per-module balance thresholds: hottest/coldest ratio within each module group.
@@ -295,11 +308,19 @@ _LOG_BATCH_RE   = re.compile(r'"batch_size"\s*:\s*(\d+)')
 _LOG_ACCUM_RE   = re.compile(r'"gradient_accumulation"\s*:\s*(\d+)')
 _LOG_RANK_RE    = re.compile(r'"linear"\s*:\s*(\d+)')
 _LOG_ALPHA_RE   = re.compile(r'"linear_alpha"\s*:\s*([\d.]+)')
+# kohya / sd-scripts (TrainerXL) log: tqdm "… | cur/total [.., avr_loss=0.08]"
+_KOHYA_STEP_RE  = re.compile(r'(\d+)\s*/\s*(\d+)\s*\[.*?avr_loss\s*=\s*([\d.eE+\-]+)')
+# kohya checkpoint filename: "{name}-step{:08d}.safetensors" (STEP_FILE_NAME)
+_CKPT_STEP_KOHYA_RE = re.compile(r'-step0*(\d+)\.safetensors$', re.IGNORECASE)
 
 
 def _get_checkpoint_step(filename: str) -> int | None:
-    """Extract step number from AI Toolkit checkpoint filename, or None for the final file."""
+    """Step number from an AI Toolkit (_NNNNNNNNN) or kohya (-stepNNNNNNNN) checkpoint
+    filename, or None for the final file."""
     m = _CKPT_STEP_RE.search(filename)
+    if m:
+        return int(m.group(1))
+    m = _CKPT_STEP_KOHYA_RE.search(filename)
     return int(m.group(1)) if m else None
 
 
@@ -415,6 +436,109 @@ def _parse_aitk_log(log_path: str) -> dict:
         return {}
 
 
+def _parse_kohya_log(log_path: str, metadata: dict | None = None) -> dict:
+    """Parse a kohya / sd-scripts training log (TrainerXL writes it as <output>/log.txt).
+    The loss curve comes from the tqdm 'avr_loss=' lines; the training params come from the
+    safetensors ss_* metadata (kohya doesn't print a JSON header like AI Toolkit). Returns the
+    same dict shape as _parse_aitk_log, or {} on failure."""
+    metadata = metadata or {}
+    try:
+        steps: dict[int, float] = {}
+        total_from_log: int | None = None
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        for m in _KOHYA_STEP_RE.finditer(content):
+            try:
+                step  = int(m.group(1))
+                total = int(m.group(2))
+                loss  = float(m.group(3))
+            except (ValueError, TypeError):
+                continue
+            steps[step] = loss          # last value written for each step wins
+            if total_from_log is None:
+                total_from_log = total
+        if not steps:
+            return {}
+
+        # Training params from kohya ss_* metadata (not the log)
+        import json as _json
+        try:
+            args = _json.loads(metadata.get("ss_arguments", "") or "{}")
+        except Exception:
+            args = {}
+
+        def _mi(key):
+            try:
+                return int(metadata.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        image_count   = _mi("ss_num_train_images")
+
+        # batch_size / grad_accum: kohya does NOT store these in ss_arguments (they come back
+        # None), so the effective-batch and TOS readouts were wrong. They ARE printed in the
+        # log's "running training" block ("batch_size: 2", "gradient accumulation steps = 3").
+        # Prefer the log text, then ss_arguments, then metadata, then default 1.
+        def _log_int(pattern):
+            mm = re.search(pattern, content, re.IGNORECASE)
+            return int(mm.group(1)) if mm else None
+
+        batch_size = (_log_int(r"\btrain_batch_size\s*[:=]\s*(\d+)")
+                      or _log_int(r"\bbatch_size\s*[:=]\s*(\d+)")
+                      or int(args.get("train_batch_size") or 0)
+                      or _mi("ss_batch_size_per_device") or 1)
+        grad_accum = (_log_int(r"gradient accumulation steps.*?[:=]\s*(\d+)")
+                      or int(args.get("gradient_accumulation_steps") or 0) or 1)
+        network_rank  = _mi("ss_network_dim")
+        try:
+            network_alpha = float(metadata.get("ss_network_alpha"))
+        except (TypeError, ValueError):
+            network_alpha = None
+
+        sorted_steps = sorted(steps.items())
+        losses = [l for _, l in sorted_steps]
+        n = len(losses)
+        q = max(1, n // 4)
+        q4 = losses[3 * q:] or losses
+        q1_avg = sum(losses[:q]) / q
+        q4_avg = sum(q4) / len(q4)
+
+        last500 = [l for s, l in sorted_steps if s >= max(steps) - 500]
+        late_mean  = sum(last500) / len(last500) if last500 else 0.0
+        late_stdev = statistics.stdev(last500) if len(last500) > 1 else 0.0
+        late_cv    = late_stdev / late_mean if late_mean > 0 else 0.0
+
+        def _window_avg(step: int, w: int = 50):
+            nearby = [l for s, l in sorted_steps if abs(s - step) <= w]
+            return sum(nearby) / len(nearby) if nearby else None
+
+        final_step  = max(steps)
+        total_steps = total_from_log or final_step
+        eff_batch   = batch_size * grad_accum
+        actual_tos  = (total_steps * eff_batch / image_count) if image_count else None
+        return {
+            "image_count":       image_count,
+            "total_steps":       total_steps,
+            "steps_per_image":   total_steps / image_count if image_count else None,
+            "batch_size":        batch_size,
+            "grad_accum":        grad_accum,
+            "eff_batch":         eff_batch,
+            "actual_tos":        actual_tos,
+            "start_loss":        losses[0],
+            "end_loss":          losses[-1],
+            "q1_avg":            q1_avg,
+            "q4_avg":            q4_avg,
+            "late_cv":           late_cv,
+            "converged":         q4_avg < q1_avg * 0.97,
+            "checkpoint_losses": {final_step: _window_avg(final_step)},
+            "final_step":        final_step,
+            "network_rank":      network_rank,
+            "network_alpha":     network_alpha,
+        }
+    except Exception:
+        return {}
+
+
 def _analyse(path: str, get_threshold, model_type_override: str | None = None,
              trainer_override: str | None = None) -> dict:
     """Load safetensors and run all checks. Returns result dict."""
@@ -495,10 +619,14 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
                 if r != up_r:
                     rank_errors.append(f"{dk}: down={r} ≠ up={up_r}")
 
-    if meta_rank is not None:
-        for r in actual_ranks:
-            if r != meta_rank:
-                rank_errors.append(f"metadata rank={meta_rank} ≠ tensor rank={r}")
+    # ss_network_dim is the LINEAR rank; LoCon/LoHa conv layers legitimately carry a smaller
+    # conv_dim, so only the dominant (max) tensor rank must match the metadata — a smaller
+    # conv rank is expected, not an inconsistency. A metadata rank that doesn't match the
+    # linear rank at all is a real mismatch.
+    if meta_rank is not None and actual_ranks:
+        linear_rank = max(actual_ranks)
+        if meta_rank != linear_rank:
+            rank_errors.append(f"metadata rank={meta_rank} ≠ linear tensor rank={linear_rank}")
 
     # Use the highest rank present — linear layers define the dominant rank.
     # Mixed-rank LoRAs (e.g. linear=128 + conv=32 from AI Toolkit) would otherwise
@@ -575,10 +703,20 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
     mag_fail = get_threshold(model_type, "mag_fail")
 
     grouped: dict[str, list[tuple[str, float]]] = {}
+    structural_zero = 0
     for uk in up_keys:
+        if _is_structural_zero(uk, model_type):
+            structural_zero += 1            # SDXL-unused final TE1 layer: zero by design
+            continue
         mag = float(tensors[uk].abs().mean().item())
         mod = _classify_key(uk)
         grouped.setdefault(mod, []).append((uk, mag))
+
+    if structural_zero:
+        checks.append({
+            "id": "structural_zero", "label": "Structural Zeros", "status": "info",
+            "detail": f"{structural_zero} module(s) on SDXL's unused final TE1 layer are zero "
+                      f"by design (kohya emits them; excluded from the dead-layer count)."})
 
     # ── 6. Overbaked (global mean across all lora_up) ─────────────────────────
     all_mags = [m for layers in grouped.values() for _, m in layers]
@@ -716,6 +854,19 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
                     actual_rank = log_data["network_rank"]
                 if log_data.get("network_alpha") is not None and declared_alpha is None:
                     declared_alpha = log_data["network_alpha"]
+
+    elif os.path.isfile(os.path.join(os.path.dirname(path), "log.txt")):
+        # kohya / TrainerXL: same loss-curve analysis from the kohya log + ss_* metadata
+        log_data = _parse_kohya_log(
+            os.path.join(os.path.dirname(path), "log.txt"), metadata)
+        if log_data:
+            ckpt_step = _get_checkpoint_step(os.path.basename(path))
+            if ckpt_step is None:
+                ckpt_step = log_data.get("final_step")
+            log_data["this_checkpoint_step"] = ckpt_step
+            log_data["this_checkpoint_loss"] = (
+                log_data.get("checkpoint_losses", {}).get(ckpt_step)
+                or log_data.get("end_loss"))
 
     # ── 10. Rank saturation ───────────────────────────────────────────────────
     mean_eff = rank_efficiency.get("mean_efficiency")
