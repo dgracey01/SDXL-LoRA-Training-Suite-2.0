@@ -85,6 +85,7 @@ Designed by **Zero** | Built by **Jarvis**
   - Winner banner shows steps/image and checkpoint loss alongside score and magnitude
   - Highlights the best candidate with a Copy Path button
   - **Open in Analyze ↗** on any row loads that file into the single-file tab for full module inspection
+  - **Sample strip** — shows the training sample images for the selected checkpoint, matched by step. Supports **both** trainers automatically: AI Toolkit (`samples/` folder, `name__<step>_<idx>.jpg`) and kohya/TrainerXL (`sample/` folder, `name_<step>_<idx>_<timestamp>.png`). Prompts for the right-click tooltip come from AI Toolkit's `config.yaml` or kohya's `<name>_sample_prompts.txt`
 - **Headless batch CLI** (`health/batch_cli.py`) — runs the exact same analysis from the command line, no GUI:
   - `python health/batch_cli.py <output-folder> --profile identity|concept|outfit|style`
   - Imports the GUI's own `_analyse` / `_batch_label` / `_score_result` (no duplicated logic), so results match the app

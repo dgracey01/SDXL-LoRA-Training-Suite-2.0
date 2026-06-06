@@ -1151,27 +1151,51 @@ def _batch_label(result: dict, mag_warn: float, mag_fail: float) -> tuple[str, s
 # ── Sample image strip ────────────────────────────────────────────────────────
 
 def _read_sample_prompts(lora_folder: str) -> list[str]:
-    """Return the ordered prompt list from AI Toolkit config.yaml, or [] if unavailable."""
+    """Ordered prompt list for tooltips. AI Toolkit keeps them in config.yaml; kohya /
+    TrainerXL writes a <name>_sample_prompts.txt next to the LoRA (one prompt per line)."""
     cfg_path = os.path.join(lora_folder, "config.yaml")
-    if not os.path.isfile(cfg_path):
-        return []
-    try:
-        import yaml
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        samples = (cfg.get("config", {})
-                      .get("process", [{}])[0]
-                      .get("sample", {})
-                      .get("samples", []))
-        return [str(s.get("prompt", "")) for s in samples if isinstance(s, dict)]
+    if os.path.isfile(cfg_path):
+        try:
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            samples = (cfg.get("config", {})
+                          .get("process", [{}])[0]
+                          .get("sample", {})
+                          .get("samples", []))
+            prompts = [str(s.get("prompt", "")) for s in samples if isinstance(s, dict)]
+            if prompts:
+                return prompts
+        except Exception:
+            pass
+    try:                                  # kohya / TrainerXL prompts file
+        for f in sorted(os.listdir(lora_folder)):
+            if f.lower().endswith("_sample_prompts.txt"):
+                with open(os.path.join(lora_folder, f), "r", encoding="utf-8") as fh:
+                    return [ln.strip() for ln in fh if ln.strip()]
     except Exception:
-        return []
+        pass
+    return []
+
+
+def _parse_sample(filename: str):
+    """(step, prompt_index) from a sample filename, for both trainers:
+       AI Toolkit:  <name>__<step:09d>_<idx>.<ext>
+       kohya:       <name>_<step:06d>_<idx:02d>_<YYYYMMDDHHMMSS>[_<seed>].png
+    Returns None if neither pattern matches."""
+    m = re.search(r"__(\d{6,9})_(\d+)\.[^.]+$", filename)        # AI Toolkit (double underscore)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"_(?:e)?(\d{6})_(\d{2})_\d{14}", filename)     # kohya step_idx_timestamp
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
 
 
 def _sample_index(filename: str) -> int | None:
-    """Extract the prompt index from an AI Toolkit sample filename (_N before ext)."""
-    m = re.search(r"_(\d+)\.[^.]+$", filename)
-    return int(m.group(1)) if m else None
+    """Prompt index from a sample filename (AI Toolkit or kohya)."""
+    p = _parse_sample(filename)
+    return p[1] if p else None
 
 
 class _SampleThumb(QFrame):
@@ -1295,27 +1319,20 @@ class _SampleStrip(QFrame):
                                    _SampleThumb(path, self._size, prompt))
 
     def _images_for_step(self, step: int | None) -> list[str]:
-        if step is not None:
-            pattern = f"__{step:09d}_"
-        else:
-            # Final LoRA — find the highest step present in the samples folder
-            import re as _re
-            best, pat = None, _re.compile(r"__(\d{9})_")
-            for f in os.listdir(self._samples_dir):
-                m = pat.search(f)
-                if m:
-                    n = int(m.group(1))
-                    if best is None or n > best:
-                        best = n
-            if best is None:
-                return []
-            pattern = f"__{best:09d}_"
-
-        return sorted(
-            os.path.join(self._samples_dir, f)
-            for f in os.listdir(self._samples_dir)
-            if pattern in f and f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
-        )
+        # Parse (step, idx) from every image via _parse_sample — works for both AI Toolkit
+        # and kohya naming, so the step match is independent of which trainer produced them.
+        try:
+            files = [f for f in os.listdir(self._samples_dir)
+                     if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+        except Exception:
+            return []
+        parsed = [(f, _parse_sample(f)) for f in files]
+        parsed = [(f, p) for f, p in parsed if p]
+        if not parsed:
+            return []
+        if step is None:                      # Final LoRA — use the highest step present
+            step = max(p[0] for _, p in parsed)
+        return sorted(os.path.join(self._samples_dir, f) for f, p in parsed if p[0] == step)
 
     def _resize_thumbs(self):
         paths = [
@@ -1865,9 +1882,14 @@ class HealthPage(QWidget):
 
         # ── Sample strip ───────────────────────────────────────────────────
         folder      = self._batch_folder_edit.text() if results else ""
-        samples_dir = os.path.join(folder, "samples") if folder else None
-        if samples_dir and not os.path.isdir(samples_dir):
-            samples_dir = None
+        # The folder name identifies the trainer: AI Toolkit -> "samples", kohya/TrainerXL -> "sample".
+        samples_dir = None
+        if folder:
+            for _sub in ("samples", "sample"):
+                _d = os.path.join(folder, _sub)
+                if os.path.isdir(_d):
+                    samples_dir = _d
+                    break
         strip = _SampleStrip(samples_dir)
         self._sample_strip = strip
 
