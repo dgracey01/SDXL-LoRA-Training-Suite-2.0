@@ -93,6 +93,7 @@ Designed by **Zero** | Built by **Jarvis**
 - Auto-detects SD 1.5 vs SDXL; manual override via dropdown
 - Model Type, Trainer, and Profile selections remembered between sessions
 - File metadata panel: filename, model type, size, rank, alpha, a/r ratio, layer count, base model
+- **Training Parameters panel** (kohya / TrainerXL) — reads the training recipe straight from the safetensors `ss_*` metadata: Steps, Epochs, Repeats (per dataset folder), Images, Eff. Batch (batch × grad-accum, with batch derived from `num_batches_per_epoch` when kohya omits it), LR / UNet LR / TE LR, Optimizer, Scheduler, Loss, Seed, Noise Offset, Min-SNR, Clip Skip. A **Copy** button puts the whole list on the clipboard. (AI Toolkit LoRAs don't write these keys, so the panel is hidden for them.)
 - Drag-and-drop file input
 - Configurable thresholds — Strict / Standard / Relaxed presets per model type, with per-threshold manual overrides (amber fields, same pattern as Calculator TOS)
 

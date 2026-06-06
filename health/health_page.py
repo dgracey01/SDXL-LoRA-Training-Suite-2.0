@@ -19,6 +19,7 @@ Loads a .safetensors LoRA file and runs 8 checks grouped by architectural module
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import statistics
@@ -539,6 +540,70 @@ def _parse_kohya_log(log_path: str, metadata: dict | None = None) -> dict:
         return {}
 
 
+def _training_params(metadata: dict) -> list[tuple]:
+    """Human-readable training parameters from kohya ss_* metadata, as ordered
+    (label, value) pairs — only the fields that are present. AI Toolkit LoRAs don't
+    write these keys, so they return an empty list."""
+    m = metadata or {}
+
+    def g(key):
+        v = m.get(key)
+        return None if v in (None, "", "None") else v
+
+    out: list[tuple] = []
+
+    def add(label, key):
+        v = g(key)
+        if v is not None:
+            out.append((label, str(v)))
+
+    add("Steps", "ss_max_train_steps")
+    add("Epochs", "ss_num_epochs")
+    try:                                  # repeats per dataset folder
+        dd = json.loads(m.get("ss_dataset_dirs", "") or "{}")
+        reps = [str(info.get("n_repeats")) for info in dd.values()
+                if isinstance(info, dict) and info.get("n_repeats") is not None]
+        if reps:
+            out.append(("Repeats", ", ".join(reps) if len(reps) > 1 else reps[0]))
+    except Exception:
+        pass
+    add("Images", "ss_num_train_images")
+
+    # effective batch = batch_size × grad_accum (batch derived if kohya didn't store it)
+    ga = g("ss_gradient_accumulation_steps")
+    bs = g("ss_batch_size_per_device")
+    if bs is None:
+        try:
+            nti = float(m.get("ss_num_train_images"))
+            nbe = float(m.get("ss_num_batches_per_epoch"))
+            bs = max(1, round(nti / nbe)) if nbe else None
+        except (TypeError, ValueError, ZeroDivisionError):
+            bs = None
+    if bs is not None:
+        try:
+            bs_i = int(bs)
+            if ga not in (None, "1", 1):
+                out.append(("Eff. Batch", f"{bs_i} × {int(ga)} = {bs_i * int(ga)}"))
+            else:
+                out.append(("Eff. Batch", str(bs_i)))
+        except (TypeError, ValueError):
+            pass
+
+    add("Learning Rate", "ss_learning_rate")
+    add("UNet LR", "ss_unet_lr")
+    add("TE LR", "ss_text_encoder_lr")
+    opt = g("ss_optimizer")
+    if opt:                               # shorten "...adamw.AdamW8bit(...)" -> "AdamW8bit"
+        out.append(("Optimizer", str(opt).split("(")[0].split(".")[-1] or str(opt)))
+    add("Scheduler", "ss_lr_scheduler")
+    add("Loss", "ss_loss_type")
+    add("Seed", "ss_seed")
+    add("Noise Offset", "ss_noise_offset")
+    add("Min-SNR", "ss_min_snr_gamma")
+    add("Clip Skip", "ss_clip_skip")
+    return out
+
+
 def _analyse(path: str, get_threshold, model_type_override: str | None = None,
              trainer_override: str | None = None) -> dict:
     """Load safetensors and run all checks. Returns result dict."""
@@ -820,6 +885,7 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         "ratio":                 ratio_display,
         "layers":                str(len(up_keys)),
         "ss_base_model_version": metadata.get("ss_base_model_version", ""),
+        "training":              _training_params(metadata),
     }
 
     _global_mag = (sum(all_mags) / len(all_mags)) if all_mags else 0.0
@@ -2747,6 +2813,50 @@ class HealthPage(QWidget):
             ml.addLayout(vrow)
 
         self._results_layout.addWidget(meta_card)
+
+        # ── Training Parameters card (from kohya ss_* metadata) ────────────
+        training = meta.get("training") or []
+        if training:
+            tp_card = QFrame()
+            tp_card.setStyleSheet(_card_style())
+            tl = QVBoxLayout(tp_card)
+            tl.setContentsMargins(16, 12, 16, 12)
+            tl.setSpacing(6)
+
+            hdr = QHBoxLayout()
+            hdr.addWidget(_lbl("Training Parameters", PRI, FONT_MD, bold=True))
+            hdr.addStretch(1)
+            tp_copy = QPushButton("Copy")
+            tp_copy.setFixedHeight(26)
+            tp_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+            _tp_text = "Training Parameters — " + meta.get("filename", "") + "\n" + \
+                "\n".join(f"{k}: {v}" for k, v in training)
+
+            def _copy_tp(txt=_tp_text, btn=tp_copy):
+                try:
+                    import pyperclip as _pc
+                    _pc.copy(txt)
+                except Exception:
+                    from PySide6.QtWidgets import QApplication
+                    QApplication.clipboard().setText(txt)
+                btn.setText("Copied ✓")
+            tp_copy.clicked.connect(_copy_tp)
+            hdr.addWidget(tp_copy)
+            tl.addLayout(hdr)
+
+            tgrid = QGridLayout()
+            tgrid.setHorizontalSpacing(8)
+            tgrid.setVerticalSpacing(4)
+            tgrid.setColumnStretch(1, 2)
+            tgrid.setColumnStretch(2, 3)
+            tgrid.setColumnStretch(4, 2)
+            for i, (lk, lv) in enumerate(training):
+                col_base = (i % 2) * 3
+                row = i // 2
+                tgrid.addWidget(_lbl(f"{lk}:", SEC, FONT_SM), row, col_base)
+                tgrid.addWidget(_lbl(str(lv), PRI, FONT_SM), row, col_base + 1)
+            tl.addLayout(tgrid)
+            self._results_layout.addWidget(tp_card)
 
         # ── Structural checks card (file-level) ────────────────────────────
         struct_card = QFrame()
