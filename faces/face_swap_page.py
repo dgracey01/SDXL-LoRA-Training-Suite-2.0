@@ -53,7 +53,7 @@ FACE_ORDERS    = ["Left → Right", "Right → Left", "Top → Bottom",
 FACE_ORDER_KEY = ["left-right", "right-left", "top-bottom",
                   "bottom-top", "large-small", "small-large"]
 GENDER_OPTS    = ["Any", "Male only", "Female only"]
-DEVICE_OPTS    = ["Auto", "CUDA", "DirectML", "CPU"]
+DEVICE_OPTS    = ["Auto", "ROCm", "DirectML", "CUDA", "CPU"]
 
 DEFAULTS = {
     "last_input_dir":      "",
@@ -83,14 +83,85 @@ DEFAULTS = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _available_providers() -> set:
+    try:
+        import onnxruntime as ort
+        return set(ort.get_available_providers())
+    except Exception:
+        return set()
+
+
 def _providers(device: str) -> list[str]:
-    if device == "CUDA":
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    if device == "DirectML":
-        return ["DmlExecutionProvider", "CPUExecutionProvider"]
-    if device == "CPU":
-        return ["CPUExecutionProvider"]
-    return ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
+    """ONNX Runtime execution providers, AMD/ROCm-first and filtered to what ORT
+    actually has installed (this is a Radeon box — there's no CUDA EP). CPU is always
+    kept as the final fallback so a swap never hard-fails on provider selection."""
+    ROCM, DML, CUDA, CPU = ("ROCMExecutionProvider", "DmlExecutionProvider",
+                            "CUDAExecutionProvider", "CPUExecutionProvider")
+    if   device == "ROCm":      order = [ROCM, CPU]
+    elif device == "DirectML":  order = [DML, CPU]
+    elif device == "CUDA":      order = [CUDA, CPU]
+    elif device == "CPU":       order = [CPU]
+    else:                       order = [ROCM, DML, CUDA, CPU]   # Auto — AMD GPU first
+    avail = _available_providers()
+    if avail:                                     # drop EPs ORT doesn't have (keep CPU)
+        order = [p for p in order if p in avail or p == CPU]
+    out = []
+    for p in order:
+        if p not in out:
+            out.append(p)
+    if CPU not in out:
+        out.append(CPU)
+    return out
+
+
+# ── Shared model cache ─────────────────────────────────────────────────────────
+# buffalo_l (detector + recognizer) and the inswapper are several hundred MB of ONNX
+# that previously reloaded on EVERY swap/export. Load once per device and reuse across
+# all workers — repeated single swaps then cost only inference. Thread-safe (workers
+# run on QThreads).
+_CACHE_LOCK    = threading.Lock()
+_APP_CACHE     = {}   # device -> {"app", "providers"}
+_SWAPPER_CACHE = {}   # (device, model_path) -> swapper
+_GFPGAN_CACHE  = {}   # "g" -> GFPGANer
+
+
+def _active_providers(app) -> list:
+    """The providers ORT actually bound — so a silent CPU fallback is visible."""
+    try:
+        return list(app.det_model.session.get_providers())
+    except Exception:
+        try:
+            return list(next(iter(app.models.values())).session.get_providers())
+        except Exception:
+            return []
+
+
+def _get_app(device: str):
+    """Cached buffalo_l FaceAnalysis. The detector is prepared once at a permissive
+    0.1 floor; every caller filters by its own det_thresh, so one instance serves all."""
+    with _CACHE_LOCK:
+        c = _APP_CACHE.get(device)
+    if c is None:
+        from insightface.app import FaceAnalysis
+        app = FaceAnalysis(name="buffalo_l", providers=_providers(device))
+        app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.1)
+        c = {"app": app, "providers": _active_providers(app)}
+        with _CACHE_LOCK:
+            _APP_CACHE[device] = c
+    return c["app"], c["providers"]
+
+
+def _get_swapper(device: str, model_path: str):
+    """Cached inswapper model, keyed by device + path."""
+    key = (device, os.path.abspath(model_path))
+    with _CACHE_LOCK:
+        s = _SWAPPER_CACHE.get(key)
+    if s is None:
+        import insightface
+        s = insightface.model_zoo.get_model(model_path, providers=_providers(device))
+        with _CACHE_LOCK:
+            _SWAPPER_CACHE[key] = s
+    return s
 
 
 def _sort_faces(faces: list, order: str) -> list:
@@ -385,10 +456,6 @@ class FaceSwapWorker(QObject):
     def run(self):
         try:
             import cv2
-            import insightface
-            from insightface.app import FaceAnalysis
-
-            prov = _providers(self._device)
 
             _buffalo = Path.home() / ".insightface" / "models" / "buffalo_l"
             if not _buffalo.exists():
@@ -396,12 +463,9 @@ class FaceSwapWorker(QObject):
             else:
                 self.status.emit("Loading face analysis model…")
 
-            app = FaceAnalysis(name="buffalo_l", providers=prov)
-            app.prepare(ctx_id=0, det_size=(640, 640),
-                        det_thresh=self._det_thresh)
-
-            swapper = insightface.model_zoo.get_model(self._model_path,
-                                                      providers=prov)
+            app, providers = _get_app(self._device)            # cached (loads once)
+            swapper = _get_swapper(self._device, self._model_path)
+            self.status.emit("Compute: " + ", ".join(providers))
 
             def to_cv(img: Image.Image):
                 return cv2.cvtColor(np.array(img.convert("RGB")),
@@ -526,11 +590,9 @@ class FaceExportWorker(QObject):
     def run(self):
         try:
             import cv2
-            from insightface.app import FaceAnalysis
             self.status.emit("Detecting face…")
-            prov = _providers(self._device)
-            app  = FaceAnalysis(name="buffalo_l", providers=prov)
-            app.prepare(ctx_id=0, det_size=(640, 640))
+            app, providers = _get_app(self._device)            # cached (loads once)
+            self.status.emit("Compute: " + ", ".join(providers))
             img_cv = cv2.cvtColor(np.array(self._img.convert("RGB")),
                                   cv2.COLOR_RGB2BGR)
             faces = [f for f in app.get(img_cv)
@@ -573,10 +635,7 @@ class BatchExportWorker(QObject):
     def run(self):
         try:
             import cv2
-            from insightface.app import FaceAnalysis
-            prov = _providers(self._device)
-            app  = FaceAnalysis(name="buffalo_l", providers=prov)
-            app.prepare(ctx_id=0, det_size=(640, 640))
+            app, _providers_used = _get_app(self._device)      # cached (loads once)
 
             images = sorted([
                 p for p in Path(self._src).iterdir()
@@ -592,7 +651,7 @@ class BatchExportWorker(QObject):
                 try:
                     img    = Image.open(img_path).convert("RGB")
                     img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                    faces  = app.get(img_cv)
+                    faces  = [f for f in app.get(img_cv) if f.det_score >= 0.5]
                     if faces:
                         out = Path(self._out) / (img_path.stem + ".safetensors")
                         save_reactor_face(faces[0], str(out))
@@ -657,21 +716,15 @@ class BatchSwapWorker(QObject):
     def run(self):
         try:
             import cv2
-            import insightface
-            from insightface.app import FaceAnalysis
-
-            prov = _providers(self._device)
 
             _buffalo = Path.home() / ".insightface" / "models" / "buffalo_l"
             self.status.emit(
                 "Downloading buffalo_l (~200 MB, first run)…"
                 if not _buffalo.exists() else "Loading face analysis model…")
 
-            app = FaceAnalysis(name="buffalo_l", providers=prov)
-            app.prepare(ctx_id=0, det_size=(640, 640),
-                        det_thresh=self._det_thresh)
-            swapper = insightface.model_zoo.get_model(self._model_path,
-                                                      providers=prov)
+            app, providers = _get_app(self._device)            # cached (loads once)
+            swapper = _get_swapper(self._device, self._model_path)
+            self.status.emit("Compute: " + ", ".join(providers))
 
             def to_cv(img: Image.Image):
                 return cv2.cvtColor(np.array(img.convert("RGB")),
@@ -1556,6 +1609,28 @@ class FaceSwapPage(QWidget):
 
     # ── Face swap inference ───────────────────────────────────────────────────
 
+    def _get_gfpgan_restorer(self):
+        """Load GFPGANer once (on the main thread to avoid the QThread/OpenMP deadlock)
+        and reuse it across every swap/batch — it was reloading on each run before.
+        On ROCm, torch reports CUDA available (HIP), so GFPGAN auto-uses the Radeon GPU."""
+        if _GFPGAN_CACHE.get("g") is not None:
+            return _GFPGAN_CACHE["g"]
+        import sys, io
+        self._patch_torchvision_functional_tensor()
+        from gfpgan import GFPGANer
+        self._status_lbl.setText("Loading GFPGAN… (may download ~185 MB on first run)")
+        QApplication.processEvents()
+        _stdout, _stderr = sys.stdout, sys.stderr      # guard None stdio (windowed mode)
+        if sys.stdout is None: sys.stdout = io.StringIO()
+        if sys.stderr is None: sys.stderr = io.StringIO()
+        try:
+            g = GFPGANer(model_path=str(GFPGAN_MODEL), upscale=1, arch="clean",
+                         channel_multiplier=2, bg_upsampler=None)
+        finally:
+            sys.stdout, sys.stderr = _stdout, _stderr
+        _GFPGAN_CACHE["g"] = g
+        return g
+
     def _run_swap(self):
         if self._src_pil is None or not self._sel_faces:
             return
@@ -1567,29 +1642,11 @@ class FaceSwapPage(QWidget):
 
         blend = self._blend_chk.isChecked() and len(self._sel_faces) > 1
 
-        # ── Load GFPGAN on the main thread (avoids QThread/OpenMP deadlock) ──
+        # ── GFPGAN on the main thread (avoids QThread/OpenMP deadlock); cached/reused ──
         gfpgan_restorer = None
         if enhance:
             try:
-                import sys, io
-                self._patch_torchvision_functional_tensor()
-                from gfpgan import GFPGANer
-                self._status_lbl.setText("Loading GFPGAN… (may download ~185 MB on first run)")
-                QApplication.processEvents()
-                # Guard against None stdout/stderr (no console / windowed mode)
-                _stdout, _stderr = sys.stdout, sys.stderr
-                if sys.stdout is None:
-                    sys.stdout = io.StringIO()
-                if sys.stderr is None:
-                    sys.stderr = io.StringIO()
-                try:
-                    gfpgan_restorer = GFPGANer(
-                        model_path=str(GFPGAN_MODEL),
-                        upscale=1, arch="clean",
-                        channel_multiplier=2,
-                        bg_upsampler=None)
-                finally:
-                    sys.stdout, sys.stderr = _stdout, _stderr
+                gfpgan_restorer = self._get_gfpgan_restorer()
             except Exception as e:
                 QMessageBox.critical(self, "GFPGAN Error",
                                      f"Failed to load GFPGAN:\n{e}")
@@ -1706,26 +1763,11 @@ class FaceSwapPage(QWidget):
 
         blend = self._blend_chk.isChecked() and len(self._sel_faces) > 1
 
-        # Load GFPGAN on main thread
+        # Load GFPGAN on main thread (cached/reused)
         gfpgan_restorer = None
         if enhance:
             try:
-                import sys, io
-                self._patch_torchvision_functional_tensor()
-                from gfpgan import GFPGANer
-                self._status_lbl.setText("Loading GFPGAN… (may download ~185 MB on first run)")
-                QApplication.processEvents()
-                _stdout, _stderr = sys.stdout, sys.stderr
-                if sys.stdout is None: sys.stdout = io.StringIO()
-                if sys.stderr is None: sys.stderr = io.StringIO()
-                try:
-                    gfpgan_restorer = GFPGANer(
-                        model_path=str(GFPGAN_MODEL),
-                        upscale=1, arch="clean",
-                        channel_multiplier=2,
-                        bg_upsampler=None)
-                finally:
-                    sys.stdout, sys.stderr = _stdout, _stderr
+                gfpgan_restorer = self._get_gfpgan_restorer()
             except Exception as e:
                 QMessageBox.critical(self, "GFPGAN Error",
                                      f"Failed to load GFPGAN:\n{e}")
