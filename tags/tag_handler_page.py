@@ -6,7 +6,7 @@ Full PySide6 port of ultimate_tag_handler.py (v1.6 CustomTkinter → PySide6).
 Translated as close to the original as possible.
 """
 
-import os, sys, json, math, threading, shutil, zipfile, csv, re, subprocess
+import os, sys, json, threading, shutil, zipfile, csv, re, subprocess
 import importlib, random, datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -14,24 +14,64 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-from PySide6.QtCore    import (Qt, QTimer, QThread, QObject, Signal,
-                                QRect, QPoint, QSize, QEvent)
-from PySide6.QtWidgets import (
-    QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLayout,
-    QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
-    QSlider, QProgressBar, QScrollArea, QTabWidget, QSplitter, QStackedWidget,
-    QFileDialog, QSizePolicy, QMessageBox, QInputDialog,
-    QPlainTextEdit, QDialog, QProgressDialog, QApplication,
-    QMenu, QSpacerItem, QSpinBox,
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QThread,
+    QObject,
+    Signal,
+    QRect,
+    QPoint,
+    QSize,
 )
-from PySide6.QtGui import QPixmap, QImage, QFont, QCursor, QKeySequence, QShortcut, QDrag
+from PySide6.QtWidgets import (
+    QWidget,
+    QFrame,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QComboBox,
+    QCheckBox,
+    QSlider,
+    QProgressBar,
+    QScrollArea,
+    QTabWidget,
+    QSplitter,
+    QStackedWidget,
+    QFileDialog,
+    QSizePolicy,
+    QMessageBox,
+    QInputDialog,
+    QPlainTextEdit,
+    QDialog,
+    QProgressDialog,
+    QApplication,
+    QMenu,
+    QSpinBox,
+)
+from PySide6.QtGui import QPixmap, QImage, QCursor, QKeySequence, QShortcut, QDrag
 from PySide6.QtCore import QMimeData
 
 from shared.theme import (
-    BG, PAN, CAR, ACC, GRN, RED, MUT, PRI, SEC, AMB,
-    FONT, FONT_SM, FONT_MD, FONT_LG, FONT_XL, VERSION, SIGNATURE,
+    BG,
+    PAN,
+    CAR,
+    ACC,
+    GRN,
+    RED,
+    MUT,
+    PRI,
+    SEC,
+    AMB,
+    FONT,
+    FONT_SM,
+    FONT_MD,
+    FONT_LG,
 )
-from shared.config import load_json, save_json
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _HERE      = os.path.dirname(os.path.abspath(__file__))
@@ -227,7 +267,7 @@ HELP = {
         ("Tag Frequency Cloud","All tags as pills sorted by frequency. Number = images containing that tag."),
         ("Tag Selection","Click any cloud pill to select it (turns blue with ✓). Selected tags filter the gallery."),
         ("Don't Sort","When checked, removing a tag pill updates only that card — the cloud and gallery are frozen. Use during rapid cleanup."),
-        ("Actions Menu","Add tags to all, Add tag to selection, Remove tags, Replace tags."),
+        ("Actions Menu","Add tags to all, Add tag to selection, Set trigger word (move selected tag to the front of every caption), Remove tags, Replace tags."),
         ("Tag Pills","Each tag shown as a rounded pill. Click a pill to remove that tag from that image."),
         ("Add Tags","Text field at bottom of each card. Type and press Enter or click + to add."),
         ("Undo","Ctrl+Z reverses the last tag operation. Up to 20 undo steps."),
@@ -468,8 +508,10 @@ def _load_or_cache_thumb(img_path):
         try: return Image.open(cache_file).convert("RGB")
         except: pass
     try:
-        img = Image.open(img_path).convert("RGB")
-        img.thumbnail((THUMB_SIZE,THUMB_SIZE),Image.LANCZOS)
+        with Image.open(img_path) as _raw:
+            _raw.draft("RGB", (THUMB_SIZE * 2, THUMB_SIZE * 2))   # JPEG: decode at reduced scale (2-8x faster)
+            img = _raw.convert("RGB")
+        img.thumbnail((THUMB_SIZE,THUMB_SIZE),Image.LANCZOS,reducing_gap=2.0)
         w,h  = img.size; side = min(w,h)
         img  = img.crop(((w-side)//2,(h-side)//2,(w+side)//2,(h+side)//2))
         img  = img.resize((THUMB_SIZE,THUMB_SIZE),Image.LANCZOS)
@@ -497,35 +539,11 @@ def _split_tags_captions(items):
     captions = [x for x in items if _is_caption(x)]
     return tags,captions
 
-def _image_status(img_path):
-    try:
-        with Image.open(img_path) as im:
-            w,h = im.size
-            return "normal" if w==h else "nonsquare"
-    except: return "normal"
-
 def _pil_to_qpixmap(pil_img):
     data = np.asarray(pil_img.convert("RGB"))
     h,w,ch = data.shape
     qi = QImage(data.tobytes(),w,h,ch*w,QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qi)
-
-def _lazy_install(pip_name, import_name=None, status_cb=None):
-    import_name = import_name or pip_name
-    try: importlib.import_module(import_name); return True
-    except ImportError: pass
-    if status_cb: status_cb(f"Installing {pip_name}…")
-    try:
-        subprocess.check_call(
-            [sys.executable,"-m","pip","install","--quiet",
-             "--disable-pip-version-check",pip_name],
-            creationflags=0x08000000)
-        importlib.invalidate_caches()
-        importlib.import_module(import_name)
-        return True
-    except Exception as ex:
-        print(f"[UTH] Could not install {pip_name}: {ex}")
-        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -918,14 +936,16 @@ class PrepareCard(QFrame):
 # ══════════════════════════════════════════════════════════════════════════════
 class TagCloud(QFrame):
     def __init__(self, parent=None, on_filter=None, on_remove=None,
-                 on_replace=None, on_add=None, on_add_custom=None):
+                 on_replace=None, on_add=None, on_add_custom=None,
+                 on_set_trigger=None):
         super().__init__(parent)
         self.setStyleSheet(f"QFrame{{background:{PAN};border-radius:6px;border:none;}}")
-        self.on_filter     = on_filter
-        self.on_remove     = on_remove
-        self.on_replace    = on_replace
-        self.on_add        = on_add
-        self.on_add_custom = on_add_custom
+        self.on_filter      = on_filter
+        self.on_remove      = on_remove
+        self.on_replace     = on_replace
+        self.on_add         = on_add
+        self.on_add_custom  = on_add_custom
+        self.on_set_trigger = on_set_trigger
         self.all_tags   = {}
         self.selected   = set()
         self.collapsed  = False
@@ -1167,6 +1187,10 @@ class TagCloud(QFrame):
                        lambda: self.on_add and self.on_add(self.selected.copy()))
         menu.addAction("✏  Add tag to selection",
                        lambda: self.on_add_custom and self.on_add_custom())
+        menu.addSeparator()
+        menu.addAction(("⭐  Set trigger word" if n == 1 else f"⭐  Set trigger word ({n})"),
+                       lambda: self.on_set_trigger and self.on_set_trigger(self.selected.copy()))
+        menu.addSeparator()
         menu.addAction(f"🗑  Remove tags ({n})",
                        lambda: self.on_remove and self.on_remove(self.selected.copy()))
         menu.addAction(f"↔  Replace tags ({n})",
@@ -1469,12 +1493,6 @@ class EditorCard(QFrame):
         self.refresh_pills()
         if self.on_tags_changed: self.on_tags_changed(self.img_path)
 
-    def set_highlighted(self,tags):
-        self.highlighted=tags; self.refresh_pills()
-
-    def set_view_mode(self,mode):
-        self._view_mode=mode; self._refresh_sections()
-
     def _on_hover(self,entered):
         if entered: self._show_hover()
         else:       self._hide_hover()
@@ -1720,9 +1738,6 @@ class TagHandlerPage(QWidget):
         QTimer.singleShot(600, self._check_first_run)
 
     # ── topbar ───────────────────────────────────────────────────────────────
-    def _build_topbar(self, root: QVBoxLayout):
-        pass  # topbar removed — dataset + controls live inside the Prepare tab
-
     # ── tabs ─────────────────────────────────────────────────────────────────
     def _build_tabs(self, root: QVBoxLayout):
         self._tabs = QTabWidget(self)
@@ -1976,9 +1991,6 @@ class TagHandlerPage(QWidget):
         total = len(self._images)
         self._prep_status.setText(
             f"{total} images loaded from {os.path.basename(self._dataset_folder)}")
-
-    def _append_prepare_cards(self, start: int, end: int):
-        """Legacy stub — no-op (virtual scroll replaces batch loading)."""
 
     def _on_prep_scroll(self, value: int):
         self._prep_assign_pool()
@@ -2585,6 +2597,7 @@ class TagHandlerPage(QWidget):
             on_remove=self._batch_remove_from_cloud_set,
             on_replace=self._batch_replace_prompt,
             on_filter=self._on_cloud_filter_set,
+            on_set_trigger=self._batch_set_trigger,
         )
         self._cap_fr_panel = self._build_cap_fr_panel()
         self._right_stack = QStackedWidget(None)
@@ -2755,13 +2768,18 @@ class TagHandlerPage(QWidget):
             return
         self._push_undo()
         dont_sort = self._dont_sort_btn.isChecked()
+        trig = self._trigger_entry.text().strip().lower()
         for card in self._editor_cards:
             if card.isVisible() and card.img_path in self._tags_changed:
                 all_items = _read_tags(card.img_path)
                 tags, caps = _split_tags_captions(all_items)
+                # Keep the trigger pinned to position 1; only the rest may be sorted.
+                # (caps are always appended last by _write_tags, never shuffled.)
+                trigger_tags = [t for t in tags if t.strip().lower() == trig] if trig else []
+                other_tags   = [t for t in tags if t.strip().lower() != trig] if trig else tags
                 if not dont_sort:
-                    tags = sorted(tags)
-                _write_tags(card.img_path, tags + caps)
+                    other_tags = sorted(other_tags)
+                _write_tags(card.img_path, trigger_tags + other_tags + caps)
                 self._tags_changed.discard(card.img_path)
         _flush_tag_cache()
         self._update_unsaved_label()
@@ -2785,9 +2803,6 @@ class TagHandlerPage(QWidget):
         self._tags_changed.discard(img_path)
         self._rebuild_tag_freq()
         self._render_prepare_page()
-
-    def _on_dont_sort_toggle(self, checked: bool):
-        pass  # applied at save time
 
     def _apply_edits(self):
         self._push_undo()
@@ -3237,19 +3252,6 @@ class TagHandlerPage(QWidget):
     # ══════════════════════════════════════════════════════════════════════════
     #  BACKUP / RESTORE
     # ══════════════════════════════════════════════════════════════════════════
-    def _show_backup_menu(self):
-        btn = self.sender()
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            f"QMenu{{background:{PAN};color:{SEC};border:1px solid {MUT};}}"
-            f"QMenu::item:selected{{background:{ACC};}}")
-        menu.addAction("Backup Dataset → ZIP", self._backup_dataset)
-        menu.addAction("Restore Images from ZIP…", self._restore_images_zip)
-        if btn:
-            menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
-        else:
-            menu.exec(self.cursor().pos())
-
     def _clear_thumb_cache(self):
         if not self._dataset_folder:
             QMessageBox.warning(self, "No Dataset", "Load a dataset first.")
@@ -3460,6 +3462,41 @@ class TagHandlerPage(QWidget):
         self._tag_cloud._deselect_all()
         self._render_editor_page()
         self._batch_log(f"Removed {tags_set} from {count} files.")
+
+    def _batch_set_trigger(self, tags):
+        """Move the selected tag(s) to the FRONT of every caption that contains them,
+        making the tag the trigger word. When several are selected they are ordered by
+        global frequency so the most common leads. Only reorders files that already have
+        the tag — never adds it where missing."""
+        trig = list(tags)
+        if not trig:
+            return
+        trig.sort(key=lambda t: -self._tag_freq.get(t, 0))   # dominant tag first
+        trig_set = set(trig)
+        self._push_undo()
+        count = 0
+        for img in self._images:
+            existing = _read_tags(img)
+            present = [t for t in trig if t in existing]      # keep desired (freq) order
+            if not present:
+                continue
+            rest = [t for t in existing if t not in trig_set]
+            new  = present + rest
+            if new != existing:
+                _write_tags(img, new)
+                count += 1
+        _flush_tag_cache()
+        self._rebuild_tag_freq()
+        # Record the trigger in BOTH fields: the editor field highlights the pill, and the
+        # canonical field is what Save All / Shuffle / Sort pin to position 1 — so later
+        # (alphabetical) sorts keep this tag at the front instead of re-shuffling it away.
+        if hasattr(self, "_editor_trigger_entry"):
+            self._editor_trigger_entry.setText(trig[0])
+        if hasattr(self, "_trigger_entry"):
+            self._trigger_entry.setText(trig[0])
+        self._tag_cloud._deselect_all()
+        self._render_editor_page()
+        self._batch_log(f"Set trigger word '{trig[0]}' — moved to front in {count} files.")
 
     def _batch_replace_prompt(self, tags):
         """Prompt user for replacement tag(s) then replace across dataset."""
@@ -3718,6 +3755,7 @@ class TagHandlerPage(QWidget):
         vl.addLayout(btn_row)
 
         dlg.exec()
+        dlg.deleteLater()      # parented to self — free it so this dialog doesn't accumulate
 
     def _export_freq_csv(self):
         if not self._tag_freq:

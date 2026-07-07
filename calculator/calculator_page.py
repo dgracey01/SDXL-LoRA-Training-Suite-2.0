@@ -12,16 +12,38 @@ import re
 
 from PySide6.QtCore    import Qt, QTimer, QThread, QObject, Signal
 from PySide6.QtWidgets import (
-    QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
-    QScrollArea, QSizePolicy, QTabWidget, QSplitter,
-    QFileDialog, QApplication,
+    QWidget,
+    QFrame,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QComboBox,
+    QCheckBox,
+    QScrollArea,
+    QTabWidget,
+    QSplitter,
+    QFileDialog,
+    QApplication,
 )
 
-from shared.theme  import (
-    BG, PAN, CAR, ACC, GRN, RED, MUT, PRI, SEC, AMB,
-    FONT, FONT_SM, FONT_MD, FONT_LG, FONT_XL,
-    VERSION, SIGNATURE,
+from shared.theme import (
+    PAN,
+    CAR,
+    ACC,
+    GRN,
+    RED,
+    MUT,
+    PRI,
+    SEC,
+    AMB,
+    FONT,
+    FONT_SM,
+    FONT_MD,
+    FONT_XL,
+    SIGNATURE,
 )
 from shared.config  import CALC_CFG, load_json, save_json
 from shared.calc_engine import (
@@ -1723,6 +1745,19 @@ class CalculatorPage(QWidget):
         except Exception as e:
             self._ko_exp_status.setText(f"⚠ Error: {str(e)[:40]}")
             QTimer.singleShot(4000, lambda: self._ko_exp_status.setText(""))
+
+    def hideEvent(self, event):
+        # Tab switched away: close any open QComboBox dropdown. A combo popup is a TOP-LEVEL widget
+        # (an empty-looking list of rows); if one were left open when the launcher swaps this page out of
+        # its QStackedWidget, it would float over the newly-shown tab — the "empty Calculator rows bleeding
+        # into other tabs" symptom. hidePopup() is a no-op when nothing is open and never touches the
+        # calculation logic. See AI_Library/reference/calculator-combo-bleed.md.
+        try:
+            for cb in self.findChildren(QComboBox):
+                cb.hidePopup()
+        except Exception:
+            pass
+        super().hideEvent(event)
 
     def closeEvent(self, event):
         save_json(CALC_CFG, self._cfg)

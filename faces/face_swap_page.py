@@ -16,11 +16,25 @@ from PIL import Image
 
 from PySide6.QtCore    import Qt, QThread, QObject, Signal
 from PySide6.QtWidgets import (
-    QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QScrollArea, QTabWidget,
-    QFileDialog, QMessageBox, QProgressDialog, QApplication,
-    QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QMenu,
-    QSlider, QSizePolicy,
+    QWidget,
+    QFrame,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QTabWidget,
+    QFileDialog,
+    QMessageBox,
+    QProgressDialog,
+    QApplication,
+    QSpinBox,
+    QDoubleSpinBox,
+    QComboBox,
+    QCheckBox,
+    QMenu,
+    QSizePolicy,
 )
 from PySide6.QtGui import QCursor
 

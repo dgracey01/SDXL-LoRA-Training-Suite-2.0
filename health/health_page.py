@@ -517,6 +517,11 @@ def _parse_kohya_log(log_path: str, metadata: dict | None = None) -> dict:
         total_steps = total_from_log or final_step
         eff_batch   = batch_size * grad_accum
         actual_tos  = (total_steps * eff_batch / image_count) if image_count else None
+        # Training Preset — TrainerXL writes "Preset: <name> (<pct>%)" in the log header
+        # (Realistic 40% / Identity 60% / Full Training 100% / Custom). Older logs predate it → None.
+        _pm = re.search(r"Preset:\s*(.+?)\s*\((\d+)%\)", content)
+        preset     = _pm.group(1).strip() if _pm else None
+        preset_pct = int(_pm.group(2)) if _pm else None
         return {
             "image_count":       image_count,
             "total_steps":       total_steps,
@@ -535,6 +540,8 @@ def _parse_kohya_log(log_path: str, metadata: dict | None = None) -> dict:
             "final_step":        final_step,
             "network_rank":      network_rank,
             "network_alpha":     network_alpha,
+            "preset":            preset,
+            "preset_pct":        preset_pct,
         }
     except Exception:
         return {}
@@ -604,6 +611,56 @@ def _training_params(metadata: dict) -> list[tuple]:
     return out
 
 
+def _preflight_safetensors(path: str) -> None:
+    """Guard against loading a partial / torn / corrupt .safetensors — e.g. a checkpoint that a
+    training run is STILL WRITING (the exact case that hard-crashed the Suite). safe_open()/get_tensor
+    mmap and read tensor bytes, so on a truncated file they can crash the whole PROCESS natively
+    (segfault reading past EOF, or an OOM from a garbage header-length) — a crash Python's try/except
+    CANNOT trap. This validates the header + tensor offsets up front with plain file reads (no mmap of
+    tensor data), so a bad file raises a clean, CATCHABLE error instead of taking the Suite down."""
+    import os, json, struct, time
+    if not os.path.isfile(path):
+        raise RuntimeError(f"File not found:\n{path}")
+    # 1) still being written? require a stable size across a short window.
+    s1 = os.path.getsize(path)
+    time.sleep(0.4)
+    s2 = os.path.getsize(path)
+    if s1 != s2:
+        raise RuntimeError(
+            "This checkpoint is still being written by a training run (its size is changing).\n"
+            "Wait for the current step's save to finish, then analyse it.")
+    if s2 < 16:
+        raise RuntimeError("File is too small to be a valid .safetensors — likely a partial write.")
+    # 2) validate the header (8-byte little-endian length + JSON) without loading any tensor data.
+    with open(path, "rb") as f:
+        raw = f.read(8)
+        if len(raw) < 8:
+            raise RuntimeError("Truncated .safetensors (no header) — incomplete file.")
+        hdr_len = struct.unpack("<Q", raw)[0]
+        if hdr_len <= 0 or hdr_len > s2 - 8 or hdr_len > 200 * 1024 * 1024:
+            raise RuntimeError(
+                "Invalid safetensors header length — the file is incomplete or corrupt (most likely a "
+                "partial write from an in-progress training save). Wait for the save to finish and retry.")
+        try:
+            header = json.loads(f.read(hdr_len).decode("utf-8"))
+        except Exception:
+            raise RuntimeError(
+                "Unreadable safetensors header — the file is incomplete or corrupt (partial training "
+                "write?). Wait for the save to finish and retry.")
+    # 3) every tensor's data must lie WITHIN the file — else safe_open reads past EOF → native crash.
+    data_len = s2 - 8 - hdr_len
+    for name, info in header.items():
+        if name == "__metadata__" or not isinstance(info, dict):
+            continue
+        off = info.get("data_offsets")
+        if (not isinstance(off, (list, tuple)) or len(off) != 2
+                or not all(isinstance(x, int) for x in off)
+                or off[0] < 0 or off[1] > data_len or off[0] > off[1]):
+            raise RuntimeError(
+                f"Tensor '{name}' extends past the end of the file — the checkpoint is truncated / "
+                "incomplete (an in-progress training save?). Wait for it to finish, then retry.")
+
+
 def _analyse(path: str, get_threshold, model_type_override: str | None = None,
              trainer_override: str | None = None) -> dict:
     """Load safetensors and run all checks. Returns result dict."""
@@ -612,6 +669,8 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         import torch
     except ImportError as e:
         raise RuntimeError(f"Missing dependency: {e}. Install safetensors and torch.")
+
+    _preflight_safetensors(path)   # refuse a torn/partial file (e.g. a checkpoint training is still writing)
 
     tensors:  dict = {}
     metadata: dict = {}
@@ -941,31 +1000,39 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         has_log   = bool(log_data)
         at_ceiling = (actual_rank is not None and actual_rank >= 128)
 
-        if at_ceiling:
-            # Rank ≥ 128 is the practical ceiling — full utilization is expected,
-            # not a deficiency. Raising the rank further gives diminishing returns.
-            sat_detail = (
-                f"Rank efficiency {mean_eff:.0%} — all rank dimensions fully utilized "
-                f"at rank {actual_rank} (maximum practical rank). "
-                f"This is expected behavior, not a deficiency.")
-            sat_status = "info"
-        elif has_log and plateaued:
+        # Rank efficiency is ~100% on essentially every healthy character/concept LoRA
+        # (validated across 14 LoRAs, ranks 8-128, two trainers — 2026-06-07 measurement).
+        # Saturation ALONE is therefore informational, not a defect. The only actionable
+        # signal is a confirmed LOSS PLATEAU — that is what separates an under-ranked LoRA
+        # from an adequately-ranked one. Plateau -> warn; everything else -> info.
+        if has_log and plateaued:
             q1 = log_data.get("q1_avg", 0)
             q4 = log_data.get("q4_avg", 0)
             sat_detail = (
-                f"Rank efficiency {mean_eff:.0%} with loss plateau confirmed "
-                f"(Q1 {q1:.4f} → Q4 {q4:.4f}) — declared rank is a bottleneck. "
+                f"Rank efficiency {mean_eff:.0%} WITH loss plateau confirmed "
+                f"(Q1 {q1:.4f} -> Q4 {q4:.4f}) — declared rank is the bottleneck. "
                 f"Retrain at higher rank for better detail capture.")
             sat_status = "warn"
-        elif mean_eff >= 0.93:
+        elif at_ceiling:
             sat_detail = (
-                f"Rank efficiency {mean_eff:.0%} — nearly all rank dimensions in use. "
-                f"Likely bottleneck; loss log unavailable to confirm plateau.")
-            sat_status = "warn"
+                f"Rank efficiency {mean_eff:.0%} — all rank dimensions fully utilized "
+                f"at rank {actual_rank} (maximum practical rank). Expected, not a deficiency.")
+            sat_status = "info"
+        elif has_log:
+            # Converged with no plateau — full utilization is the normal end state.
+            q1 = log_data.get("q1_avg", 0)
+            q4 = log_data.get("q4_avg", 0)
+            sat_detail = (
+                f"Rank efficiency {mean_eff:.0%} but loss converged with no plateau "
+                f"(Q1 {q1:.4f} -> Q4 {q4:.4f}) — full utilization is the normal state for "
+                f"this LoRA type; declared rank is adequate. Informational.")
+            sat_status = "info"
         else:
             sat_detail = (
-                f"Rank efficiency {mean_eff:.0%} — rank dimensions heavily utilized. "
-                f"Monitor loss trend; higher rank may improve detail capture.")
+                f"Rank efficiency {mean_eff:.0%} — high utilization is normal for "
+                f"character/concept LoRAs and is not by itself a defect. No loss log to "
+                f"check for a plateau; if detail is lacking, confirm a loss plateau before "
+                f"raising rank.")
             sat_status = "info"
 
         checks.append({"id": "rank_saturation", "label": "Rank Saturation",
@@ -1081,10 +1148,17 @@ def _rank_verdict(rank_efficiency: dict, log_data: dict | None = None,
         return None, None
     spectral = rank_efficiency.get("spectral") or {}
     q2 = spectral.get("q2")
+    log_data = log_data or {}
+    plateaued = bool(log_data) and (log_data.get("converged") is False)
+    converged = bool(log_data) and (log_data.get("converged") is True)
     if mean_eff >= 0.88:
-        if (q2 is not None and q2 >= 0.90) or (declared_rank is not None and declared_rank >= 128):
+        # Saturation is near-universal; only a confirmed loss plateau means the rank is
+        # actually limiting. Converged / steep-spectrum / at-ceiling = adequate rank.
+        if plateaued:
+            return "May benefit from higher rank", AMB
+        if converged or (q2 is not None and q2 >= 0.90) or (declared_rank is not None and declared_rank >= 128):
             return "Balanced rank", GRN
-        return "May benefit from higher rank", AMB
+        return "Saturated (normal — no plateau)", MUT
     if mean_eff >= 0.45:
         return "Balanced rank", GRN
     return "May benefit from lower rank", MUT
@@ -1105,10 +1179,14 @@ def _score_result(result: dict, profile: str = "concept",
     mean_mag = m.get("mean_mag", 0.0)
     dead     = m.get("total_dead", 0)
 
-    # step_ratio shared by identity / outfit / style
+    # step_ratio shared by identity / outfit / style. A bare-name final (no parsable step in
+    # the filename → checkpoint_step is None) IS the last checkpoint, so score it as
+    # total_steps rather than the neutral 0.5 (TrainerXL prunes the redundant -stepNNNN copy,
+    # leaving only the bare-name final).
     step_ratio = 0.5
-    if checkpoint_step is not None and total_steps and total_steps > 0:
-        step_ratio = min(1.0, checkpoint_step / total_steps)
+    if total_steps and total_steps > 0:
+        eff_step = checkpoint_step if checkpoint_step is not None else total_steps
+        step_ratio = min(1.0, eff_step / total_steps)
 
     mag_frac = min(1.0, mean_mag / mag_warn) if mag_warn > 0 else 0.0
     eff      = m.get("mean_efficiency")   # None if SVD was unavailable
@@ -1172,8 +1250,12 @@ def _batch_label(result: dict, mag_warn: float, mag_fail: float) -> tuple[str, s
     """Return (label_text, badge_color) for the batch-tab Overall column.
 
     Priority (high → low): Corrupted > Burnt > Dead Layers > Overcooked >
-    Slightly Overcooked > Layer Unbalanced > Rank Saturated > Rank Mismatch >
+    Slightly Overcooked > Layer Unbalanced > Rank Plateau > Rank Mismatch >
     Undercooked > Pass
+
+    Note: rank *saturation* (100% efficiency) is informational, not a warning — it is
+    the normal state for character/concept LoRAs. Only a confirmed loss *plateau*
+    (saturation + non-converging loss) escalates to a warning ("Rank Plateau").
     """
     overall       = result["overall"]
     checks        = result.get("checks", [])
@@ -1202,7 +1284,7 @@ def _batch_label(result: dict, mag_warn: float, mag_fail: float) -> tuple[str, s
         if any(g.get("status") == "warn" for g in module_groups.values()):
             return "Layer Unbalanced", AMB
         if check_map.get("rank_saturation") == "warn":
-            return "Rank Saturated", AMB
+            return "Rank Plateau", AMB   # saturation + confirmed loss plateau (actionable)
         if check_map.get("rank_range") == "warn" or check_map.get("alpha_ratio") == "warn":
             return "Rank Mismatch", AMB
         return "⚠ Warn", AMB
@@ -1680,7 +1762,7 @@ class HealthPage(QWidget):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_batch_tab(self):
-        from PySide6.QtWidgets import QProgressBar, QSizePolicy
+        from PySide6.QtWidgets import QProgressBar
 
         w = QWidget()
         w.setStyleSheet(f"background:{PAN};")
@@ -2005,6 +2087,10 @@ class HealthPage(QWidget):
             spi_part  = ""
             if folder_log_data.get("actual_tos") is not None:
                 spi_part = f"  ·  TOS {folder_log_data['actual_tos']:.0f}"
+            preset_part = ""
+            if folder_log_data.get("preset"):
+                preset_part = (f"  ·  Preset: {folder_log_data['preset']} "
+                               f"({folder_log_data.get('preset_pct')}%)")
             best_eff  = m.get("mean_efficiency")
             eff_part  = f"  ·  Rank eff: {best_eff:.0%}" if best_eff is not None else ""
             detail_row.addWidget(_lbl(
@@ -2013,7 +2099,7 @@ class HealthPage(QWidget):
                 f"Dead layers: {m.get('total_dead', 0)}"
                 f"{eff_part}  ·  "
                 f"{best_meta['model_type']}  rank {best_meta.get('rank_display') or best_meta['rank']}"
-                f"{loss_part}{spi_part}",
+                f"{loss_part}{spi_part}{preset_part}",
                 SEC, FONT_SM))
             detail_row.addStretch(1)
 
@@ -2051,11 +2137,11 @@ class HealthPage(QWidget):
                     spec_color = GRN
                     spec_hint  = "steep spectrum — concept fits naturally in fewer dims"
                 elif q2 >= 0.70:
-                    spec_color = AMB
-                    spec_hint  = "moderate spread — rank was a partial constraint"
+                    spec_color = GRN
+                    spec_hint  = "moderate spread — rank comfortably covers the concept"
                 else:
-                    spec_color = RED
-                    spec_hint  = "flat spectrum — rank was a limiting factor"
+                    spec_color = MUT
+                    spec_hint  = "flat spectrum — normal for character/concept LoRAs; not a defect on its own"
                 spec_row = QHBoxLayout()
                 spec_row.setSpacing(8)
                 spec_row.addWidget(_lbl(

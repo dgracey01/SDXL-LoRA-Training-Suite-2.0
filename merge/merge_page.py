@@ -834,7 +834,7 @@ class MergePage(QWidget):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_checkpoint_tab(self):
-        from .merge_methods import METHODS, THREE_MODEL_METHODS, METHOD_DESCRIPTIONS
+        from .merge_methods import METHODS, METHOD_DESCRIPTIONS
 
         w      = QWidget()
         w.setStyleSheet(f"background:{PAN};")

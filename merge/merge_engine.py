@@ -21,20 +21,6 @@ from .merge_methods import METHODS, TWO_MODEL_METHODS, weighted_sum
 
 # ── Device helpers ────────────────────────────────────────────────────────────
 
-def get_available_vram_gb() -> float:
-    """Return free VRAM in GB, or 0.0 if no CUDA device."""
-    if not torch.cuda.is_available():
-        return 0.0
-    free, _ = torch.cuda.mem_get_info()
-    return free / (1024 ** 3)
-
-
-def get_total_vram_gb() -> float:
-    """Return total VRAM in GB, or 0.0 if no CUDA device."""
-    if not torch.cuda.is_available():
-        return 0.0
-    _, total = torch.cuda.mem_get_info()
-    return total / (1024 ** 3)
 
 
 def resolve_device(pref: str) -> str:
@@ -64,29 +50,6 @@ _DTYPE_BYTES = {
     "I64": 8, "I32": 4, "I16": 2, "I8": 1, "U8": 1, "BOOL": 1,
 }
 
-
-def estimate_model_gb(path: str) -> float:
-    """
-    Estimate loaded model size in GB by reading the safetensors header only.
-    Header is at most a few hundred KB — no tensor data is read.
-    """
-    try:
-        with open(path, "rb") as f:
-            header_len = struct.unpack("<Q", f.read(8))[0]
-            header     = json.loads(f.read(header_len))
-        total = 0
-        for k, v in header.items():
-            if k == "__metadata__":
-                continue
-            shape = v.get("shape", [])
-            dtype = v.get("dtype", "F32")
-            n = 1
-            for s in shape:
-                n *= s
-            total += n * _DTYPE_BYTES.get(dtype, 4)
-        return total / (1024 ** 3)
-    except Exception:
-        return os.path.getsize(path) / (1024 ** 3)
 
 
 # ── I/O helpers ───────────────────────────────────────────────────────────────
@@ -434,27 +397,6 @@ def merge_checkpoints(
 
 # ── LoRA delta helpers ────────────────────────────────────────────────────────
 
-def _lora_delta(tensors: dict, dk: str) -> torch.Tensor | None:
-    """Compute the full-rank delta for one LoRA layer from a pre-loaded dict."""
-    uk = dk.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
-    if uk not in tensors:
-        return None
-    down = tensors[dk].float()
-    up   = tensors[uk].float()
-
-    alpha_key = dk.rsplit(".", 1)[0] + ".alpha"
-    alpha = float(tensors[alpha_key].item()) if alpha_key in tensors else float(down.shape[0])
-    dim   = down.shape[0]
-    scale = alpha / dim
-
-    if down.dim() == 4:
-        d = (up.view(up.shape[0], -1) @ down.view(down.shape[0], -1)).view(
-            up.shape[0], down.shape[1], down.shape[2], down.shape[3])
-    else:
-        d = up @ down
-
-    return d * scale
-
 
 def _lora_delta_from_handles(f, dk: str) -> torch.Tensor | None:
     """Compute delta for one layer using open safetensors file handles (streaming)."""
@@ -479,31 +421,6 @@ def _lora_delta_from_handles(f, dk: str) -> torch.Tensor | None:
 
     return d * scale
 
-
-def _lora_delta_from_dict(tensors: dict, dk: str, dev: str) -> torch.Tensor | None:
-    """Compute delta for one layer from a preloaded tensor dict.
-    Moves only the tensors needed for this key to dev — CPU dict stays intact.
-    """
-    uk = dk.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
-    if uk not in tensors:
-        return None
-
-    down = tensors[dk].float().to(dev)
-    up   = tensors[uk].float().to(dev)
-
-    alpha_key = dk.rsplit(".", 1)[0] + ".alpha"
-    alpha = float(tensors[alpha_key].item()) if alpha_key in tensors else float(down.shape[0])
-    dim   = down.shape[0]
-    scale = alpha / dim
-
-    if down.dim() == 4:
-        d = (up.view(up.shape[0], -1) @ down.view(down.shape[0], -1)).view(
-            up.shape[0], down.shape[1], down.shape[2], down.shape[3])
-    else:
-        d = up @ down
-
-    del down, up
-    return d * scale
 
 
 def _svd_decompose(delta: torch.Tensor, rank: int, ref_dtype: torch.dtype,

@@ -22,19 +22,39 @@ from PIL import Image, ImageFilter
 
 from PySide6.QtCore    import Qt, QThread, QObject, Signal
 from PySide6.QtWidgets import (
-    QWidget, QFrame, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QScrollArea, QFileDialog,
-    QMessageBox, QProgressDialog, QApplication,
-    QComboBox, QSlider, QSpinBox, QSizePolicy, QMenu,
+    QWidget,
+    QFrame,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QFileDialog,
+    QMessageBox,
+    QProgressDialog,
+    QApplication,
+    QComboBox,
+    QSlider,
+    QSpinBox,
+    QMenu,
 )
 from PySide6.QtGui import QCursor
 
 from shared.theme import (
-    BG, PAN, CAR, ACC, GRN, RED, MUT, PRI, SEC, AMB,
-    FONT, FONT_SM, FONT_MD,
+    BG,
+    CAR,
+    ACC,
+    GRN,
+    MUT,
+    PRI,
+    SEC,
+    AMB,
+    FONT,
+    FONT_SM,
+    FONT_MD,
 )
 from shared.config import load_json, save_json
-from randomizer.randomizer_page import BgViewerCard, _load_thumb
+from randomizer.randomizer_page import BgViewerCard
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE        = os.path.dirname(os.path.abspath(__file__))

@@ -39,6 +39,12 @@ from PySide6.QtGui     import QIcon
 QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
 from shared.theme     import apply_theme, VERSION
+from shared import crash_guard
+# faulthandler + global excepthook: a native ROCm/torch OOM (segfault) now dumps a Python stack to
+# logs/suite_crash.log instead of vanishing, and an unhandled Python error shows a dialog instead of
+# killing the Suite. Installed before the UI so it covers construction of every module.
+crash_guard.install()
+
 from launcher.main_window import Launcher
 
 _ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")

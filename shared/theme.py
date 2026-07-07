@@ -269,21 +269,4 @@ def apply_theme(app):
     app.setStyleSheet(GLOBAL_QSS)
 
 
-def make_label(parent, text="", size=FONT_MD, color=SEC, bold=False):
-    """Helper — returns a styled QLabel."""
-    from PySide6.QtWidgets import QLabel
-    lbl = QLabel(text, parent)
-    weight = "bold" if bold else "normal"
-    lbl.setStyleSheet(
-        f"color: {color}; font-family: {FONT}; font-size: {size}px; font-weight: {weight};"
-    )
-    return lbl
 
-
-def card_frame(parent=None):
-    """Returns a QFrame styled as a card."""
-    from PySide6.QtWidgets import QFrame
-    f = QFrame(parent)
-    f.setProperty("card", True)
-    f.setStyleSheet(f"QFrame {{ background:{CAR}; border-radius:8px; border:2px solid {MUT}; }}")
-    return f

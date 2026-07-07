@@ -2,7 +2,6 @@
 assets/make_zip.py  —  Build distribution zip for Lora Training Suite 2.0
 Run once:  .venv\Scripts\python.exe assets\make_zip.py
 """
-import os
 import zipfile
 from pathlib import Path
 

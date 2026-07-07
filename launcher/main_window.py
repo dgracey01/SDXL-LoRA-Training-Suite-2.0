@@ -25,30 +25,66 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore    import Qt, QUrl, QTimer, QSize, Signal, QObject
-from PySide6.QtGui     import QFont, QCursor, QIcon, QPixmap, QColor, QImage
+from PySide6.QtGui import QIcon, QPixmap, QImage
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QFrame, QStackedWidget,
-    QScrollArea, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QSizePolicy, QInputDialog, QMessageBox,
-    QDialog, QDialogButtonBox, QMenu, QFileDialog, QFormLayout,
+    QMainWindow,
+    QWidget,
+    QFrame,
+    QStackedWidget,
+    QScrollArea,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QInputDialog,
+    QMessageBox,
+    QDialog,
+    QDialogButtonBox,
+    QMenu,
+    QFileDialog,
+    QFormLayout,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore    import (
     QWebEnginePage, QWebEngineProfile, QWebEngineSettings,
 )
 
-from shared.theme  import (
-    BG, PAN, CAR, ACC, GRN, RED, MUT, PRI, SEC,
-    FONT, FONT_SM, FONT_MD, FONT_LG, VERSION, SIGNATURE,
+from shared.theme import (
+    BG,
+    PAN,
+    CAR,
+    ACC,
+    GRN,
+    RED,
+    MUT,
+    PRI,
+    SEC,
+    FONT,
+    FONT_SM,
+    FONT_MD,
+    VERSION,
+    SIGNATURE,
 )
 from shared.config import (
-    load_apps, save_apps, check_port, DEFAULT_APPS,
-    load_hf_token, save_hf_token, apply_hf_token,
+    load_apps,
+    save_apps,
+    check_port,
+    load_hf_token,
+    save_hf_token,
+    apply_hf_token,
 )
 
 _HERE             = os.path.dirname(os.path.abspath(__file__))
 _ASSETS           = os.path.join(os.path.dirname(_HERE), "assets")
 _CUSTOM_APPS_FILE = os.path.join(_HERE, "custom_apps.json")
+
+# Accepted identifier-image formats. Includes .ico (program icons) and other
+# common formats Qt can load — the box drops/pickers match against this list.
+_IMG_EXTS   = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif',
+               '.ico', '.jfif', '.tif', '.tiff')
+_IMG_FILTER = ("Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif"
+               " *.ico *.jfif *.tif *.tiff)")
 
 
 def _load_custom_apps() -> list[dict]:
@@ -314,6 +350,28 @@ class AppIconBox(QFrame):
 _IMG_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="img_scale")
 
 
+# Marshal a callable from a worker thread back onto the GUI thread. QTimer.singleShot
+# cannot be used from a non-Qt worker thread (no event loop there → it never fires), which
+# is why background-loaded box images silently failed to appear. Emitting through this
+# queued signal runs the callback on the GUI thread, where QPixmap creation is also legal.
+class _MainThreadInvoker(QObject):
+    run = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.run.connect(self._invoke, Qt.ConnectionType.QueuedConnection)
+
+    @staticmethod
+    def _invoke(fn):
+        try:
+            fn()
+        except RuntimeError:
+            pass
+
+
+_MAIN_INVOKER = _MainThreadInvoker()
+
+
 def _scale_qimage_bg(path: str, w: int, h: int):
     """Load, scale-to-fill, and center-crop a QImage off the main thread."""
     img = QImage(path)
@@ -441,7 +499,7 @@ class WebUIBox(QFrame):
                             self_ref._show_image_placeholder()
                     except RuntimeError:
                         pass
-                QTimer.singleShot(0, _apply)
+                _MAIN_INVOKER.run.emit(_apply)
             _IMG_EXECUTOR.submit(_scale_qimage_bg, img_path, w, h).add_done_callback(_done)
             return
         self._show_image_placeholder()
@@ -458,7 +516,7 @@ class WebUIBox(QFrame):
         if event.mimeData().hasUrls():
             for u in event.mimeData().urls():
                 if u.toLocalFile().lower().endswith(
-                        ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                        _IMG_EXTS):
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -467,7 +525,7 @@ class WebUIBox(QFrame):
         for u in event.mimeData().urls():
             path = u.toLocalFile()
             if path.lower().endswith(
-                    ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                    _IMG_EXTS):
                 self.app["image"] = path
                 self._refresh_image()
                 self.image_changed.emit(self)
@@ -534,7 +592,7 @@ class WebUIBox(QFrame):
     def _browse_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Image", "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+            _IMG_FILTER)
         if path:
             self.app["image"] = path
             self._refresh_image()
@@ -634,6 +692,7 @@ class WebUIEntryDialog(QDialog):
 
     def __init__(self, app: dict | None = None, parent=None):
         super().__init__(parent)
+        self.finished.connect(self.deleteLater)   # free after exec(); parented dialogs otherwise pile up
         is_edit = app is not None
         self.setWindowTitle("Edit WebUI Entry" if is_edit else "Create WebUI Entry")
         self.setMinimumWidth(380)
@@ -813,7 +872,7 @@ class CustomAppBox(QFrame):
                             self_ref._show_image_placeholder()
                     except RuntimeError:
                         pass
-                QTimer.singleShot(0, _apply)
+                _MAIN_INVOKER.run.emit(_apply)
             _IMG_EXECUTOR.submit(_scale_qimage_bg, img_path, w, h).add_done_callback(_done)
             return
         self._show_image_placeholder()
@@ -830,7 +889,7 @@ class CustomAppBox(QFrame):
         if event.mimeData().hasUrls():
             for u in event.mimeData().urls():
                 if u.toLocalFile().lower().endswith(
-                        ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                        _IMG_EXTS):
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -839,7 +898,7 @@ class CustomAppBox(QFrame):
         for u in event.mimeData().urls():
             path = u.toLocalFile()
             if path.lower().endswith(
-                    ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')):
+                    _IMG_EXTS):
                 self.app["image"] = path
                 self._refresh_image()
                 self.image_changed.emit(self)
@@ -921,7 +980,7 @@ class CustomAppBox(QFrame):
     def _browse_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Image", "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+            _IMG_FILTER)
         if path:
             self.app["image"] = path
             self._refresh_image()
@@ -1009,6 +1068,7 @@ class CustomAppEntryDialog(QDialog):
 
     def __init__(self, app: dict | None = None, parent=None):
         super().__init__(parent)
+        self.finished.connect(self.deleteLater)   # free after exec(); parented dialogs otherwise pile up
         is_edit = app is not None
         self.setWindowTitle("Edit Application" if is_edit else "Add Application")
         self.setMinimumWidth(420)
@@ -1108,6 +1168,7 @@ class SettingsDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.finished.connect(self.deleteLater)   # free after exec(); parented dialogs otherwise pile up
         self.setWindowTitle("Settings")
         self.setMinimumWidth(440)
         self.setStyleSheet(f"""
@@ -1279,6 +1340,7 @@ class ManagePage(QWidget):
         ("Randomizer",   "Randomizer.png"),
         ("LoRA Health",  "health.png"),
         ("Model Merge",  "merge.png"),
+        ("PoserXL",      "poserxl.png"),
     ]
 
     _SECTION_LABEL = (
@@ -1398,9 +1460,6 @@ class ManagePage(QWidget):
             url = box.app.get("url", "")
             if url in statuses:
                 box.set_status(statuses[url])
-
-    def get_cards(self) -> list[WebUIBox]:
-        return list(self._webui_boxes)
 
     def _create_webui(self) -> None:
         dlg = WebUIEntryDialog(parent=self)
@@ -1568,6 +1627,8 @@ class Launcher(QMainWindow):
         self._health_index: int | None = None
         self._merge_page:   None                = None
         self._merge_index:  int | None = None
+        self._poser_page:   None                = None
+        self._poser_index:  int | None = None
         self._poll_timer:   QTimer | None = None
 
         self._build_ui()
@@ -1666,6 +1727,8 @@ class Launcher(QMainWindow):
             "LoRA Health", self._show_health, closeable=True)
         self._merge_tab  = self._make_nav_tab(
             "Model Merge", self._show_merge, closeable=True)
+        self._poser_tab  = self._make_nav_tab(
+            "PoserXL", self._show_poserxl, closeable=True, refresh=True)
 
         self._tags_tab.close_requested.connect(self._close_tags)
         self._calc_tab.close_requested.connect(self._close_calculator)
@@ -1674,10 +1737,12 @@ class Launcher(QMainWindow):
         self._enh_tab.close_requested.connect(self._close_enhancer)
         self._health_tab.close_requested.connect(self._close_health)
         self._merge_tab.close_requested.connect(self._close_merge)
+        self._poser_tab.close_requested.connect(self._close_poserxl)
+        self._poser_tab.refresh_requested.connect(self._restart_poserxl)   # tab ↻ = reboot PoserXL in place
 
         for btn in (self._tags_tab, self._calc_tab, self._rand_tab,
                     self._face_tab, self._enh_tab, self._health_tab,
-                    self._merge_tab):
+                    self._merge_tab, self._poser_tab):
             hrow.addWidget(btn)
             hrow.addSpacing(4)
             btn.setVisible(False)   # hidden until app is opened
@@ -1735,9 +1800,9 @@ class Launcher(QMainWindow):
         self._show_manage()
 
     def _make_nav_tab(self, label: str, callback,
-                      closeable: bool = False) -> TabButton:
+                      closeable: bool = False, refresh: bool = False) -> TabButton:
         btn = TabButton(label, show_dot=closeable, show_close=closeable,
-                        parent=self._header)
+                        enable_refresh=refresh, parent=self._header)
         btn.clicked.connect(callback)
         return btn
 
@@ -1769,6 +1834,7 @@ class Launcher(QMainWindow):
         self._enh_tab.set_active(False)
         self._health_tab.set_active(False)
         self._merge_tab.set_active(False)
+        self._poser_tab.set_active(False)
         for entry in self._tab_data.values():
             entry["tab_btn"].set_active(False)
 
@@ -1790,16 +1856,28 @@ class Launcher(QMainWindow):
             "Randomizer":  self._show_randomizer,
             "LoRA Health":  self._show_health,
             "Model Merge":  self._show_merge,
+            "PoserXL":      self._show_poserxl,
         }
         fn = dispatch.get(name)
         if fn:
             fn()
 
     def _show_tags(self):
+        if self._tags_page is None:
+            if not self._vram_preflight("Tagger", free_engine_ckpt=True):
+                return
         self._tags_tab.setVisible(True)
         if self._tags_page is None:
-            from tags.tag_handler_page import TagHandlerPage
-            self._tags_page  = TagHandlerPage()
+            from shared import crash_guard
+            def _make():
+                from tags.tag_handler_page import TagHandlerPage
+                return TagHandlerPage()
+            page = crash_guard.guard_open("Tagger", _make, parent=self)
+            if page is None:
+                self._tags_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._tags_page  = page
             self._tags_index = self._stack.addWidget(self._tags_page)
             self._tags_tab.set_dot_online(True)
         self._deactivate_all()
@@ -1811,8 +1889,17 @@ class Launcher(QMainWindow):
     def _show_calculator(self):
         self._calc_tab.setVisible(True)
         if self._calc_page is None:
-            from calculator.calculator_page import CalculatorPage
-            self._calc_page  = CalculatorPage()
+            # CPU-only: no VRAM pre-flight, but still contain a Python init failure to this tab.
+            from shared import crash_guard
+            def _make():
+                from calculator.calculator_page import CalculatorPage
+                return CalculatorPage()
+            page = crash_guard.guard_open("Calculator", _make, parent=self)
+            if page is None:
+                self._calc_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._calc_page  = page
             self._calc_index = self._stack.addWidget(self._calc_page)
             self._calc_tab.set_dot_online(True)
         self._deactivate_all()
@@ -1824,8 +1911,17 @@ class Launcher(QMainWindow):
     def _show_randomizer(self):
         self._rand_tab.setVisible(True)
         if self._rand_page is None:
-            from randomizer.randomizer_page import RandomizerPage
-            self._rand_page  = RandomizerPage()
+            # CPU-only: no VRAM pre-flight, but still contain a Python init failure to this tab.
+            from shared import crash_guard
+            def _make():
+                from randomizer.randomizer_page import RandomizerPage
+                return RandomizerPage()
+            page = crash_guard.guard_open("Randomizer", _make, parent=self)
+            if page is None:
+                self._rand_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._rand_page  = page
             self._rand_index = self._stack.addWidget(self._rand_page)
             self._rand_tab.set_dot_online(True)
         self._deactivate_all()
@@ -1835,10 +1931,21 @@ class Launcher(QMainWindow):
         self._set_zoom_display(1.0)
 
     def _show_faceswap(self):
+        if self._face_page is None:
+            if not self._vram_preflight("Face Swap", free_engine_ckpt=True):
+                return
         self._face_tab.setVisible(True)
         if self._face_page is None:
-            from faces.face_swap_page import FaceSwapPage
-            self._face_page  = FaceSwapPage()
+            from shared import crash_guard
+            def _make():
+                from faces.face_swap_page import FaceSwapPage
+                return FaceSwapPage()
+            page = crash_guard.guard_open("Face Swap", _make, parent=self)
+            if page is None:
+                self._face_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._face_page  = page
             self._face_index = self._stack.addWidget(self._face_page)
             self._face_tab.set_dot_online(True)
         self._deactivate_all()
@@ -1848,10 +1955,21 @@ class Launcher(QMainWindow):
         self._set_zoom_display(1.0)
 
     def _show_enhancer(self):
+        if self._enh_page is None:
+            if not self._vram_preflight("Enhancer", free_engine_ckpt=True):
+                return
         self._enh_tab.setVisible(True)
         if self._enh_page is None:
-            from enhancer.enhancer_page import EnhancerPage
-            self._enh_page  = EnhancerPage()
+            from shared import crash_guard
+            def _make():
+                from enhancer.enhancer_page import EnhancerPage
+                return EnhancerPage()
+            page = crash_guard.guard_open("Enhancer", _make, parent=self)
+            if page is None:
+                self._enh_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._enh_page  = page
             self._enh_index = self._stack.addWidget(self._enh_page)
             self._enh_tab.set_dot_online(True)
         self._deactivate_all()
@@ -1860,11 +1978,48 @@ class Launcher(QMainWindow):
         self._stack.setCurrentIndex(self._enh_index)
         self._set_zoom_display(1.0)
 
+    def _vram_preflight(self, module: str, free_engine_ckpt: bool = False, need_gb: float = 3.0) -> bool:
+        """Free reclaimable VRAM (LM Studio models Jarvis left resident; the engine checkpoint when the
+        module doesn't need it) BEFORE opening a heavy GPU module, so its native libs don't OOM the card
+        and crash the whole Suite. If VRAM still won't fit, ask the user to proceed or cancel.
+        Returns True to open, False to abort. Never raises."""
+        from PySide6.QtWidgets import QApplication
+        try:
+            from shared import vram_guard
+        except Exception:
+            return True                      # guard unavailable -> don't block the user
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            rep = vram_guard.preflight(module, free_engine_ckpt=free_engine_ckpt, need_gb=need_gb)
+        except Exception:
+            rep = None
+        finally:
+            QApplication.restoreOverrideCursor()
+        if rep and rep.get("fit") is False:
+            r = QMessageBox.warning(
+                self, f"Low VRAM — {module}", rep["message"],
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            return r == QMessageBox.StandardButton.Yes
+        return True
+
     def _show_health(self):
+        if self._health_page is None:
+            # Health does NOT use the render engine, so free its checkpoint too for max headroom.
+            if not self._vram_preflight("LoRA Health", free_engine_ckpt=True):
+                return
         self._health_tab.setVisible(True)
         if self._health_page is None:
-            from health.health_page import HealthPage
-            self._health_page  = HealthPage()
+            from shared import crash_guard
+            def _make():
+                from health.health_page import HealthPage
+                return HealthPage()
+            page = crash_guard.guard_open("LoRA Health", _make, parent=self)
+            if page is None:                 # Python-level init failure -> fail the module, not the Suite
+                self._health_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._health_page  = page
             self._health_index = self._stack.addWidget(self._health_page)
             self._health_tab.set_dot_online(True)
         self._deactivate_all()
@@ -2029,19 +2184,82 @@ class Launcher(QMainWindow):
         self._health_index = None
         self._health_tab.set_active(False)
         self._health_tab.set_dot_online(False)
-        self._health_tab.setVisible(False)
+
+    def _show_poserxl(self):
+        if self._poser_page is None:
+            # PoserXL NEEDS the engine checkpoint (it renders through it) -> keep it, only evict the
+            # LM Studio models Jarvis leaves resident.
+            if not self._vram_preflight("PoserXL", free_engine_ckpt=False):
+                return
+        self._poser_tab.setVisible(True)
+        if self._poser_page is None:
+            import sys
+            # purge on (re)open too, so the tab always loads the latest PoserXL code even if the
+            # close-time purge was missed — no full Suite restart needed for Python changes
+            for key in list(sys.modules.keys()):
+                if key.startswith("poserxl") and not key.startswith("poserxl.engine"):
+                    del sys.modules[key]
+            from shared import crash_guard
+            def _make():
+                from poserxl.poserxl_page import PoserXLPage
+                return PoserXLPage()
+            page = crash_guard.guard_open("PoserXL", _make, parent=self)
+            if page is None:                 # Python-level init failure -> fail the module, not the Suite
+                self._poser_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._poser_page  = page
+            self._poser_index = self._stack.addWidget(self._poser_page)
+            self._poser_tab.set_dot_online(True)
+        self._deactivate_all()
+        self._poser_tab.set_active(True)
+        self._active_url = None
+        self._stack.setCurrentIndex(self._poser_index)
+        self._set_zoom_display(1.0)
+
+    def _restart_poserxl(self):
+        """Reboot the PoserXL tab in place: tear it down (purges + cleans up) then reopen it, which
+        re-imports the poserxl modules fresh and reloads the web poser. Loads PoserXL code changes
+        without restarting the whole Suite; the engine subprocess (separate process) keeps running."""
+        self._close_poserxl()
+        self._show_poserxl()
+
+    def _close_poserxl(self):
+        if self._poser_page is None:
+            return
+        if hasattr(self._poser_page, "cleanup"):
+            self._poser_page.cleanup()
+        self._stack.removeWidget(self._poser_page)
+        self._poser_page.deleteLater()
+        self._poser_page  = None
+        self._poser_index = None
+        self._poser_tab.set_active(False)
+        self._poser_tab.set_dot_online(False)
+        self._poser_tab.setVisible(False)
         import sys
         for key in list(sys.modules.keys()):
-            if key.startswith("health"):
+            if key.startswith("poserxl"):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
 
     def _show_merge(self):
+        if self._merge_page is None:
+            # Merge loads full checkpoints into VRAM (torch) — free everything first.
+            if not self._vram_preflight("Merge", free_engine_ckpt=True):
+                return
         self._merge_tab.setVisible(True)
         if self._merge_page is None:
-            from merge.merge_page import MergePage
-            self._merge_page  = MergePage()
+            from shared import crash_guard
+            def _make():
+                from merge.merge_page import MergePage
+                return MergePage()
+            page = crash_guard.guard_open("Merge", _make, parent=self)
+            if page is None:
+                self._merge_tab.setVisible(False)
+                self._show_manage()
+                return
+            self._merge_page  = page
             self._merge_index = self._stack.addWidget(self._merge_page)
             self._merge_tab.set_dot_online(True)
         self._deactivate_all()

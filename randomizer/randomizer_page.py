@@ -27,8 +27,19 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QCursor, QAction
 
 from shared.theme import (
-    BG, PAN, CAR, ACC, GRN, RED, MUT, PRI, SEC, AMB,
-    FONT, FONT_SM, FONT_MD, FONT_LG, VERSION,
+    BG,
+    PAN,
+    CAR,
+    ACC,
+    GRN,
+    MUT,
+    PRI,
+    SEC,
+    FONT,
+    FONT_SM,
+    FONT_MD,
+    FONT_LG,
+    VERSION,
 )
 from shared.config import load_json, save_json
 
