@@ -93,13 +93,16 @@ def analyse_folder(folder: str, profile: str, model_type_override: str | None,
     if not files:
         return [], {}
 
-    total_steps = max((_step_of(p) for p in files if _step_of(p) < (1 << 30)), default=None)
+    total_steps_files = max((_step_of(p) for p in files if _step_of(p) < (1 << 30)), default=None)
 
     # training context from the kohya log + final checkpoint metadata
     log_summary: dict = {}
     log_path = os.path.join(folder, "log.txt")
     if os.path.isfile(log_path):
         log_summary = hp._parse_kohya_log(log_path, _read_metadata(files[-1]))
+    # Prefer the TRUE total from the kohya log: the step-numbered files may stop short of it
+    # when the redundant -stepNNNN copy was pruned, leaving only the bare-name final.
+    total_steps = int(log_summary.get("total_steps") or 0) or total_steps_files
 
     rows = []
     for path in files:
@@ -144,6 +147,8 @@ def print_report(folder: str, profile: str, rows: list[dict], log: dict) -> None
         eff = log.get("eff_batch")
         tos = log.get("actual_tos")
         print("Training context (from log.txt + metadata):")
+        if log.get("preset"):
+            print(f"  Preset: {log['preset']} ({log.get('preset_pct')}% of full training)")
         print(f"  images={log.get('image_count')}  total_steps={log.get('total_steps')}  "
               f"eff_batch={eff}  TOS={tos:.1f}" if tos else
               f"  images={log.get('image_count')}  total_steps={log.get('total_steps')}  eff_batch={eff}")

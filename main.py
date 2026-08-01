@@ -14,10 +14,42 @@ import sys
 import os
 import ctypes
 
+# ── ROCm attention (MUST precede any torch import, anywhere in the process) ───
+# PyTorch gates its flash / mem-efficient attention kernels behind this flag on AMD. Unset, SDPA
+# falls back to the `math` path: measured 210-486 ms per SDXL-1024 attention call vs ~6 ms with
+# flash, i.e. 0.12 it/s instead of ~2 it/s — renders that feel CPU-bound.
+# It is read when torch initialises, so setting it from a library module is too late: by the time
+# shared/render_engine.py is imported (lazily, on first render) torch is already loaded and the flag
+# has no effect. The entry point is the only place that reliably wins the race. Harmless on
+# CUDA/CPU boxes.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+
+# ── PyTorch HIP allocator: curb the fragmentation that causes ROCm hard-crash-on-OOM ──────────────
+# The single-process Suite loads/frees big SDXL tensors repeatedly; a fragmented pool is the usual
+# trigger of the native OOM that kills the whole process on this RDNA3 + ROCm-Windows box.
+#   garbage_collection_threshold:0.6 — reclaim cached blocks earlier (before the pool is exhausted).
+#   max_split_size_mb:512           — don't carve large blocks into small pieces that can't recombine.
+# Deliberately NO expandable_segments: proven a no-op that HARD-CRASHED on this discrete card (it's a
+# unified-memory/iGPU trick). Must be set before torch initialises → the entry point is the only place
+# that wins the race. Set both the HIP (ROCm) and CUDA (fallback) names so any torch build reads it.
+_ALLOC_CONF = "garbage_collection_threshold:0.6,max_split_size_mb:512"
+os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)       # torch >= 2.9 canonical name
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", _ALLOC_CONF)   # ROCm-specific fallback for older builds
+
 # ── Single-instance guard (Windows named mutex) ───────────────────────────────
+# HARDENED: the old code read the error with a SEPARATE `windll.kernel32.GetLastError()` call — but ctypes
+# can reset the thread's Win32 last-error between two foreign calls, so ERROR_ALREADY_EXISTS was
+# intermittently missed and a SECOND instance slipped through (that's how stale-code duplicates were
+# stacking up). WinDLL(use_last_error=True) snapshots the error right after CreateMutexW so
+# ctypes.get_last_error() reads it reliably. The handle is kept in a module global for the process
+# lifetime so the mutex isn't released early. bInitialOwner=False — existence detection doesn't need it.
+_ERROR_ALREADY_EXISTS = 183
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateMutexW.restype  = ctypes.c_void_p
+_k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
 _MUTEX_NAME = "ZeroJarvis.LoraSuite.2.SingleInstance"
-_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
-if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+_mutex = _k32.CreateMutexW(None, 0, _MUTEX_NAME)
+if _mutex and ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
     ctypes.windll.user32.MessageBoxW(
         0,
         "Lora Training Suite is already running.",
@@ -25,6 +57,7 @@ if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         0x30,  # MB_ICONWARNING
     )
     sys.exit(0)
+# (if _mutex is NULL the mutex couldn't be created — proceed rather than block launch on a rare failure.)
 
 # ── Windows taskbar: treat as its own app (not grouped under pythonw.exe) ─────
 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(

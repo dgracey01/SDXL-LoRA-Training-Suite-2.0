@@ -3,7 +3,7 @@ shared/crash_guard.py — keep one failing module from taking down the whole Sui
 crashes we CAN'T prevent finally leave a trace.
 
 WHY THIS EXISTS
-  Heavy Suite modules (PoserXL: MediaPipe + engine; LoRA Health: torch/SVD) run native code in the
+  Heavy Suite modules (SD.UI: MediaPipe + engine; LoRA Health: torch/SVD) run native code in the
   Suite process. Two failure classes have been killing the entire app:
 
     1. Uncatchable NATIVE crashes (a ROCm/torch OOM segfault) — the process just dies, no Python
@@ -33,6 +33,7 @@ import datetime
 import faulthandler
 import os
 import sys
+import threading
 import traceback
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,6 +98,26 @@ def install(show_dialog: bool = True) -> None:
         # deliberately do NOT re-raise / call prev: keep the event loop alive
 
     sys.excepthook = _hook
+
+    # WORKER THREADS: sys.excepthook only covers the MAIN thread. An exception raised inside a QThread /
+    # threading.Thread (scan workers, LoRA Health SVD, SD.UI render workers) is otherwise swallowed
+    # silently — the job just stops with no trace. threading.excepthook (3.8+) is the only way to see it.
+    def _thread_hook(args):
+        if issubclass(args.exc_type, KeyboardInterrupt):
+            return
+        text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        name = getattr(args.thread, "name", "?")
+        _append(f"\n----- Unhandled exception in thread '{name}' {_stamp()} -----\n{text}")
+        try:
+            sys.stderr.write(text)
+        except Exception:
+            pass
+        # no dialog here: worker threads must not touch Qt widgets (that itself crashes Qt)
+
+    try:
+        threading.excepthook = _thread_hook       # Python 3.8+
+    except Exception:
+        pass
 
 
 def _close() -> None:

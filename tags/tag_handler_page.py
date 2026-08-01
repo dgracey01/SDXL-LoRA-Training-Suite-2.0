@@ -1941,6 +1941,10 @@ class TagHandlerPage(QWidget):
     def _prep_assign_pool(self):
         if not self._prep_pool_cards:
             return
+        # Snapshot EVERY pool card's LIVE pan/zoom before any reassignment. Otherwise a card being
+        # reassigned to an image still shown (with unsaved edits) on a not-yet-processed pool card reads a
+        # STALE _crop_offsets entry — so the user's positioning "resets" on every row-crossing scroll.
+        self._prep_save_visible_offsets()
         sb_val    = self._prep_scroll.verticalScrollBar().value()
         cols      = self._prep_pool_cols or self._prep_cols_spin.value()
         cw        = self.PREP_CARD_W

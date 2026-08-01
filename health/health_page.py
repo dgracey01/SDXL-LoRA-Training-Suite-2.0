@@ -40,6 +40,11 @@ from shared.theme import (
 )
 from shared.config import HEALTH_CFG, load_json, save_json
 
+try:                                             # dashboard chart widgets (Phase 1/2)
+    from health.health_charts import RingGauge, LossCurve, ModuleBars
+except ImportError:                              # when imported as a top-level module (health/ on path)
+    from health_charts import RingGauge, LossCurve, ModuleBars
+
 
 # ── Architectural module groups ────────────────────────────────────────────────
 # Keys parsed from lora tensor names to classify each layer into its module role.
@@ -537,12 +542,30 @@ def _parse_kohya_log(log_path: str, metadata: dict | None = None) -> dict:
             "late_cv":           late_cv,
             "converged":         q4_avg < q1_avg * 0.97,
             "checkpoint_losses": {final_step: _window_avg(final_step)},
+            # kohya logs avr_loss EVERY step, so unlike AI Toolkit's per-checkpoint points we have the
+            # full curve — expose it for the loss-curve chart (the card prefers loss_series when present).
+            "loss_series":       dict(sorted_steps),
             "final_step":        final_step,
             "network_rank":      network_rank,
             "network_alpha":     network_alpha,
             "preset":            preset,
             "preset_pct":        preset_pct,
         }
+    except Exception:
+        return {}
+
+
+def _embedded_loss_series(metadata: dict) -> dict:
+    """Loss curve baked into the .safetensors metadata by TrainerXL (key 'lts_loss_series') → {step: loss}.
+    Makes a LoRA self-describing: the analyzer charts the curve straight from the FILE, no sidecar log.txt
+    required. Returns {} if the key is absent or malformed. Schema: {"schema":1,"unit":"avr_loss",
+    "points":[[step,loss],...]}."""
+    raw = (metadata or {}).get("lts_loss_series")
+    if not raw:
+        return {}
+    try:
+        pts = json.loads(raw).get("points", [])
+        return {int(s): float(l) for s, l in pts if l is not None}
     except Exception:
         return {}
 
@@ -714,6 +737,52 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         checks.append({"id": "nan_inf", "label": "NaN / Inf",
                         "status": "pass", "detail": "All tensors are finite."})
 
+    # ── 2b. Training Completeness ─────────────────────────────────────────────
+    # A crashed / power-cut run (or any pre-final checkpoint) leaves STRUCTURALLY sound weights — rank,
+    # magnitude, NaN, saturation all PASS — that are nonetheless UNCONVERGED: the cosine/LR-decay
+    # refinement phase in the back half never ran, so output is soft and low-quality. The integrity
+    # checks are blind to this; the safetensors' own ss_steps/ss_epoch vs the planned totals are the only
+    # file-level tell. (kohya/sd-scripts records these; AI-Toolkit doesn't → info, not a failure.)
+    def _m_int(k):
+        try: return int(float(metadata.get(k)))
+        except (TypeError, ValueError): return None
+    _ss, _max = _m_int("ss_steps"), _m_int("ss_max_train_steps")
+    _ep, _nep = _m_int("ss_epoch"), _m_int("ss_num_epochs")
+    _has_steps  = bool(_ss and _max and _max > 0)
+    _has_epochs = bool(_ep and _nep and _nep > 0)
+    pct = (_ss / _max) if _has_steps else ((_ep / _nep) if _has_epochs else None)
+    if pct is None:
+        checks.append({"id": "training_completeness", "label": "Training Completeness",
+                       "status": "info",
+                       "detail": "No step/epoch progress in metadata — completeness can't be verified "
+                                 "(not a kohya/sd-scripts save, or the ss_* fields were stripped)."})
+    else:
+        prog = ", ".join([p for p in (
+            (f"{_ss:,}/{_max:,} steps" if _has_steps else ""),
+            (f"epoch {_ep}/{_nep}" if _has_epochs else "")) if p])
+        if pct < 0.75:
+            # Below ~75% the cosine/LR-decay refinement phase has barely begun (LR still >~15% of max),
+            # so the weights are HOT BUT COARSE/NOISY — genuinely unusable, not merely suboptimal. Same
+            # practical verdict as a corrupt file: FAIL, don't deploy it.
+            checks.append({"id": "training_completeness", "label": "Training Completeness",
+                           "status": "fail",
+                           "detail": f"SEVERELY INCOMPLETE - {prog} = {pct*100:.0f}% of the planned "
+                                     f"schedule. Weights are UNCONVERGED (the LR-decay refinement phase "
+                                     f"never ran) -> hot but coarse/noisy, low-quality output. Not usable "
+                                     f"- resume or retrain to completion."})
+        elif pct < 0.98:
+            # Most of the schedule ran, incl. the bulk of LR decay: converged but not fully polished —
+            # usable, just slightly soft. A completed checkpoint is preferable.
+            checks.append({"id": "training_completeness", "label": "Training Completeness",
+                           "status": "warn",
+                           "detail": f"INCOMPLETE - {prog} = {pct*100:.0f}% of the planned schedule. Most "
+                                     f"of the LR-decay refinement ran, so it's usable but slightly "
+                                     f"under-refined; prefer a completed checkpoint."})
+        else:
+            checks.append({"id": "training_completeness", "label": "Training Completeness",
+                           "status": "pass",
+                           "detail": f"Ran to completion ({prog} = {pct*100:.0f}%)."})
+
     # ── Collect structural keys ───────────────────────────────────────────────
     up_keys   = [k for k in tensors if "lora_up"   in k or "lora_B"  in k]
     down_keys = [k for k in tensors if "lora_down" in k or "lora_A"  in k]
@@ -862,6 +931,21 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
         checks.append({"id": "overbaked", "label": "Overbaked",
                         "status": "info", "detail": "No lora_up tensors found."})
 
+    # ── 6b. Undercooked (magnitude well BELOW the imprint sweet spot) ──────────
+    # The Overbaked check only guards the UPPER bound; a LoRA can equally be too WEAK. Mean magnitude far
+    # below the sweet spot means it barely imprinted (undertrained / too-low effective LR). This is the
+    # SAME test Batch Compare's label uses (5% of mag_warn) — surfacing it here keeps the Analyze verdict
+    # in agreement with the batch label instead of silently passing an undercooked LoRA. WARN not FAIL: a
+    # deliberately subtle style LoRA may sit here on purpose.
+    if all_mags:
+        _undercooked_thresh = 0.05 * mag_warn if mag_warn > 0 else 0.0
+        if 0.0 < mean_mag < _undercooked_thresh:
+            checks.append({"id": "undercooked", "label": "Undercooked", "status": "warn",
+                           "detail": f"global mean magnitude={mean_mag:.4f} is below the imprint sweet spot "
+                                     f"(~{_undercooked_thresh:.4f}) — the LoRA barely imprinted, likely "
+                                     f"undertrained (too few steps / low effective LR). Fine for a deliberately "
+                                     f"subtle style, but weak for character/identity."})
+
     # ── 7-8. Per-module dead layers and balance ────────────────────────────────
     # Balance thresholds are per-module — layers of the same architectural role
     # should have similar magnitudes regardless of UNet depth.
@@ -993,6 +1077,16 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
                 log_data.get("checkpoint_losses", {}).get(ckpt_step)
                 or log_data.get("end_loss"))
 
+    # ── Embedded loss curve (self-contained) ──────────────────────────────────
+    # TrainerXL bakes the per-step avr_loss curve into the safetensors metadata, so the loss chart works
+    # straight from the FILE even with no log.txt next to it. A freshly-parsed log (above) wins when
+    # present — identical data; otherwise fall back to the embedded series.
+    if not log_data.get("loss_series"):
+        _emb = _embedded_loss_series(metadata)
+        if _emb:
+            log_data = dict(log_data or {})
+            log_data["loss_series"] = _emb
+
     # ── 10. Rank saturation ───────────────────────────────────────────────────
     mean_eff = rank_efficiency.get("mean_efficiency")
     if mean_eff is not None and mean_eff >= 0.88:
@@ -1058,6 +1152,7 @@ def _analyse(path: str, get_threshold, model_type_override: str | None = None,
             "total_dead":      _total_dead,
             "worst_balance":   _worst_bal,
             "mean_efficiency": rank_efficiency.get("mean_efficiency"),
+            "completeness":    pct,          # training completeness ratio 0..1 (None if no ss_* progress)
         },
     }
 
@@ -1162,6 +1257,27 @@ def _rank_verdict(rank_efficiency: dict, log_data: dict | None = None,
     if mean_eff >= 0.45:
         return "Balanced rank", GRN
     return "May benefit from lower rank", MUT
+
+
+# ── Headline health score (0-100) for the summary gauge ────────────────────────
+def _health_score(result: dict) -> int:
+    """A bounded 0-100 readout for the summary donut — NOT a new judgement, just a compact restatement of
+    the same checks/modules the verdict already uses (unlike _score_result, which is an unbounded penalty
+    for batch ranking). A NaN/Inf failure floors it; other fails/warns subtract, per-module issues subtract
+    less. The gauge is coloured by result['overall'], so the number and the colour always agree."""
+    score = 100.0
+    for c in result.get("checks", []):
+        st, cid = c.get("status"), c.get("id", "")
+        if st == "fail":
+            score -= 65 if cid == "nan_inf" else 22
+        elif st == "warn":
+            score -= 7
+    for g in result.get("module_groups", {}).values():
+        if g.get("status") == "fail":
+            score -= 9
+        elif g.get("status") == "warn":
+            score -= 3.5
+    return int(max(0, min(100, round(score))))
 
 
 # ── Batch candidate scoring ────────────────────────────────────────────────────
@@ -1281,6 +1397,8 @@ def _batch_label(result: dict, mag_warn: float, mag_fail: float) -> tuple[str, s
             return "Dead Layers", AMB
         if check_map.get("overbaked") == "warn":
             return "Overcooked", AMB
+        if check_map.get("undercooked") == "warn":
+            return "Undercooked", AMB          # magnitude below the imprint sweet spot (now a real check)
         if any(g.get("status") == "warn" for g in module_groups.values()):
             return "Layer Unbalanced", AMB
         if check_map.get("rank_saturation") == "warn":
@@ -2854,6 +2972,60 @@ class HealthPage(QWidget):
         badge_w.setLayout(badge_row)
         self._results_layout.addWidget(badge_w)
 
+        # ── Summary gauges (Phase 2): score · rank utilization · completeness ─
+        metrics = result.get("metrics", {})
+
+        def _gauge_card(title, gauge):
+            gc = QFrame(); gc.setStyleSheet(_card_style())
+            gl = QVBoxLayout(gc); gl.setContentsMargins(14, 12, 14, 12); gl.setSpacing(8)
+            gl.addWidget(_lbl(title, SEC, FONT_SM, bold=True))
+            gl.addWidget(gauge, alignment=Qt.AlignHCenter)
+            return gc
+
+        summary_row = QHBoxLayout(); summary_row.setSpacing(12)
+        score = _health_score(result)
+        summary_row.addWidget(_gauge_card(
+            "HEALTH SCORE",
+            RingGauge(score / 100.0, str(score), "/ 100", STATUS_COLORS.get(overall, MUT))), stretch=1)
+
+        eff = metrics.get("mean_efficiency")
+        if eff is not None:
+            summary_row.addWidget(_gauge_card(
+                "RANK UTILIZATION",
+                RingGauge(eff, f"{eff * 100:.0f}%", "SATURATED" if eff >= 0.88 else "UTILIZED", ACC)),
+                stretch=1)
+
+        pct = metrics.get("completeness")
+        if pct is not None:
+            comp_status = next((c["status"] for c in checks if c.get("id") == "training_completeness"), "info")
+            summary_row.addWidget(_gauge_card(
+                "COMPLETENESS",
+                RingGauge(min(1.0, pct), f"{pct * 100:.0f}%",
+                          "COMPLETE" if pct >= 0.98 else "PARTIAL",
+                          STATUS_COLORS.get(comp_status, ACC))), stretch=1)
+
+        summary_w = QWidget(); summary_w.setStyleSheet("background:transparent;")
+        summary_w.setLayout(summary_row)
+        self._results_layout.addWidget(summary_w)
+
+        # ── Loss curve (Phase 1): loss trend, best point marked ────────────────
+        # Prefer the FULL per-step series (kohya logs avr_loss every step) → a real curve; fall back to
+        # the per-checkpoint points (AI Toolkit). Either way the data comes from a log.txt beside the file.
+        _ld     = result.get("log_data") or {}
+        _series = _ld.get("loss_series") or _ld.get("checkpoint_losses") or {}
+        _losses = [(int(s), v) for s, v in _series.items() if v is not None]
+        if _losses:
+            _losses.sort()
+            if len(_losses) > 800:                       # keep the polyline light on very long runs
+                _stride = len(_losses) // 800 + 1
+                _losses = _losses[::_stride] + [_losses[-1]]
+            _title = "Loss over training" if len(_losses) > 12 else "Loss over checkpoints"
+            loss_card = QFrame(); loss_card.setStyleSheet(_card_style())
+            lcl = QVBoxLayout(loss_card); lcl.setContentsMargins(16, 12, 16, 14); lcl.setSpacing(8)
+            lcl.addWidget(_lbl(_title, PRI, FONT_MD, bold=True))
+            lcl.addWidget(LossCurve(_losses))
+            self._results_layout.addWidget(loss_card)
+
         # ── File metadata card ─────────────────────────────────────────────
         meta_card = QFrame()
         meta_card.setStyleSheet(_card_style())
@@ -2994,6 +3166,22 @@ class HealthPage(QWidget):
 
         # ── Module analysis card ───────────────────────────────────────────
         if module_groups:
+            # Phase 1: at-a-glance magnitude bars ABOVE the detailed text table (the table is retained).
+            rank_eff_groups = result.get("rank_efficiency", {}).get("groups", {})
+            bar_rows = []
+            for _mod in (MODULE_GROUPS + ["unet_other"]):
+                _g = module_groups.get(_mod)
+                if not _g:
+                    continue
+                bar_rows.append({"label": _g["label"], "mean_abs": _g["mean_abs"],
+                                 "status": _g["status"], "balance": _g.get("balance"),
+                                 "eff": rank_eff_groups.get(_mod)})
+            bars_card = QFrame(); bars_card.setStyleSheet(_card_style())
+            bcl = QVBoxLayout(bars_card); bcl.setContentsMargins(16, 12, 16, 14); bcl.setSpacing(8)
+            bcl.addWidget(_lbl("Module Magnitude  ·  bar = mean-abs, colour = status", PRI, FONT_MD, bold=True))
+            bcl.addWidget(ModuleBars(bar_rows))
+            self._results_layout.addWidget(bars_card)
+
             mod_card = QFrame()
             mod_card.setStyleSheet(_card_style())
             mcl = QVBoxLayout(mod_card)

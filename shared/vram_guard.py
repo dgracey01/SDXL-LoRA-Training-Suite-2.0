@@ -1,8 +1,8 @@
 """
-shared/vram_guard.py — VRAM pre-flight for the Suite's heavy GPU modules (PoserXL, LoRA Health).
+shared/vram_guard.py — VRAM pre-flight for the Suite's heavy GPU modules (SD.UI, LoRA Health).
 
 WHY THIS EXISTS
-  The Suite loads heavy native libs IN-PROCESS: PoserXL pulls in MediaPipe + drives the SDXL engine,
+  The Suite loads heavy native libs IN-PROCESS: SD.UI pulls in MediaPipe + drives the SDXL engine,
   LoRA Health imports torch for SVD. When VRAM is already occupied — Jarvis routinely leaves LM Studio
   models resident (JoyCaption ~5.8 GB + a brain ~1 GB) and the render engine keeps its SDXL checkpoint
   (~6.7 GB) — opening one of those modules pushes the card over the top and the allocation OOMs. On
@@ -28,7 +28,7 @@ import urllib.request
 # Suite — those stray conhost windows are what pile up in Task Manager.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# The render engine PoserXL shares (poserxl.engine_manager.BASE_URL).
+# The render engine SD.UI shares (sdui.engine_manager.BASE_URL).
 DEFAULT_ENGINE_URL = "http://127.0.0.1:3681"
 # The `lms` CLI (load/unload/ps). Same path Jarvis uses; falls back to PATH lookup if absent.
 _LMS_CANDIDATES = ("C:/Users/Dago/.lmstudio/bin/lms.exe", "lms")
@@ -90,8 +90,34 @@ def snapshot(engine_url: str = DEFAULT_ENGINE_URL) -> dict | None:
 
 
 # ── reclaim ──────────────────────────────────────────────────────────────────────────────────────
+def _lms_running() -> bool:
+    """Is LM Studio ALREADY up? Checked WITHOUT invoking `lms` — because ANY `lms` command auto-starts
+    LM Studio. If it isn't running there's nothing for us to free (esp. now the brain runs on
+    llama.cpp, not LM Studio), so we must not wake it. Windows process check, then an OpenAI-port probe."""
+    try:
+        p = subprocess.run(["tasklist", "/FI", "IMAGENAME eq LM Studio.exe", "/NH"],
+                           capture_output=True, text=True, timeout=8, creationflags=_NO_WINDOW)
+        if "LM Studio" in (p.stdout or ""):
+            return True
+    except Exception:
+        pass
+    try:
+        import socket
+        s = socket.socket(); s.settimeout(0.4)
+        try:
+            s.connect(("127.0.0.1", 1234)); return True
+        finally:
+            s.close()
+    except Exception:
+        pass
+    return False
+
+
 def _loaded_llms(lms_exe: str) -> list[str]:
-    """Names of LM Studio models currently resident (via `lms ps`), best-effort."""
+    """Names of LM Studio models currently resident (via `lms ps`), best-effort. Returns [] WITHOUT
+    calling `lms` if LM Studio isn't already running — calling `lms ps` would otherwise start it."""
+    if not _lms_running():
+        return []
     try:
         p = subprocess.run([lms_exe, "ps"], capture_output=True, text=True, timeout=20,
                            creationflags=_NO_WINDOW)
@@ -125,7 +151,7 @@ def free_llm(lms_exe: str | None = None) -> dict:
 
 def free_engine(engine_url: str = DEFAULT_ENGINE_URL) -> dict:
     """Unload the render engine's SDXL checkpoint (/sdapi/v1/unload-checkpoint). Only for modules that
-    do NOT need the engine (e.g. Health) — PoserXL needs the checkpoint, so it keeps it."""
+    do NOT need the engine (e.g. Health) — SD.UI needs the checkpoint, so it keeps it."""
     if not _get(engine_url + "/sdapi/v1/memory", timeout=3.0):
         return {"target": "engine", "unloaded": False, "ok": True, "note": "engine not up"}
     st, err = _post(engine_url + "/sdapi/v1/unload-checkpoint")
@@ -137,9 +163,9 @@ def preflight(module: str, *, engine_url: str = DEFAULT_ENGINE_URL, lms_exe: str
               need_gb: float = 3.0, free_engine_ckpt: bool = False, settle: float = 1.5) -> dict:
     """Free reclaimable VRAM before `module` opens, then report whether it should fit.
 
-    module           label for the report/dialog (e.g. "PoserXL", "LoRA Health").
+    module           label for the report/dialog (e.g. "SD.UI", "LoRA Health").
     need_gb          headroom we want free AFTER reclaiming — advisory, drives the 'fit' verdict/warning.
-    free_engine_ckpt unload the engine's SDXL checkpoint too (Health=True; PoserXL=False, it needs it).
+    free_engine_ckpt unload the engine's SDXL checkpoint too (Health=True; SD.UI=False, it needs it).
 
     Returns {module, before, after, freed:[...], fit: True|False|None, message}. Never raises."""
     lms_exe = lms_exe or _lms_exe()

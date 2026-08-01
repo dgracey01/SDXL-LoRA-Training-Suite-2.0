@@ -1340,7 +1340,7 @@ class ManagePage(QWidget):
         ("Randomizer",   "Randomizer.png"),
         ("LoRA Health",  "health.png"),
         ("Model Merge",  "merge.png"),
-        ("PoserXL",      "poserxl.png"),
+        ("SD.UI",        "sdui.png"),
     ]
 
     _SECTION_LABEL = (
@@ -1728,7 +1728,7 @@ class Launcher(QMainWindow):
         self._merge_tab  = self._make_nav_tab(
             "Model Merge", self._show_merge, closeable=True)
         self._poser_tab  = self._make_nav_tab(
-            "PoserXL", self._show_poserxl, closeable=True, refresh=True)
+            "SD.UI", self._show_sdui, closeable=True, refresh=True)
 
         self._tags_tab.close_requested.connect(self._close_tags)
         self._calc_tab.close_requested.connect(self._close_calculator)
@@ -1737,8 +1737,8 @@ class Launcher(QMainWindow):
         self._enh_tab.close_requested.connect(self._close_enhancer)
         self._health_tab.close_requested.connect(self._close_health)
         self._merge_tab.close_requested.connect(self._close_merge)
-        self._poser_tab.close_requested.connect(self._close_poserxl)
-        self._poser_tab.refresh_requested.connect(self._restart_poserxl)   # tab ↻ = reboot PoserXL in place
+        self._poser_tab.close_requested.connect(self._close_sdui)
+        self._poser_tab.refresh_requested.connect(self._restart_sdui)   # tab ↻ = reboot SD.UI in place
 
         for btn in (self._tags_tab, self._calc_tab, self._rand_tab,
                     self._face_tab, self._enh_tab, self._health_tab,
@@ -1856,7 +1856,7 @@ class Launcher(QMainWindow):
             "Randomizer":  self._show_randomizer,
             "LoRA Health":  self._show_health,
             "Model Merge":  self._show_merge,
-            "PoserXL":      self._show_poserxl,
+            "SD.UI":        self._show_sdui,
         }
         fn = dispatch.get(name)
         if fn:
@@ -2010,6 +2010,13 @@ class Launcher(QMainWindow):
                 return
         self._health_tab.setVisible(True)
         if self._health_page is None:
+            import sys
+            # Purge on (re)open so the tab always loads the latest Health code (charts / checks / scoring)
+            # without a full Suite restart — matches the SD.UI reopen-purge. Safe: no live HealthPage
+            # exists here (self._health_page is None), so nothing references the modules being dropped.
+            for key in list(sys.modules.keys()):
+                if key.startswith("health"):
+                    del sys.modules[key]
             from shared import crash_guard
             def _make():
                 from health.health_page import HealthPage
@@ -2061,6 +2068,13 @@ class Launcher(QMainWindow):
         if self._poll_timer:
             self._poll_timer.setInterval(10_000)  # slow poll — status dots not visible
 
+    def _reclaim_after_close(self):
+        """After a heavy module's page is torn down, hand its allocator cache + freed RAM back. Deferred so
+        Qt's deleteLater and Python's gc have already run (empty_cache only frees once the tensors' refs are
+        gone). Single-process reclaim — see shared/proc_memory. Cheap + safe when torch was never loaded."""
+        from shared import proc_memory
+        QTimer.singleShot(1200, proc_memory.reclaim)
+
     def _close_tab(self, url: str):
         if url not in self._tab_data:
             return
@@ -2105,6 +2119,7 @@ class Launcher(QMainWindow):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
+        self._reclaim_after_close()
 
     def _close_calculator(self):
         if self._calc_page is None:
@@ -2139,6 +2154,7 @@ class Launcher(QMainWindow):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
+        self._reclaim_after_close()
 
     def _close_faceswap(self):
         if self._face_page is None:
@@ -2156,6 +2172,7 @@ class Launcher(QMainWindow):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
+        self._reclaim_after_close()
 
     def _close_enhancer(self):
         if self._enh_page is None:
@@ -2173,6 +2190,7 @@ class Launcher(QMainWindow):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
+        self._reclaim_after_close()
 
     def _close_health(self):
         if self._health_page is None:
@@ -2184,26 +2202,27 @@ class Launcher(QMainWindow):
         self._health_index = None
         self._health_tab.set_active(False)
         self._health_tab.set_dot_online(False)
+        self._reclaim_after_close()
 
-    def _show_poserxl(self):
+    def _show_sdui(self):
         if self._poser_page is None:
-            # PoserXL NEEDS the engine checkpoint (it renders through it) -> keep it, only evict the
+            # SD.UI NEEDS the engine checkpoint (it renders through it) -> keep it, only evict the
             # LM Studio models Jarvis leaves resident.
-            if not self._vram_preflight("PoserXL", free_engine_ckpt=False):
+            if not self._vram_preflight("SD.UI", free_engine_ckpt=False):
                 return
         self._poser_tab.setVisible(True)
         if self._poser_page is None:
             import sys
-            # purge on (re)open too, so the tab always loads the latest PoserXL code even if the
+            # purge on (re)open too, so the tab always loads the latest SD.UI code even if the
             # close-time purge was missed — no full Suite restart needed for Python changes
             for key in list(sys.modules.keys()):
-                if key.startswith("poserxl") and not key.startswith("poserxl.engine"):
+                if key.startswith("sdui") and not key.startswith("sdui.engine"):
                     del sys.modules[key]
             from shared import crash_guard
             def _make():
-                from poserxl.poserxl_page import PoserXLPage
-                return PoserXLPage()
-            page = crash_guard.guard_open("PoserXL", _make, parent=self)
+                from sdui.sdui_page import SDUIPage
+                return SDUIPage()
+            page = crash_guard.guard_open("SD.UI", _make, parent=self)
             if page is None:                 # Python-level init failure -> fail the module, not the Suite
                 self._poser_tab.setVisible(False)
                 self._show_manage()
@@ -2217,14 +2236,14 @@ class Launcher(QMainWindow):
         self._stack.setCurrentIndex(self._poser_index)
         self._set_zoom_display(1.0)
 
-    def _restart_poserxl(self):
-        """Reboot the PoserXL tab in place: tear it down (purges + cleans up) then reopen it, which
-        re-imports the poserxl modules fresh and reloads the web poser. Loads PoserXL code changes
+    def _restart_sdui(self):
+        """Reboot the SD.UI tab in place: tear it down (purges + cleans up) then reopen it, which
+        re-imports the sdui modules fresh and reloads the web poser. Loads SD.UI code changes
         without restarting the whole Suite; the engine subprocess (separate process) keeps running."""
-        self._close_poserxl()
-        self._show_poserxl()
+        self._close_sdui()
+        self._show_sdui()
 
-    def _close_poserxl(self):
+    def _close_sdui(self):
         if self._poser_page is None:
             return
         if hasattr(self._poser_page, "cleanup"):
@@ -2238,10 +2257,11 @@ class Launcher(QMainWindow):
         self._poser_tab.setVisible(False)
         import sys
         for key in list(sys.modules.keys()):
-            if key.startswith("poserxl"):
+            if key.startswith("sdui"):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
+        self._reclaim_after_close()
 
     def _show_merge(self):
         if self._merge_page is None:
@@ -2285,6 +2305,7 @@ class Launcher(QMainWindow):
                 del sys.modules[key]
         self._rebuild_stack_index()
         self._show_manage()
+        self._reclaim_after_close()
 
     def _rebuild_stack_index(self):
         self._stack_index.clear()
@@ -2370,6 +2391,18 @@ class Launcher(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
     # Shutdown
     # ═══════════════════════════════════════════════════════════════════════════
+
+    def changeEvent(self, event):
+        # Idle CPU: pause the status poll while minimized (the dots aren't visible), and resume + refresh
+        # immediately on restore. Cuts background CPU to ~zero when the Suite is tucked away.
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.WindowStateChange and self._poll_timer is not None:
+            if self.isMinimized():
+                self._poll_timer.stop()
+            elif not self._poll_timer.isActive():
+                self._poll_timer.start()
+                self._poller.run()
+        super().changeEvent(event)
 
     def closeEvent(self, event):
         self._poll_timer.stop()
