@@ -77,6 +77,11 @@ from shared.config import (
 
 _HERE             = os.path.dirname(os.path.abspath(__file__))
 _ASSETS           = os.path.join(os.path.dirname(_HERE), "assets")
+
+# SD.UI is an OPTIONAL local module (not shipped in the public repo — it needs a local diffusers
+# engine + models). Only offer its launcher button when sdui/ is actually present, so a fresh clone
+# doesn't get a button that crashes with ModuleNotFoundError. Local installs with sdui/ are unaffected.
+_SDUI_PRESENT     = os.path.isdir(os.path.join(os.path.dirname(_HERE), "sdui"))
 _CUSTOM_APPS_FILE = os.path.join(_HERE, "custom_apps.json")
 
 # Accepted identifier-image formats. Includes .ico (program icons) and other
@@ -1391,7 +1396,10 @@ class ManagePage(QWidget):
         self._app_row.setContentsMargins(0, 4, 0, 4)
         self._app_row.setSpacing(16)
 
-        for name, icon_file in self._BUILTIN_APPS:
+        # Effective built-in list: drop SD.UI when its local module isn't present (see _SDUI_PRESENT).
+        self._builtin_apps = [(n, i) for (n, i) in self._BUILTIN_APPS
+                              if n != "SD.UI" or _SDUI_PRESENT]
+        for name, icon_file in self._builtin_apps:
             box = AppIconBox(name, os.path.join(_ASSETS, icon_file),
                              self._app_row_widget)
             box.clicked_app.connect(self.open_builtin)
@@ -1497,7 +1505,7 @@ class ManagePage(QWidget):
 
     def _refresh_custom_apps(self) -> None:
         """Remove custom boxes + trailing stretch/add-box, rebuild from self._custom_apps."""
-        builtin_count = len(self._BUILTIN_APPS)
+        builtin_count = len(self._builtin_apps)
         # Strip everything appended after the 5 built-in boxes
         while self._app_row.count() > builtin_count:
             item = self._app_row.takeAt(builtin_count)

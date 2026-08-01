@@ -62,3 +62,11 @@ ehthumbs.db
 .vs/
 .idea/
 *.code-workspace
+
+# ── Jarvis — now its own project (github.com/dgracey01/Project-Jarvis) ─────────
+# Jarvis lives in this folder locally but ships as a SEPARATE repository. Never
+# commit it (or its render outputs / local llama.cpp binaries) to the Suite repo.
+Jarvis/
+jarvis_renders/
+llama_cpp/
+joy_crash.log
