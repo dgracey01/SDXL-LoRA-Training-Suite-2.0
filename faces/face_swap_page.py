@@ -11,6 +11,26 @@ import threading
 import urllib.request
 from pathlib import Path
 
+# ── Import-robustness shim (installed once, at module load) ────────────────────────────────────────
+# insightface's import chain (insightface.app -> thirdparty.face3d -> mesh.vis -> matplotlib -> dateutil
+# -> six.moves) trips a three-way conflict on this stack: PySide6's shibokensupport feature-import hook
+# introspects the freshly-imported `six` module via inspect.getfile (which torch has monkeypatched), and
+# inspect.getfile raises AttributeError("'_SixMetaPathImporter' object has no attribute '_path'") instead
+# of the TypeError inspect callers (incl. that hook) tolerate -> the `from insightface.app import ...` in
+# _get_app crashes. Convert that AttributeError into the expected TypeError so introspection fails
+# gracefully and the import completes. Benign for all other callers (getfile is meant to raise TypeError
+# for objects it can't resolve). Verified 2026-08-02: repros without this, imports cleanly with it.
+import inspect as _inspect
+if not getattr(_inspect.getfile, "_lts_safe", False):
+    _lts_orig_getfile = _inspect.getfile
+    def _lts_safe_getfile(_obj):
+        try:
+            return _lts_orig_getfile(_obj)
+        except AttributeError as _e:
+            raise TypeError(str(_e)) from _e
+    _lts_safe_getfile._lts_safe = True
+    _inspect.getfile = _lts_safe_getfile
+
 import numpy as np
 from PIL import Image
 

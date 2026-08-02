@@ -46,6 +46,11 @@ if not errorlevel 1 (
   )
 )
 
+:: MIOpen conv kernel-find FAST mode: avoids the hires-fix 2.0x (~2048^2 conv) exhaustive-search stall
+:: on this AMD ROCm-Windows box (a 2.0x render hung 25s+ on one upsampling conv, 2026-08-02). Inherited
+:: by the launched pythonw + its children. Also set in main.py as the launch-method-independent catch-all.
+set "MIOPEN_FIND_MODE=FAST"
+
 :: Launch without a console window
 start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0main.py"
 endlocal

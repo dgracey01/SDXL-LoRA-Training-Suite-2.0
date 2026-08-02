@@ -14,6 +14,17 @@ import sys
 import os
 import ctypes
 
+# ── pythonw.exe stream safety (MUST be early — before anything writes to stdout/stderr) ────────────
+# Under pythonw (the GUI launch, no console) sys.stdout/stderr are None. Any library that writes to
+# them — notably huggingface_hub's tqdm download bars — then dies with
+# "'NoneType' object has no attribute 'write'", which is exactly what broke fresh WD14 tagger / model
+# downloads on a clean clone. Point the missing streams at a discard sink and disable HF progress bars.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 # ── ROCm attention (MUST precede any torch import, anywhere in the process) ───
 # PyTorch gates its flash / mem-efficient attention kernels behind this flag on AMD. Unset, SDPA
 # falls back to the `math` path: measured 210-486 ms per SDXL-1024 attention call vs ~6 ms with
@@ -35,6 +46,15 @@ os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 _ALLOC_CONF = "garbage_collection_threshold:0.6,max_split_size_mb:512"
 os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)       # torch >= 2.9 canonical name
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", _ALLOC_CONF)   # ROCm-specific fallback for older builds
+
+# ── MIOpen conv kernel-find: FAST mode (avoid the hires-fix 2.0x stall) ────────────────────────────
+# The FIRST time MIOpen sees a large conv shape — e.g. the ~2048² UNet upsampling conv from a hires-fix
+# 2.0x SECOND pass — its default find runs an EXHAUSTIVE kernel search that can hang the render for
+# minutes (thread frozen inside _conv_forward, a full CPU core pegged). Verified 2026-08-02: a 2.0x
+# render sat 25s+ on one such conv. FAST mode uses the find-db when present and an immediate heuristic /
+# dynamic kernel otherwise (no exhaustive search), so the conv proceeds at once — a marginally slower
+# kernel beats a multi-minute stall. Read by MIOpen at conv time; set before torch initialises to be safe.
+os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 # ── Single-instance guard (Windows named mutex) ───────────────────────────────
 # HARDENED: the old code read the error with a SEPARATE `windll.kernel32.GetLastError()` call — but ctypes
