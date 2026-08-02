@@ -3840,7 +3840,8 @@ class TagHandlerPage(QWidget):
         missing_wd14 = not any(models_dir.rglob("*.onnx"))
         missing_esr  = any(
             not (models_dir / fname).exists() for fname in ESR_MODELS)
-        if missing_wd14 or missing_esr:
+        missing_joy  = not _check_joycaption_model(str(models_dir / "joycaption"))[0]
+        if missing_wd14 or missing_esr or missing_joy:
             parts = []
             if missing_wd14:
                 parts.append("• WD14 tagger models (~500 MB)")
@@ -3848,15 +3849,21 @@ class TagHandlerPage(QWidget):
                 for fname, (_, desc) in ESR_MODELS.items():
                     if not (models_dir / fname).exists():
                         parts.append(f"• {fname}  [{desc}]")
+            if missing_joy:
+                parts.append("• JoyCaption captioner (~17 GB — natural-language captions; "
+                             "reuses your HuggingFace cache if already present)")
             r = QMessageBox.question(
                 self, "Download Models",
                 "The following models are missing:\n\n"
                 + "\n".join(parts)
-                + "\n\nDownload all now? You can skip and they will be "
-                  "downloaded on first use.",
+                + "\n\nDownload now? (WD14 / upscalers also auto-download on first use if you skip; "
+                  "JoyCaption is only fetched here.)",
                 QMessageBox.Yes | QMessageBox.No)
             if r == QMessageBox.Yes:
-                self._run_model_downloads()
+                if missing_wd14 or missing_esr:
+                    self._run_model_downloads()
+                if missing_joy:
+                    self._download_joycaption()
 
     def _run_model_downloads(self):
         try:
@@ -3911,9 +3918,15 @@ class TagHandlerPage(QWidget):
             dlg.setLabelText(f"Downloading {fname}  ({desc})…")
             dlg.setValue(step)
             QApplication.processEvents()
+            tmp = out_path.with_suffix(out_path.suffix + ".part")
             try:
-                urllib.request.urlretrieve(url, str(out_path))
+                urllib.request.urlretrieve(url, str(tmp))
+                tmp.replace(out_path)                 # atomic: out_path appears only when complete
             except Exception as e:
+                try:
+                    tmp.unlink(missing_ok=True)        # drop the partial so a retry actually re-fetches
+                except OSError:
+                    pass
                 failed.append(f"{fname}: {e}")
             step += 1
 
@@ -3926,6 +3939,52 @@ class TagHandlerPage(QWidget):
         else:
             QMessageBox.information(self, "Done",
                                     "All models downloaded successfully.")
+
+    def _download_joycaption(self) -> bool:
+        """Install the JoyCaption model into tags/models/joycaption, so a fresh setup has a clear route
+        to the (~17 GB) captioner instead of the 'integrity check failed' dead-end. Downloads file-by-file
+        via hf_hub_download, which REUSES the local HuggingFace cache if the model is already there."""
+        try:
+            from huggingface_hub import hf_hub_download, list_repo_files
+        except ImportError:
+            QMessageBox.critical(self, "Missing Package",
+                                 "Install huggingface-hub:\n  pip install huggingface-hub")
+            return False
+        jc_dir = Path(_HERE) / "models" / "joycaption"
+        jc_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            files = [f for f in list_repo_files(JOY_MODEL_ID) if not f.endswith("/")]
+        except Exception as e:
+            QMessageBox.critical(self, "JoyCaption Download",
+                                 f"Couldn't reach HuggingFace to list {JOY_MODEL_ID}:\n{e}")
+            return False
+        dlg = QProgressDialog("Preparing JoyCaption download…", "Cancel", 0, max(1, len(files)), self)
+        dlg.setWindowTitle("Downloading JoyCaption (~17 GB)")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.show()
+        failed = []
+        for i, filename in enumerate(files):
+            if dlg.wasCanceled():
+                break
+            dlg.setLabelText(f"JoyCaption — {filename}\n"
+                             f"(large shards take a while; the window may pause — that's normal)")
+            dlg.setValue(i)
+            QApplication.processEvents()
+            try:
+                hf_hub_download(repo_id=JOY_MODEL_ID, filename=filename, local_dir=str(jc_dir))
+            except Exception as e:
+                failed.append(f"{filename}: {e}")
+        dlg.setValue(len(files))
+        dlg.close()
+        ok, err = _check_joycaption_model(str(jc_dir))
+        if ok:
+            self.joy_path = str(jc_dir)          # point the loader at the freshly-installed model
+            if not failed:
+                QMessageBox.information(self, "JoyCaption", "JoyCaption downloaded successfully.")
+            return True
+        QMessageBox.warning(self, "JoyCaption Download Incomplete",
+                            "JoyCaption is still missing files:\n" + (err or "; ".join(failed[:5])))
+        return False
 
     def _ensure_esr_model(self, fname: str) -> bool:
         """Return True if model exists; prompt to download if not."""
@@ -4684,8 +4743,9 @@ class _TaggerThread(QThread):
         _ok, _err = _check_joycaption_model(self.joy_path)
         if not _ok:
             return None, None, None, (
-                f"JoyCaption model integrity check failed:\n{_err}\n\n"
-                f"Re-download the model to fix this.")
+                f"JoyCaption isn't installed yet ({_err}).\n\n"
+                f"To get it: reopen the Tagger — the model-download prompt offers JoyCaption "
+                f"(~17 GB, reuses your HuggingFace cache if already downloaded).")
 
         # pythonw.exe has no console — stdout/stderr are None.
         # transformers/huggingface_hub write tqdm progress during download,
